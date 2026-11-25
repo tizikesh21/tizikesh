@@ -1,0 +1,23 @@
+services:
+  sulgx:
+    build: .
+    image: sulgx-panel:1.5.8
+    container_name: sulgx-panel
+    env_file:
+      - .env
+    environment:
+      - DB_PATH=/data/panel.db
+    ports:
+      - "${PORT:-8000}:${PORT:-8000}"
+    volumes:
+      - sulgx-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,urllib.request; port=os.environ.get('PORT','8000'); urllib.request.urlopen('http://localhost:'+port+'/health')"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+
+volumes:
+  sulgx-data:

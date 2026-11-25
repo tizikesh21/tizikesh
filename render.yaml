@@ -1,0 +1,46 @@
+services:
+  - type: web
+    name: SulgX
+    env: python
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /health
+    disk:
+      name: sulgx-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: SECRET_KEY
+        generateValue: true
+      - key: DOMAIN
+        sync: false
+      - key: DB_PATH
+        value: /data/panel.db
+      - key: TRUSTED_PROXY_IPS
+        value: 127.0.0.1,::1
+        sync: false
+      - key: PROXY_ENCRYPTION_KEY
+        sync: false
+      - key: PANEL_ALLOWED_ORIGINS
+        sync: false
+      - key: PROXY_WHITELIST
+        sync: false
+      - key: PANEL_PREFIX
+        sync: false
+      - key: STEALTH_MODE
+        value: "0"
+        sync: false
+      - key: SOCKS_PORT
+        value: "0"
+      - key: TG_PROXY_PORT
+        value: "0"
+      - key: TG_PROXY_SECRET
+        sync: false
+      - key: HTTP_PROXY_PORT
+        value: "0"
+        sync: false
+      - key: TG_WEB_SECRET
+        sync: false
+        sync: false
