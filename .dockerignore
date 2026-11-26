@@ -9,8 +9,16 @@ panel.db
 *.db
 *.sqlite
 *.sqlite3
+*.wal
+*.shm
+subs_state.json
 .env
 *.env
+.sulgx-env
+initial-credentials.txt
+sulgx.log
+sulgx.pid
+data/
 .vscode/
 .idea/
 *.swp
