@@ -4,9 +4,15 @@ services:
     image: sulgx-panel:1.5.8
     container_name: sulgx-panel
     env_file:
-      - .env
+      - path: .env
+        required: false
     environment:
       - DB_PATH=/data/panel.db
+      - PORT=${PORT:-8000}
+      - PANEL_BIND_HOST=0.0.0.0
+      - SOCKS_PORT=0
+      - TG_PROXY_PORT=0
+      - HTTP_PROXY_PORT=0
     ports:
       - "${PORT:-8000}:${PORT:-8000}"
     volumes:
