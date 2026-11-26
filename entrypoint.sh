@@ -68,7 +68,7 @@ if [ -z "${DATABASE_URL:-}" ]; then
   if [ "$SULGX_DB_HAS_SECRET" = "no" ] && [ -z "${SECRET_KEY:-}" ]; then
     SULGX_NEW_SECRET_KEY="$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")"
     SULGX_NEW_TG_PROXY_SECRET="$(SULGX_SECRET="$SULGX_NEW_SECRET_KEY" python3 -c "import hashlib, os; print('dd' + hashlib.sha256((os.environ.get('SULGX_SECRET', '') + 'mtproxy-secret').encode()).hexdigest()[:32])")"
-    SULGX_NEW_TG_WEB_SECRET="$(SULGX_SECRET="$SULGX_NEW_SECRET_KEY" python3 -c "import hashlib, os; print(hashlib.sha256((os.environ.get('SULGX_SECRET', '') + 'tg-web-secret').encode()).hexdigest())")"
+    SULGX_NEW_TG_WEB_SECRET="$(SULGX_SECRET="$SULGX_NEW_SECRET_KEY" python3 -c "import hashlib, os; print(hashlib.sha256((os.environ.get('SULGX_SECRET', '') + 'tg-web-secret').encode()).hexdigest()[:32])")"
     printf '%s\n' "SECRET_KEY='$SULGX_NEW_SECRET_KEY'" >> "$ENV_FILE"
     printf '%s\n' "TG_PROXY_SECRET='$SULGX_NEW_TG_PROXY_SECRET'" >> "$ENV_FILE"
     printf '%s\n' "TG_WEB_SECRET='$SULGX_NEW_TG_WEB_SECRET'" >> "$ENV_FILE"
