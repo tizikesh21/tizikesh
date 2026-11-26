@@ -72,6 +72,8 @@ _MTPROXY_QUOTA_OK = None
 _SESSION_ALLOWED = None
 ACTIVE_PROXY = {}
 _SERVERS = []
+_BOUND_PORTS = set()
+_BIND_ERRORS = {}
 _STATS = {"socks_connections": 0, "socks_bytes": 0, "mtproxy_connections": 0, "mtproxy_bytes": 0, "http_connections": 0, "http_bytes": 0}
 _MTPROXY_LINK_SECRETS = {}
 
@@ -425,6 +427,12 @@ async def _handle_mtproto_relay(reader, writer, prefix):
                 link_uid = _mtproto_identify_obfs(head)
         if link_uid and _COUNT_TRAFFIC is not None:
             if not await _COUNT_TRAFFIC(link_uid, 0):
+                writer.close()
+                return
+        if link_uid and _SESSION_ALLOWED is not None:
+            _peer = writer.get_extra_info("peername")
+            _cip = _peer[0] if _peer else ""
+            if not _SESSION_ALLOWED(link_uid, _cip):
                 writer.close()
                 return
         try:
@@ -1976,18 +1984,29 @@ async def start_all(multi_ports, auth_lookup, count_traffic, mtproxy_quota_ok, s
     }
     bound = []
     bind_error = ""
+    failed = {}
     for port in ports:
         try:
             server = await asyncio.start_server(_handle_multi, "0.0.0.0", port)
             _SERVERS.append(server)
+            _BOUND_PORTS.add(port)
+            _BIND_ERRORS.pop(port, None)
             bound.append(port)
         except OSError as exc:
+            failed[port] = str(exc)
+            _BIND_ERRORS[port] = str(exc)
             if not bind_error:
                 bind_error = str(exc)
     first = bound[0] if bound else 0
     status["socks"]["port"] = first
     status["http"]["port"] = first
     status["mtproxy"]["port"] = first
+    status["socks"]["ports"] = list(bound)
+    status["http"]["ports"] = list(bound)
+    status["mtproxy"]["ports"] = list(bound)
+    status["socks"]["failed_ports"] = {str(k): v for k, v in failed.items()}
+    status["http"]["failed_ports"] = {str(k): v for k, v in failed.items()}
+    status["mtproxy"]["failed_ports"] = {str(k): v for k, v in failed.items()}
     if bound:
         status["socks"]["enabled"] = True
         status["http"]["enabled"] = True
@@ -2003,6 +2022,40 @@ async def start_all(multi_ports, auth_lookup, count_traffic, mtproxy_quota_ok, s
     return status
 
 
+async def ensure_proxy_ports(ports):
+    wanted = []
+    for item in ports or []:
+        try:
+            port = int(item)
+        except (TypeError, ValueError):
+            continue
+        if port and port not in wanted:
+            wanted.append(port)
+    bound = []
+    failed = {}
+    for port in wanted:
+        if port in _BOUND_PORTS:
+            continue
+        try:
+            server = await asyncio.start_server(_handle_multi, "0.0.0.0", port)
+            _SERVERS.append(server)
+            _BOUND_PORTS.add(port)
+            _BIND_ERRORS.pop(port, None)
+            bound.append(port)
+        except OSError as exc:
+            failed[port] = str(exc)
+            _BIND_ERRORS[port] = str(exc)
+    return {"bound": bound, "failed": {str(k): v for k, v in failed.items()}, "ports": sorted(_BOUND_PORTS), "errors": {str(k): v for k, v in _BIND_ERRORS.items()}}
+
+
+def proxy_bound_ports():
+    return sorted(_BOUND_PORTS)
+
+
+def proxy_bind_errors():
+    return dict(_BIND_ERRORS)
+
+
 async def stop_all():
     for server in _SERVERS:
         try:
@@ -2011,4 +2064,6 @@ async def stop_all():
         except OSError:
             pass
     _SERVERS.clear()
+    _BOUND_PORTS.clear()
+    _BIND_ERRORS.clear()
     await telemt_stop_all()
