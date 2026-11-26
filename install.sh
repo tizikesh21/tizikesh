@@ -15,7 +15,7 @@ sulgx_derive_tg_proxy_secret() {
   SULGX_SECRET="$1" python3 -c "import hashlib, os; print('dd' + hashlib.sha256((os.environ.get('SULGX_SECRET', '') + 'mtproxy-secret').encode()).hexdigest()[:32])"
 }
 sulgx_derive_tg_web_secret() {
-  SULGX_SECRET="$1" python3 -c "import hashlib, os; print(hashlib.sha256((os.environ.get('SULGX_SECRET', '') + 'tg-web-secret').encode()).hexdigest())"
+  SULGX_SECRET="$1" python3 -c "import hashlib, os; print(hashlib.sha256((os.environ.get('SULGX_SECRET', '') + 'tg-web-secret').encode()).hexdigest()[:32])"
 }
 sulgx_env_value() {
   grep "^$1=" "$ENV_FILE" | tail -n 1 | cut -d= -f2- | tr -d "'" | tr -d '"'
@@ -71,6 +71,15 @@ if [ "$DOCKER_OK" = "yes" ]; then
   if ! grep -q "^DB_PATH=" "$ENV_FILE"; then
     printf '%s\n' "DB_PATH=/data/panel.db" >> "$ENV_FILE"
   fi
+  if ! grep -q "^SOCKS_PORT=" "$ENV_FILE"; then
+    printf '%s\n' "SOCKS_PORT=0" >> "$ENV_FILE"
+  fi
+  if ! grep -q "^TG_PROXY_PORT=" "$ENV_FILE"; then
+    printf '%s\n' "TG_PROXY_PORT=0" >> "$ENV_FILE"
+  fi
+  if ! grep -q "^HTTP_PROXY_PORT=" "$ENV_FILE"; then
+    printf '%s\n' "HTTP_PROXY_PORT=0" >> "$ENV_FILE"
+  fi
 else
   if ! grep -q "^DB_PATH=" "$ENV_FILE"; then
     printf '%s\n' "DB_PATH=$SCRIPT_DIR/data/panel.db" >> "$ENV_FILE"
@@ -83,7 +92,7 @@ if [ -z "$PORT_VALUE" ]; then
   PORT_VALUE=8000
 fi
 if [ "$DOCKER_OK" = "yes" ]; then
-  $COMPOSE_CMD up -d
+  $COMPOSE_CMD up -d --build
   if sulgx_wait_for_health "$PORT_VALUE"; then
     printf '%s\n' "SulgX Panel is up: http://localhost:$PORT_VALUE"
   else
