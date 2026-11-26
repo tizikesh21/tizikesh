@@ -27,6 +27,15 @@ from urllib.parse import quote as _url_path_quote
 import urllib.error
 import urllib.request
 
+try:
+    from cryptography.hazmat.primitives.ciphers import Cipher as _AES_CIPHER
+    from cryptography.hazmat.primitives.ciphers.algorithms import AES as _AES_ALG
+    from cryptography.hazmat.primitives.ciphers.modes import CTR as _AES_CTR
+except Exception:
+    _AES_CIPHER = None
+    _AES_ALG = None
+    _AES_CTR = None
+
 _LOG = logging.getLogger("sulgx.telegram")
 
 TG_NETWORKS = [
@@ -69,8 +78,10 @@ _MTPROXY_LINK_SECRETS = {}
 _TELEMT_DIR_CACHED = ""
 _TELEMT_DECOY_READY = False
 _TELEMT_MTPROTO = None
+_TELEMT_MTPROTO_USERS = {}
 _TELEMT_WEB = {}
 _TELEMT_LOCKS = {}
+_MTPROXY_FLUSHED = {}
 
 
 def configure(secret, domain="www.google.com"):
@@ -296,14 +307,87 @@ async def _peek_prefix(reader):
     return prefix
 
 
+def _mtproto_candidate_secrets():
+    candidates = []
+    seen = set()
+    for username, info in list(_TELEMT_MTPROTO_USERS.items()):
+        try:
+            secret = bytes.fromhex(str((info or {}).get("secret_hex") or ""))
+        except ValueError:
+            continue
+        if len(secret) != 16:
+            continue
+        uid = str((info or {}).get("uid") or username)
+        if uid in seen:
+            continue
+        seen.add(uid)
+        candidates.append((uid, secret))
+    for link_uid, secret in list(_MTPROXY_LINK_SECRETS.items()):
+        uid = str(link_uid)
+        if uid in seen:
+            continue
+        if not isinstance(secret, (bytes, bytearray)) or len(secret) != 16:
+            continue
+        seen.add(uid)
+        candidates.append((uid, bytes(secret)))
+    return candidates
+
+
+def _mtproto_trial_obfs_tag(init, secret):
+    if _AES_CIPHER is None or len(init) < 64 or len(secret) != 16:
+        return None
+    try:
+        enc_key = hashlib.sha256(bytes(init[8:40]) + bytes(secret)).digest()
+        cipher = _AES_CIPHER(_AES_ALG(enc_key), _AES_CTR(bytes(init[40:56])))
+        stream = cipher.encryptor()
+        stream.update(bytes(56))
+        tail = stream.update(bytes(init[56:64]))
+    except Exception:
+        return None
+    tag = bytes(tail[:4])
+    if tag == b"\xdd\xdd\xdd\xdd":
+        return "dd"
+    if tag == b"\xef\xef\xef\xef":
+        return "plain"
+    if tag == b"\xee\xee\xee\xee":
+        return "faketls"
+    return None
+
+
+def _mtproto_identify_obfs(init):
+    for uid, secret in _mtproto_candidate_secrets():
+        if _mtproto_trial_obfs_tag(init, secret) is not None:
+            return uid
+    return ""
+
+
+def _mtproto_identify_faketls(hello):
+    if len(hello) < 43:
+        return ""
+    zeroed = bytes(hello[:11]) + b"\x00" * 32 + bytes(hello[43:])
+    rand = bytes(hello[11:43])
+    now = int(time.time())
+    for uid, secret in _mtproto_candidate_secrets():
+        digest = hmac_mod.new(bytes(secret), zeroed, hashlib.sha256).digest()
+        if not hmac_mod.compare_digest(rand[:28], digest[:28]):
+            continue
+        stamp = bytes(a ^ b for a, b in zip(rand[28:32], digest[28:32]))
+        stamp_value = struct.unpack("<I", stamp)[0]
+        if abs(stamp_value - now) <= 900:
+            return uid
+    return ""
+
+
 async def _handle_mtproto_relay(reader, writer, prefix):
     _STATS["mtproxy_connections"] += 1
     upstream_reader = None
     upstream_writer = None
     sid = None
     entry = None
-    total_up = 0
-    total_down = 0
+    total_bytes = 0
+    up_flushed = 0
+    down_flushed = 0
+    link_uid = ""
     try:
         if _MTPROXY_QUOTA_OK is not None:
             if not await _MTPROXY_QUOTA_OK():
@@ -314,6 +398,27 @@ async def _handle_mtproto_relay(reader, writer, prefix):
             _LOG.warning("telemt MTProto child is not running; closing MTProto connection")
             writer.close()
             return
+        head = bytes(prefix or b"")
+        if head and head[0] == 0x16 and len(head) >= 5 and head[1] == 0x03:
+            total_len = 5 + struct.unpack(">H", head[3:5])[0]
+            if total_len > len(head) and total_len <= 65535:
+                try:
+                    head += bytes(await asyncio.wait_for(reader.readexactly(total_len - len(head)), timeout=3.0))
+                except (asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError, OSError):
+                    pass
+            link_uid = _mtproto_identify_faketls(head)
+        else:
+            if len(head) < 64:
+                try:
+                    head += bytes(await asyncio.wait_for(reader.readexactly(64 - len(head)), timeout=3.0))
+                except (asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError, OSError):
+                    pass
+            if len(head) == 64:
+                link_uid = _mtproto_identify_obfs(head)
+        if link_uid and _COUNT_TRAFFIC is not None:
+            if not await _COUNT_TRAFFIC(link_uid, 0):
+                writer.close()
+                return
         try:
             upstream_reader, upstream_writer = await asyncio.wait_for(
                 asyncio.open_connection("127.0.0.1", port), timeout=10
@@ -321,18 +426,41 @@ async def _handle_mtproto_relay(reader, writer, prefix):
         except (OSError, asyncio.TimeoutError):
             writer.close()
             return
-        if prefix:
-            upstream_writer.write(prefix)
-            await upstream_writer.drain()
-            total_up += len(prefix)
-            _STATS["mtproxy_bytes"] += len(prefix)
         peer = writer.get_extra_info("peername")
         sid = "mtproxy-" + os.urandom(6).hex()
-        entry = {"id": sid, "username": "", "protocol": "mtproto", "client_ip": peer[0] if peer else "", "started_at": datetime.now(timezone.utc).isoformat(), "bytes_up": total_up, "bytes_down": 0, "bytes_flushed": 0, "writer": writer}
+        entry = {"id": sid, "username": link_uid, "protocol": "mtproto", "client_ip": peer[0] if peer else "", "started_at": datetime.now(timezone.utc).isoformat(), "bytes_up": 0, "bytes_down": 0, "bytes_flushed": 0, "writer": writer}
         ACTIVE_PROXY[sid] = entry
 
+        async def _count(n, direction):
+            nonlocal total_bytes, up_flushed, down_flushed
+            total_bytes += n
+            _STATS["mtproxy_bytes"] += n
+            pending = 0
+            if direction == "up":
+                entry["bytes_up"] += n
+                pending = entry["bytes_up"] - up_flushed
+            else:
+                entry["bytes_down"] += n
+                pending = entry["bytes_down"] - down_flushed
+            if link_uid and _COUNT_TRAFFIC is not None and pending >= 1048576:
+                if await _COUNT_TRAFFIC(link_uid, pending):
+                    if direction == "up":
+                        up_flushed += pending
+                    else:
+                        down_flushed += pending
+                    entry["bytes_flushed"] = up_flushed + down_flushed
+                    _MTPROXY_FLUSHED[link_uid] = int(_MTPROXY_FLUSHED.get(link_uid, 0) or 0) + pending
+                else:
+                    try:
+                        writer.close()
+                    except OSError:
+                        pass
+                    try:
+                        upstream_writer.close()
+                    except OSError:
+                        pass
+
         async def _relay(src, dst, direction):
-            nonlocal total_up, total_down
             try:
                 while True:
                     chunk = await src.read(65536)
@@ -340,13 +468,7 @@ async def _handle_mtproto_relay(reader, writer, prefix):
                         break
                     dst.write(chunk)
                     await dst.drain()
-                    _STATS["mtproxy_bytes"] += len(chunk)
-                    if direction == "up":
-                        total_up += len(chunk)
-                        entry["bytes_up"] = total_up
-                    else:
-                        total_down += len(chunk)
-                        entry["bytes_down"] = total_down
+                    await _count(len(chunk), direction)
             except (ConnectionError, asyncio.IncompleteReadError, asyncio.TimeoutError, OSError):
                 pass
             finally:
@@ -358,6 +480,10 @@ async def _handle_mtproto_relay(reader, writer, prefix):
                     except OSError:
                         pass
 
+        if head:
+            upstream_writer.write(head)
+            await upstream_writer.drain()
+            await _count(len(head), "up")
         up_task = asyncio.create_task(_relay(reader, upstream_writer, "up"))
         down_task = asyncio.create_task(_relay(upstream_reader, writer, "down"))
         done, pending = await asyncio.wait((up_task, down_task), return_when=asyncio.FIRST_COMPLETED)
@@ -367,6 +493,13 @@ async def _handle_mtproto_relay(reader, writer, prefix):
     except (ConnectionError, asyncio.IncompleteReadError, asyncio.TimeoutError, OSError):
         pass
     finally:
+        if link_uid and _COUNT_TRAFFIC is not None and total_bytes - (up_flushed + down_flushed) > 0:
+            remainder = total_bytes - (up_flushed + down_flushed)
+            try:
+                if await _COUNT_TRAFFIC(link_uid, remainder):
+                    _MTPROXY_FLUSHED[link_uid] = int(_MTPROXY_FLUSHED.get(link_uid, 0) or 0) + remainder
+            except (ConnectionError, asyncio.TimeoutError, OSError):
+                pass
         if upstream_writer is not None:
             try:
                 upstream_writer.close()
@@ -872,7 +1005,7 @@ def _write_text(path, text):
         handle.write(text)
 
 
-def _mtproto_config_text(api_port, token, port, bootstrap_secret):
+def _mtproto_config_text(api_port, token, port, bootstrap_secret, users=None):
     lines = [
         "[general]",
         "use_middle_proxy = false",
@@ -906,6 +1039,37 @@ def _mtproto_config_text(api_port, token, port, bootstrap_secret):
         "[access.users]",
         'bootstrap = "' + bootstrap_secret + '"',
     ]
+    entries = []
+    if users:
+        for username in sorted(users):
+            info = users[username] or {}
+            secret = str(info.get("secret_hex") or "")
+            if not _valid_secret_hex(secret):
+                continue
+            entries.append((username, info))
+            lines.append('"' + _toml_escape(username) + '" = "' + secret.lower() + '"')
+    max_conns = [(username, int(info.get("max_conns") or 0)) for username, info in entries if int(info.get("max_conns") or 0) > 0]
+    if max_conns:
+        lines.append("")
+        lines.append("[access.user_max_tcp_conns]")
+        for username, value in max_conns:
+            lines.append('"' + _toml_escape(username) + '" = ' + str(value))
+    quotas = [(username, int(info.get("limit_bytes") or 0)) for username, info in entries if int(info.get("limit_bytes") or 0) > 0]
+    if quotas:
+        lines.append("")
+        lines.append("[access.user_data_quota]")
+        for username, value in quotas:
+            lines.append('"' + _toml_escape(username) + '" = ' + str(value))
+    expirations = []
+    for username, info in entries:
+        stamp = _rfc3339(info.get("expires_at"))
+        if stamp:
+            expirations.append((username, stamp))
+    if expirations:
+        lines.append("")
+        lines.append("[access.user_expirations]")
+        for username, stamp in expirations:
+            lines.append('"' + _toml_escape(username) + '" = "' + stamp + '"')
     return "\n".join(lines) + "\n"
 
 
@@ -1202,6 +1366,12 @@ async def _spawn_entry(entry):
         fields["bearer"] = entry["token"]
         entry["config_text"] = _web_config_text(fields)
         _write_text(entry["config_path"], entry["config_text"])
+    elif entry["kind"] == "mtproto":
+        fields = entry["fields"]
+        fields["generation"] = int(fields.get("generation") or 0) + 1
+        entry["config_text"] = _mtproto_config_text(entry["api_port"], entry["token"], entry["port"], str(fields.get("bootstrap_secret") or ""), users=_TELEMT_MTPROTO_USERS)
+        _write_text(entry["config_path"], entry["config_text"])
+        entry["config_written"] = True
     elif not entry.get("config_written"):
         _write_text(entry["config_path"], entry["config_text"])
         entry["config_written"] = True
@@ -1359,30 +1529,44 @@ def _rfc3339(value):
     return None
 
 
-async def telemt_mtproto_upsert_user(uid, secret_hex, variant="dd", domain="www.google.com", max_conns=0, limit_bytes=0, expires_at=None):
-    if not _valid_secret_hex(secret_hex):
-        _LOG.warning("telemt MTProto upsert refused for uid %s: secret must be 32 hex characters", uid)
-        return False
+def _write_mtproto_config(entry):
+    entry["config_text"] = _mtproto_config_text(entry["api_port"], entry["token"], entry["port"], str((entry.get("fields") or {}).get("bootstrap_secret") or ""), users=_TELEMT_MTPROTO_USERS)
+    _write_text(entry["config_path"], entry["config_text"])
+
+
+async def _restart_mtproto_entry(entry):
+    global _TELEMT_MTPROTO
+    await _stop_entry(entry)
+    fresh = _new_telemt_entry("mtproto", "mtproto", entry["run_dir"], entry["config_path"], entry["port"], entry["api_port"], entry["token"])
+    fresh["fields"] = entry["fields"]
+    _TELEMT_MTPROTO = fresh
+    fresh["task"] = asyncio.create_task(_supervise_entry(fresh))
+    return await _wait_entry_ready(fresh, timeout=30.0)
+
+
+def telemt_mtproto_generation():
     entry = _TELEMT_MTPROTO
-    if entry is None or not entry.get("ready"):
-        started = await telemt_start_mtproto()
-        if not started.get("enabled"):
-            return False
-        entry = _TELEMT_MTPROTO
-    username = _telemt_username(uid)
-    body = {"secret": secret_hex.lower()}
+    if entry is None:
+        return 0
     try:
-        if max_conns and int(max_conns) > 0:
-            body["max_tcp_conns"] = int(max_conns)
-        if limit_bytes and int(limit_bytes) > 0:
-            body["data_quota_bytes"] = int(limit_bytes)
+        return int((entry.get("fields") or {}).get("generation") or 0)
     except (TypeError, ValueError):
-        return False
-    if expires_at is not None:
-        text = _rfc3339(expires_at)
-        if text is None:
-            return False
-        body["expiration_rfc3339"] = text
+        return 0
+
+
+def mtproto_counted_bytes(uid):
+    target = str(uid)
+    total = int(_MTPROXY_FLUSHED.get(target, 0) or 0)
+    for session in list(ACTIVE_PROXY.values()):
+        if session.get("protocol") != "mtproto":
+            continue
+        if str(session.get("username") or "") != target:
+            continue
+        total += int(session.get("bytes_up", 0) or 0) + int(session.get("bytes_down", 0) or 0) - int(session.get("bytes_flushed", 0) or 0)
+    return total
+
+
+async def _telemt_mtproto_upsert_api(entry, username, body):
     path = "/v1/users/" + _url_path_quote(username, safe="")
     status, payload = None, {}
     for attempt in range(5):
@@ -1405,35 +1589,99 @@ async def telemt_mtproto_upsert_user(uid, secret_hex, variant="dd", domain="www.
             await asyncio.sleep(1.0)
             continue
         break
-    _LOG.warning("telemt MTProto upsert failed for uid %s: %s", uid, _telemt_api_error(payload))
+    _LOG.warning("telemt MTProto upsert failed for user %s: %s", username, _telemt_api_error(payload))
     return False
+
+
+async def _telemt_mtproto_wait_live(entry, username, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "GET", "/v1/users/" + _url_path_quote(username, safe=""))
+        if status is None:
+            return True
+        if status == 404:
+            return False
+        if status == 200 and payload.get("ok"):
+            data = payload.get("data") or {}
+            if data.get("in_runtime", True):
+                return True
+        await asyncio.sleep(0.5)
+    return False
+
+
+async def telemt_mtproto_upsert_user(uid, secret_hex, variant="dd", domain="www.google.com", max_conns=0, limit_bytes=0, expires_at=None):
+    if not _valid_secret_hex(secret_hex):
+        _LOG.warning("telemt MTProto upsert refused for uid %s: secret must be 32 hex characters", uid)
+        return False
+    body = {"secret": secret_hex.lower()}
+    try:
+        if max_conns and int(max_conns) > 0:
+            body["max_tcp_conns"] = int(max_conns)
+        if limit_bytes and int(limit_bytes) > 0:
+            body["data_quota_bytes"] = int(limit_bytes)
+    except (TypeError, ValueError):
+        return False
+    expires_text = None
+    if expires_at is not None:
+        expires_text = _rfc3339(expires_at)
+        if expires_text is None:
+            return False
+        body["expiration_rfc3339"] = expires_text
+    username = _telemt_username(uid)
+    async with _telemt_lock("mtproto-upsert"):
+        _TELEMT_MTPROTO_USERS[username] = {"uid": str(uid), "secret_hex": secret_hex.lower(), "max_conns": int(max_conns or 0), "limit_bytes": int(limit_bytes or 0), "expires_at": expires_text}
+        entry = _TELEMT_MTPROTO
+        if entry is None or not entry.get("ready"):
+            started = await telemt_start_mtproto()
+            if not started.get("enabled"):
+                return False
+            entry = _TELEMT_MTPROTO
+            return await _telemt_mtproto_wait_live(entry, username)
+        try:
+            _write_mtproto_config(entry)
+        except OSError:
+            pass
+        if await _telemt_mtproto_upsert_api(entry, username, body):
+            return await _telemt_mtproto_wait_live(entry, username)
+        _LOG.warning("telemt MTProto API upsert failed for user %s; restarting the MTProto child so the user is live from its config", username)
+        if not await _restart_mtproto_entry(entry):
+            return False
+        return await _telemt_mtproto_wait_live(_TELEMT_MTPROTO, username)
 
 
 async def telemt_mtproto_remove_user(uid):
-    entry = _TELEMT_MTPROTO
-    if entry is None or not entry.get("ready"):
-        return False
     username = _telemt_username(uid)
-    path = "/v1/users/" + _url_path_quote(username, safe="")
-    status, payload = None, {}
-    for attempt in range(5):
-        status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "DELETE", path)
-        if status in (200, 202) and payload.get("ok"):
+    async with _telemt_lock("mtproto-upsert"):
+        _TELEMT_MTPROTO_USERS.pop(username, None)
+        entry = _TELEMT_MTPROTO
+        if entry is None:
             return True
-        if status == 404:
-            return True
-        if status == 409:
-            if _telemt_error_code(payload) == "reload_in_progress":
-                await asyncio.sleep(1.0)
-                continue
-            status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "POST", path + "/disable")
+        try:
+            _write_mtproto_config(entry)
+        except OSError:
+            pass
+        if not entry.get("ready"):
+            return await _restart_mtproto_entry(entry)
+        path = "/v1/users/" + _url_path_quote(username, safe="")
+        status, payload = None, {}
+        for attempt in range(5):
+            status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "DELETE", path)
             if status in (200, 202) and payload.get("ok"):
-                _LOG.warning("telemt refused to delete the last MTProto user %s; disabled it instead", uid)
                 return True
-            return False
-        break
-    _LOG.warning("telemt MTProto remove failed for uid %s: %s", uid, _telemt_api_error(payload))
-    return False
+            if status == 404:
+                return True
+            if status == 409:
+                if _telemt_error_code(payload) == "reload_in_progress":
+                    await asyncio.sleep(1.0)
+                    continue
+                status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "POST", path + "/disable")
+                if status in (200, 202) and payload.get("ok"):
+                    _LOG.warning("telemt refused to delete the last MTProto user %s; disabled it instead", uid)
+                    return True
+                return False
+            break
+        _LOG.warning("telemt MTProto remove failed for user %s: %s; restarting the MTProto child so the user is gone from its config", uid, _telemt_api_error(payload))
+        return await _restart_mtproto_entry(entry)
 
 
 async def telemt_mtproto_user_stats(uid):
