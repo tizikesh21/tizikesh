@@ -132,6 +132,9 @@ _TELEMT_ROOT_UID = ""
 _TELEMT_ROOT_SECRET_HEX = ""
 _TELEMT_ROOT_CHILD_UID = "legacy-root"
 _TELEMT_ROOT_CHILD_TOKEN = "legacy-root"
+_TELEMT_ROOT_SYNC_LOCK = asyncio.Lock()
+_TELEMT_ROOT_SYNC_STATE = {"last_attempt": 0.0, "last_error": "", "last_key": ""}
+_TELEMT_ROOT_SYNC_COOLDOWN_SECONDS = 120.0
 _LAST_PUBLIC_DOMAIN = ""
 _PROXY_CODE_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"
 
@@ -412,59 +415,111 @@ async def _telemt_refresh_web_status(uid=None):
             _TELEMT_WEB_STATUS_CACHE[link.get("uid", "")] = (status, time.monotonic())
 
 
+async def _telemt_root_child_is_rooted():
+    try:
+        checked = await _tg_call("telemt_web_base_path", _TELEMT_ROOT_CHILD_UID)
+    except Exception:
+        return False
+    if not isinstance(checked, tuple) or len(checked) != 2:
+        return False
+    base_path, err = checked
+    if err:
+        return False
+    return base_path == ""
+
+
 async def _telemt_sync_root_vhost():
     global _TELEMT_ROOT_UID, _TELEMT_ROOT_SECRET_HEX
-    oldest = _oldest_active_web()
-    oldest_uid = str(oldest.get("uid", "")) if oldest else ""
-    if not oldest_uid:
-        if _TELEMT_ROOT_UID:
-            try:
-                await _tg_call("telemt_stop_web", _TELEMT_ROOT_CHILD_UID)
-            except Exception:
-                pass
-            _TELEMT_PROVISIONED["web"].discard(_TELEMT_ROOT_CHILD_UID)
-            _TELEMT_ROOT_UID = ""
-            _TELEMT_ROOT_SECRET_HEX = ""
-        return
-    try:
-        secret_hex = _web_secret_hex_for_link(oldest)
-    except ValueError:
-        return
-    if oldest_uid == _TELEMT_ROOT_UID and _TELEMT_ROOT_CHILD_UID in _TELEMT_PROVISIONED.get("web", set()) and _TELEMT_ROOT_SECRET_HEX == secret_hex:
-        return
-    try:
-        await _tg_call("telemt_stop_web", _TELEMT_ROOT_CHILD_UID)
-    except Exception:
-        pass
-    _TELEMT_PROVISIONED["web"].discard(_TELEMT_ROOT_CHILD_UID)
-    _TELEMT_ROOT_UID = ""
-    _TELEMT_ROOT_SECRET_HEX = ""
-    host = get_domain()
-    public_ip = None
-    try:
-        resolved = await resolve_domain_to_ip(host)
-        if resolved:
-            public_ip = resolved
-    except Exception:
+    async with _TELEMT_ROOT_SYNC_LOCK:
+        oldest = _oldest_active_web()
+        oldest_uid = str(oldest.get("uid", "")) if oldest else ""
+        if not oldest_uid:
+            if _TELEMT_ROOT_UID:
+                try:
+                    await _tg_call("telemt_stop_web", _TELEMT_ROOT_CHILD_UID)
+                except Exception:
+                    pass
+                _TELEMT_PROVISIONED["web"].discard(_TELEMT_ROOT_CHILD_UID)
+                _TELEMT_ROOT_UID = ""
+                _TELEMT_ROOT_SECRET_HEX = ""
+                _TELEMT_ROOT_SYNC_STATE["last_key"] = ""
+                _TELEMT_ROOT_SYNC_STATE["last_error"] = ""
+                WEBPROXY_STATE["child_errors"].pop(_TELEMT_ROOT_CHILD_UID, None)
+            return
+        try:
+            secret_hex = _web_secret_hex_for_link(oldest)
+        except ValueError:
+            return
+        host = get_domain()
+        key = oldest_uid + "|" + secret_hex + "|" + host
+        if oldest_uid == _TELEMT_ROOT_UID and _TELEMT_ROOT_SECRET_HEX == secret_hex and _TELEMT_ROOT_CHILD_UID in _TELEMT_PROVISIONED.get("web", set()):
+            if await _telemt_root_child_is_rooted():
+                WEBPROXY_STATE["child_errors"].pop(_TELEMT_ROOT_CHILD_UID, None)
+                return
+            if _TELEMT_ROOT_SYNC_STATE.get("last_key") == key and time.monotonic() - float(_TELEMT_ROOT_SYNC_STATE.get("last_attempt") or 0) < _TELEMT_ROOT_SYNC_COOLDOWN_SECONDS:
+                return
         public_ip = None
-    max_sessions = int(oldest.get("max_connections") or 0)
-    if max_sessions <= 0:
-        max_sessions = 8
-    result = await _tg_call("telemt_start_web", _TELEMT_ROOT_CHILD_UID, _TELEMT_ROOT_CHILD_TOKEN, secret_hex, host, max_sessions=max_sessions, max_streams=512, public_ip=public_ip)
-    if not isinstance(result, dict) or not result.get("enabled"):
-        err = str(result.get("error") or "telemt root WEB child did not start") if isinstance(result, dict) else "telemt root WEB child did not start"
+        try:
+            resolved = await resolve_domain_to_ip(host)
+            if resolved:
+                public_ip = resolved
+        except Exception:
+            public_ip = None
+        max_sessions = int(oldest.get("max_connections") or 0)
+        if max_sessions <= 0:
+            max_sessions = 8
+        _TELEMT_ROOT_SYNC_STATE["last_attempt"] = time.monotonic()
+        _TELEMT_ROOT_SYNC_STATE["last_key"] = key
+        result = None
+        direct_unsupported = False
+        try:
+            result = await _tg_call("telemt_start_web", _TELEMT_ROOT_CHILD_UID, _TELEMT_ROOT_CHILD_TOKEN, secret_hex, host, max_sessions=max_sessions, max_streams=512, public_ip=public_ip, root_enabled=True)
+        except TypeError:
+            direct_unsupported = True
+        if isinstance(result, dict) and result.get("enabled"):
+            if await _telemt_root_child_is_rooted():
+                _TELEMT_PROVISIONED["web"].add(_TELEMT_ROOT_CHILD_UID)
+                _TELEMT_ROOT_UID = oldest_uid
+                _TELEMT_ROOT_SECRET_HEX = secret_hex
+                _TELEMT_ROOT_SYNC_STATE["last_error"] = ""
+                WEBPROXY_STATE["child_errors"].pop(_TELEMT_ROOT_CHILD_UID, None)
+                return
+            start_err = "telemt root WEB child started but its vhost is not at the root"
+        elif isinstance(result, dict):
+            start_err = str(result.get("error") or "telemt root WEB child did not start")
+        elif _tg_fn("telemt_start_web") is None:
+            start_err = "telemt WEB start is not available in the telegram module"
+        else:
+            start_err = "telemt root WEB child did not start"
+        if direct_unsupported:
+            result = await _tg_call("telemt_start_web", _TELEMT_ROOT_CHILD_UID, _TELEMT_ROOT_CHILD_TOKEN, secret_hex, host, max_sessions=max_sessions, max_streams=512, public_ip=public_ip)
+            if isinstance(result, dict) and result.get("enabled"):
+                start_err = ""
+        rooted = None
+        if _telemt_web_port_for_uid(_TELEMT_ROOT_CHILD_UID) is not None:
+            rooted = await _tg_call("telemt_web_set_root", _TELEMT_ROOT_CHILD_UID, True)
+        if rooted is True:
+            _TELEMT_PROVISIONED["web"].add(_TELEMT_ROOT_CHILD_UID)
+            _TELEMT_ROOT_UID = oldest_uid
+            _TELEMT_ROOT_SECRET_HEX = secret_hex
+            _TELEMT_ROOT_SYNC_STATE["last_error"] = ""
+            WEBPROXY_STATE["child_errors"].pop(_TELEMT_ROOT_CHILD_UID, None)
+            return
+        detail = ""
+        try:
+            detail_fn = _tg_fn("telemt_web_root_error")
+            if detail_fn is not None:
+                detail = str(detail_fn(_TELEMT_ROOT_CHILD_UID) or "")
+        except Exception:
+            detail = ""
+        err = start_err
+        if detail:
+            err = err + "; root vhost enable failed: " + detail
+        elif rooted is False:
+            err = err + "; telemt root vhost could not be enabled on the legacy-root child"
         WEBPROXY_STATE["child_errors"][_TELEMT_ROOT_CHILD_UID] = err
-        logger.error("telemt legacy-root WEB child failed to start: " + err)
-        return
-    rooted = await _tg_call("telemt_web_set_root", _TELEMT_ROOT_CHILD_UID, True)
-    if rooted is False:
-        WEBPROXY_STATE["child_errors"][_TELEMT_ROOT_CHILD_UID] = "telemt root vhost could not be enabled on the legacy-root child"
-        logger.error("telemt legacy-root WEB child failed to enable its root vhost")
-        return
-    _TELEMT_PROVISIONED["web"].add(_TELEMT_ROOT_CHILD_UID)
-    _TELEMT_ROOT_UID = oldest_uid
-    _TELEMT_ROOT_SECRET_HEX = secret_hex
-    WEBPROXY_STATE["child_errors"].pop(_TELEMT_ROOT_CHILD_UID, None)
+        _TELEMT_ROOT_SYNC_STATE["last_error"] = err
+        logger.error("telemt legacy-root WEB child failed: " + err)
 
 
 async def _telemt_provision_web(link):
@@ -3257,6 +3312,9 @@ def _proxy_inbound_disabled_reason(link):
     if protocol not in PROXY_PROTOCOLS:
         return ""
     if protocol == "webproxy":
+        own_err = _webproxy_child_error_for_uid(link.get("uid", ""))
+        if own_err:
+            return "WEB proxy child failed for this inbound: " + own_err
         try:
             port = int(link.get("port") or 443)
         except (TypeError, ValueError):
@@ -3314,11 +3372,21 @@ def _proxy_listener_enabled(protocol):
     return False
 
 
+def _webproxy_child_error_for_uid(uid):
+    child_errors = WEBPROXY_STATE.get("child_errors") or {}
+    if uid and str(uid) in child_errors:
+        return str(child_errors.get(str(uid)) or "")
+    return ""
+
+
 def _proxy_disabled_reason(protocol):
     if protocol == "webproxy":
         child_errors = WEBPROXY_STATE.get("child_errors") or {}
         if child_errors:
-            return "WEB proxy child failed: " + str(next(iter(child_errors.values())))
+            own = [str(v) for k, v in child_errors.items() if k != _TELEMT_ROOT_CHILD_UID]
+            if own:
+                return "WEB proxy child failed: " + str(own[0])
+            return "WEB proxy legacy root child failed: " + str(next(iter(child_errors.values()))) + " (token links are unaffected; only legacy root links need the root child)"
         err = (TG_PROXY_STATUS.get("webproxy", {}) or {}).get("error", "") or ""
         if err:
             return "WEB proxy is not configured: " + err
@@ -3334,7 +3402,9 @@ def _proxy_disabled_reason(protocol):
             return "No listener port configured on this host (port 0); raw TCP listeners cannot be published on a single-port host, use the WEB proxy or a VPS or Railway TCP Proxy"
         if err:
             return "Listener failed on port " + str(port) + ": " + err
-        return "Listener disabled on this host (Render exposes one HTTP port only; set SOCKS_PORT / TG_PROXY_PORT / HTTP_PROXY_PORT on a VPS or Railway TCP Proxy)"
+        if _proxy_mux_bound(port):
+            return "Listener is bound on port " + str(port) + " locally and the local handshake passes, but the public address is not reachable from outside on this host (single HTTPS port only, or the TCP port is closed)"
+        return "Listener is not bound on port " + str(port) + " yet"
     return ""
 
 
@@ -3370,7 +3440,7 @@ async def _card_raw_tcp_usable(pid, domain, port, uid, variant="", tls_domain=""
     if verdict == "pass":
         return True, "running"
     if verdict == "local_only":
-        return False, "not_reachable"
+        return True, "local_only"
     return False, "listener_failed"
 
 
@@ -3492,6 +3562,8 @@ async def _listener_cards(public_port, request=None):
                 _shown_port = int(_card_link.get("port") or _pport or 0)
             except (TypeError, ValueError):
                 _shown_port = _pport
+        if _on and _code == "local_only":
+            _why = "Listener is bound on port " + str(_shown_port) + " and the local handshake passes, but the public address is not reachable from outside on this host (single HTTPS port only, or the TCP port is closed)"
         cards.append({"id": _pid, "name": _pname, "protocol": _pid, "port": str(_shown_port) if _shown_port else "—", "enabled": bool(_on), "reason": _why, "reason_code": _code})
     _web_on, _web_code = usable.get("webproxy", (_proxy_listener_enabled("webproxy"), "running_panel" if _proxy_listener_enabled("webproxy") else "not_configured"))
     cards.append({"id": "webproxy", "name": "WEB proxy", "protocol": "webproxy", "port": str(WEBPROXY_PUBLIC_PORT), "enabled": bool(_web_on), "reason": "" if _web_on else _proxy_disabled_reason("webproxy"), "reason_code": "running_panel" if _web_on else _web_code, "shared": _webproxy_shared_443()})
@@ -3630,20 +3702,32 @@ async def refresh_proxy_listener_status(force=False):
             await _telemt_refresh_web_status()
         except Exception:
             pass
+        child_errors = WEBPROXY_STATE.get("child_errors") or {}
+        root_err = str(child_errors.get(_TELEMT_ROOT_CHILD_UID) or "")
+        web_entry["root_error"] = root_err
+        web_entry["root_child"] = {"running": _telemt_web_port_for_uid(_TELEMT_ROOT_CHILD_UID) is not None, "error": root_err}
         if web_entry.get("enabled"):
             async with LINKS_LOCK:
                 web_rows = [link for link in LINKS.values() if (link.get("protocol") or "") == "webproxy" and link.get("active")]
             if web_rows:
                 any_healthy = False
+                own_errors = []
                 for link in web_rows:
                     status = _telemt_web_status_cached(str(link.get("uid", "")))
                     if status.get("enabled") and not status.get("error"):
                         any_healthy = True
                         break
+                    own = _webproxy_child_error_for_uid(link.get("uid", ""))
+                    if own:
+                        own_errors.append(own)
                 if not any_healthy:
-                    child_errors = WEBPROXY_STATE.get("child_errors") or {}
                     web_entry["enabled"] = False
-                    web_entry["error"] = str(next(iter(child_errors.values()))) if child_errors else "telemt WEB child is not running for the active WEB inbound"
+                    if own_errors:
+                        web_entry["error"] = str(own_errors[0])
+                    elif root_err:
+                        web_entry["error"] = "WEB proxy token children are not running; legacy root child also failed: " + root_err
+                    else:
+                        web_entry["error"] = "telemt WEB child is not running for the active WEB inbound"
                     TG_PROXY_STATUS["webproxy"] = web_entry
         _invalidate_card_usability()
         _PROXY_LISTENER_PROBE_AT = time.monotonic()
@@ -5629,6 +5713,24 @@ app.add_middleware(PanelPrefixMiddleware)
 async def chart_js():
     return Response(content=CHARTJS_BYTES, media_type="application/javascript", headers={"Cache-Control": "public, max-age=86400"})
 
+_FONT_FILES = {
+    "Inter-Variable.woff2": "font/woff2",
+    "Vazirmatn-Variable.woff2": "font/woff2",
+}
+
+
+@app.get("/static/fonts/{name}")
+async def font_file(name: str):
+    if name not in _FONT_FILES:
+        return Response(status_code=404)
+    font_path = os.path.join(os.path.dirname(__file__), "static", "fonts", name)
+    try:
+        with open(font_path, "rb") as font_handle:
+            font_bytes = font_handle.read()
+    except OSError:
+        return Response(status_code=404)
+    return Response(content=font_bytes, media_type=_FONT_FILES[name], headers={"Cache-Control": "public, max-age=86400"})
+
 
 @app.post("/api/tg-webhook")
 @limiter.limit("60/minute")
@@ -6398,7 +6500,7 @@ def parse_user_agent(ua: str) -> tuple:
         browser = "Unknown"
     return browser, os_name
 
-SX_TOKEN_CSS = r""":root{
+SX_TOKEN_CSS = r"""@font-face{font-family:"Inter";font-style:normal;font-weight:100 900;font-display:swap;src:url(/static/fonts/Inter-Variable.woff2) format("woff2")}@font-face{font-family:"Vazirmatn";font-style:normal;font-weight:100 900;font-display:swap;src:url(/static/fonts/Vazirmatn-Variable.woff2) format("woff2")}:root{
 --sx-bg:#070a06;
 --sx-surface:#0d120b;
 --sx-surface-2:#131a0f;
@@ -6449,7 +6551,7 @@ SX_TOKEN_CSS = r""":root{
 --sx-radius-lg:12px;
 --sx-radius-xl:16px;
 --sx-radius-full:9999px;
---sx-font-sans:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,"Tahoma",sans-serif;
+--sx-font-sans:"Inter","Vazirmatn",system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,"Tahoma",sans-serif;
 --sx-font-mono:ui-monospace,"SF Mono","Cascadia Mono",Menlo,Consolas,"Roboto Mono",monospace;
 --sx-transition:120ms ease-out;
 --sx-space-1:4px;
@@ -6460,18 +6562,18 @@ SX_TOKEN_CSS = r""":root{
 --sx-space-6:24px;
 --sx-space-7:32px;
 --sx-space-8:40px;
---sx-text-xs:11px;
---sx-text-sm:12px;
---sx-text-md:14px;
---sx-text-base:15px;
---sx-text-lg:17px;
---sx-text-xl:20px;
---sx-text-2xl:24px;
+--sx-text-xs:12px;
+--sx-text-sm:14px;
+--sx-text-md:16px;
+--sx-text-base:16px;
+--sx-text-lg:19px;
+--sx-text-xl:22px;
+--sx-text-2xl:26px;
 --sx-leading-tight:1.25;
 --sx-leading-normal:1.5;
 --sx-leading-relaxed:1.65;
---sx-control-h:40px;
---sx-control-h-sm:32px;
+--sx-control-h:48px;
+--sx-control-h-sm:44px;
 --sx-sidebar-w:272px;
 --bg:var(--sx-bg);
 --surface:var(--sx-surface);
@@ -6651,7 +6753,7 @@ bdi{unicode-bidi:isolate}
 .logo{display:inline-flex;align-items:center;gap:8px;font-family:var(--sx-font-sans);font-size:20px;font-weight:800;color:var(--sx-text);letter-spacing:-0.02em;flex-shrink:0}
 .logo::before{content:"";width:20px;height:20px;background:var(--sx-accent);border-radius:6px;flex:none;box-shadow:var(--sx-glow)}
 .version-tag{font-family:var(--sx-font-mono);font-size:var(--sx-text-xs);font-weight:600;background:var(--sx-surface-2);border:1px solid var(--sx-border);color:var(--sx-text-2);border-radius:var(--sx-radius-full);padding:2px 8px}
-.btn{font-family:inherit;font-size:var(--sx-text-md);font-weight:600;border-radius:var(--sx-radius-md);padding:8px 14px;min-height:var(--sx-control-h);cursor:pointer;display:inline-flex;align-items:center;justify-content:center;gap:8px;border:1px solid transparent;transition:background-color var(--sx-transition),color var(--sx-transition),border-color var(--sx-transition),transform 150ms ease-out;position:relative;letter-spacing:0.01em;background:var(--sx-surface-2);color:var(--sx-text)}
+.btn{font-family:inherit;font-size:var(--sx-text-md);font-weight:600;border-radius:var(--sx-radius-md);padding:12px 18px;min-height:var(--sx-control-h);cursor:pointer;display:inline-flex;align-items:center;justify-content:center;gap:8px;border:1px solid transparent;transition:background-color var(--sx-transition),color var(--sx-transition),border-color var(--sx-transition),transform 150ms ease-out;position:relative;letter-spacing:0.01em;background:var(--sx-surface-2);color:var(--sx-text)}
 .btn:active{transform:scale(0.97)}
 .btn:disabled{opacity:0.5;cursor:not-allowed}
 .btn-primary{background:var(--sx-accent-solid);color:var(--sx-on-accent);box-shadow:var(--sx-shadow-sm)}
@@ -6660,42 +6762,42 @@ bdi{unicode-bidi:isolate}
 .btn-outline:hover{background:var(--sx-surface-2);border-color:var(--sx-accent-border)}
 .btn-danger{background:var(--sx-danger-solid);color:var(--sx-on-danger)}
 .btn-danger:hover{background:var(--sx-danger-hover)}
-.btn-sm{min-height:var(--sx-control-h-sm);padding:4px 10px;font-size:var(--sx-text-sm)}
+.btn-sm{min-height:var(--sx-control-h-sm);padding:10px 14px;font-size:var(--sx-text-sm)}
 .btn-icon{display:inline-flex;align-items:center;justify-content:center;width:38px;height:38px;border-radius:var(--sx-radius-md);border:1px solid var(--sx-border);background:var(--sx-surface);color:var(--sx-text-2);cursor:pointer;transition:background-color var(--sx-transition),color var(--sx-transition),border-color var(--sx-transition);flex:none}
 .btn-icon:hover{background:var(--sx-surface-2);color:var(--sx-text);border-color:var(--sx-accent-border)}
 .btn-danger-icon:hover{color:var(--sx-danger);border-color:var(--sx-danger-border)}
 .btn:focus-visible,.btn-icon:focus-visible,.act-btn:focus-visible,.nav-link:focus-visible,.pill-btn:focus-visible,.chip:focus-visible,.seg-btn:focus-visible,.lang-btn:focus-visible,.mo-close:focus-visible{outline:2px solid var(--sx-focus);outline-offset:2px}
 .lang-switch{display:flex;gap:2px;background:var(--sx-surface-2);border:1px solid var(--sx-border);border-radius:var(--sx-radius-md);padding:3px}
-.lang-btn{padding:6px 12px;border:none;background:transparent;color:var(--sx-text-3);font-size:13px;font-weight:700;border-radius:var(--sx-radius-sm);cursor:pointer;font-family:inherit;transition:background-color var(--sx-transition),color var(--sx-transition)}
+.lang-btn{padding:10px 14px;border:none;background:transparent;color:var(--sx-text-3);font-size:15px;font-weight:700;border-radius:var(--sx-radius-sm);cursor:pointer;font-family:inherit;transition:background-color var(--sx-transition),color var(--sx-transition)}
 .lang-btn.active{background:var(--sx-accent-solid);color:var(--sx-on-accent)}
 .card{background:var(--sx-surface);border:1px solid var(--sx-border);border-radius:var(--sx-radius-xl);padding:20px;box-shadow:var(--sx-shadow-sm);min-width:0;transition:border-color var(--sx-transition),box-shadow var(--sx-transition)}
 .card:hover{border-color:var(--sx-border-strong)}
 .card-hd{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:14px}
 .card-title{font-size:var(--sx-text-lg);font-weight:700;color:var(--sx-text);letter-spacing:-0.01em}
-.fg{display:flex;flex-direction:column;gap:6px;margin-bottom:14px;min-width:0}
-.fl{font-size:var(--sx-text-sm);font-weight:700;color:var(--sx-text-2);letter-spacing:0.04em;text-transform:uppercase}
-.fi,.fs{width:100%;max-width:100%;min-height:var(--sx-control-h);padding:9px 12px;border:1px solid var(--sx-border);border-radius:var(--sx-radius-md);background:var(--sx-surface-2);color:var(--sx-text);font-size:var(--sx-text-md);font-family:inherit;transition:border-color var(--sx-transition),box-shadow var(--sx-transition)}
+.fg{display:flex;flex-direction:column;gap:10px;margin-bottom:20px;min-width:0}
+.fl{font-size:var(--sx-text-sm);font-weight:700;color:var(--sx-text-2);letter-spacing:0.04em;text-transform:uppercase;line-height:1.5}
+.fi,.fs{width:100%;max-width:100%;min-height:var(--sx-control-h);padding:13px 14px;border:1px solid var(--sx-border);border-radius:var(--sx-radius-md);background:var(--sx-surface-2);color:var(--sx-text);font-size:var(--sx-text-md);font-family:inherit;transition:border-color var(--sx-transition),box-shadow var(--sx-transition)}
 .fi:focus,.fs:focus{outline:none;border-color:var(--sx-accent);box-shadow:0 0 0 3px var(--sx-accent-soft)}
 .fi::placeholder{color:var(--sx-text-3)}
 textarea.fi{resize:vertical;min-height:130px;white-space:pre-wrap;overflow-wrap:break-word;word-break:break-word}
 select.fi,select.fs{cursor:pointer}
 input[type="color"].fi{padding:4px;height:44px}
-.hint{font-size:0.85rem;color:var(--sx-text-3);line-height:var(--sx-leading-relaxed)}
+.hint{font-size:0.95rem;color:var(--sx-text-3);line-height:var(--sx-leading-relaxed)}
 .tag{display:inline-flex;align-items:center;gap:4px;font-size:var(--sx-text-xs);font-weight:700;padding:3px 8px;border-radius:var(--sx-radius-full);background:var(--sx-surface-3);border:1px solid var(--sx-border);color:var(--sx-text-2);white-space:nowrap}
 .tag-on{background:var(--sx-success-soft);border-color:var(--sx-success-border);color:var(--sx-success-ink)}
 .tag-off{background:var(--sx-danger-soft);border-color:var(--sx-danger-border);color:var(--sx-danger-ink)}
 .tag-vless{background:var(--sx-accent-soft);border-color:var(--sx-accent-border);color:var(--sx-accent-ink)}
-.chip{display:inline-flex;align-items:center;gap:6px;padding:6px 12px;border-radius:var(--sx-radius-full);border:1px solid var(--sx-border);background:var(--sx-surface-2);color:var(--sx-text-2);font-size:var(--sx-text-sm);font-weight:600;cursor:pointer;transition:background-color var(--sx-transition),color var(--sx-transition),border-color var(--sx-transition)}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:10px 16px;border-radius:var(--sx-radius-full);border:1px solid var(--sx-border);background:var(--sx-surface-2);color:var(--sx-text-2);font-size:var(--sx-text-md);font-weight:600;cursor:pointer;transition:background-color var(--sx-transition),color var(--sx-transition),border-color var(--sx-transition)}
 .chip:hover{border-color:var(--sx-accent-border);color:var(--sx-text)}
 .chip.active{background:var(--sx-accent-solid);border-color:var(--sx-accent-solid);color:var(--sx-on-accent)}
 .chip:active{transform:scale(0.97)}
 .pill-group{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
-.pill-btn{padding:7px 14px;border-radius:var(--sx-radius-full);border:1px solid var(--sx-border);background:var(--sx-surface-2);color:var(--sx-text-2);font-size:var(--sx-text-sm);font-weight:600;cursor:pointer;transition:background-color var(--sx-transition),color var(--sx-transition),border-color var(--sx-transition)}
+.pill-btn{min-height:var(--sx-control-h);padding:11px 16px;border-radius:var(--sx-radius-full);border:1px solid var(--sx-border);background:var(--sx-surface-2);color:var(--sx-text-2);font-size:var(--sx-text-md);font-weight:600;cursor:pointer;transition:background-color var(--sx-transition),color var(--sx-transition),border-color var(--sx-transition)}
 .pill-btn:hover{border-color:var(--sx-accent-border);color:var(--sx-text)}
 .pill-btn.active{background:var(--sx-accent-solid);border-color:var(--sx-accent-solid);color:var(--sx-on-accent)}
 .pill-btn:active{transform:scale(0.97)}
-.seg-group{display:flex;gap:2px;background:var(--sx-surface-2);border:1px solid var(--sx-border);border-radius:var(--sx-radius-md);padding:3px;width:fit-content;max-width:100%}
-.seg-btn{padding:7px 14px;border:none;background:transparent;color:var(--sx-text-3);font-size:var(--sx-text-sm);font-weight:700;border-radius:var(--sx-radius-sm);cursor:pointer;font-family:inherit;transition:background-color var(--sx-transition),color var(--sx-transition)}
+.seg-group{display:flex;gap:4px;background:var(--sx-surface-2);border:1px solid var(--sx-border);border-radius:var(--sx-radius-md);padding:5px;width:fit-content;max-width:100%}
+.seg-btn{min-height:var(--sx-control-h);padding:12px 18px;border:none;background:transparent;color:var(--sx-text-3);font-size:var(--sx-text-md);font-weight:700;border-radius:var(--sx-radius-sm);cursor:pointer;font-family:inherit;transition:background-color var(--sx-transition),color var(--sx-transition)}
 .seg-btn.active{background:var(--sx-accent-solid);color:var(--sx-on-accent)}
 .seg-btn:hover:not(.active){color:var(--sx-text)}
 .seg-btn:active{transform:scale(0.97)}
@@ -6781,13 +6883,16 @@ NOTFOUND_HTML = r"""<!DOCTYPE html>
 <div class="nf-card">
 <div class="nf-logo"><span class="nf-logo-dot"></span>SulgX Panel</div>
 <div class="nf-code">404</div>
-<p class="nf-msg">Page not found</p>
-<a class="nf-btn" href="/panel">Back to Panel</a>
+<span class="ic" style="--ic:36px;display:block;margin:0 auto 12px;color:var(--sx-warning);" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></span><p class="nf-msg" data-en="Page not found" data-fa="صفحه یافت نشد">Page not found</p>
+<a class="nf-btn" href="/panel"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg></span><span data-en="Back to Panel" data-fa="بازگشت به پنل">Back to Panel</span></a>
 </div>
  <script>
  var storedTheme = localStorage.getItem('theme') || 'dark';
  document.body.classList.toggle('light-mode', storedTheme==='light');
  document.body.classList.toggle('blue-dark', storedTheme==='blue-dark');
+ var storedLang = localStorage.getItem('ll') || 'en';
+ document.body.dir = storedLang === 'fa' ? 'rtl' : 'ltr';
+ document.querySelectorAll('[data-en]').forEach(function(el){ var v = el.getAttribute('data-' + storedLang); if (v) el.textContent = v; });
  </script>
 </body>
 </html>"""
@@ -6834,14 +6939,14 @@ LANDING_HTML = r"""<!DOCTYPE html>
       </div>
     </div>
     <div style="margin-top:8px;">
-      <button class="btn btn-primary" id="login-btn" onclick="window.location.href='/login'" style="width:100%;margin:0;padding:13px;"><span data-en="Login" data-fa="ورود">Login</span></button>
+      <button class="btn btn-primary" id="login-btn" onclick="window.location.href='/login'" style="width:100%;margin:0;padding:13px;"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="4.5"/><path d="M11 12L21 2M16 7l3 3"/></svg></span><span data-en="Login" data-fa="ورود">Login</span></button>
     </div>
   </div>
 </div>
 <div class="footer">
   <div class="footer-inner">
-    <a href="https://t.me/SulgX" target="_blank">Telegram</a>
-    <a href="https://github.com/SulgX" target="_blank">GitHub</a>
+    <a href="https://t.me/SulgX" target="_blank" style="display:inline-flex;align-items:center;gap:6px;"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg></span>Telegram</a>
+    <a href="https://github.com/SulgX" target="_blank" style="display:inline-flex;align-items:center;gap:6px;"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z"/></svg></span>GitHub</a>
   </div>
 </div>
 <script>
@@ -8550,6 +8655,8 @@ async def create_link(request: Request, _=Depends(require_auth)):
     udp_enabled = _rvalues["udp_enabled"]
     enable_ipv6 = _rvalues["enable_ipv6"]
     xray_dns_mode = _rvalues["xray_dns_mode"]
+    if profile != "custom":
+        custom_fp = fingerprint
     _ech_preset_obj = ech_preset_by_id(ech_preset)
     if _ech_preset_obj is not None:
         ech_enabled = 1
@@ -10235,6 +10342,8 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
         for _k, _v in _rbase.items():
             if _force_profile or _k not in body:
                 body[_k] = _v
+        if _force_profile:
+            body["custom_fp"] = body["fingerprint"]
     if "outbound_proxy" in body:
         try:
             _oproxy, _opass = split_outbound_proxy_for_store(body.get("outbound_proxy") or "", link.get("outbound_proxy_pass", ""))
@@ -11248,7 +11357,7 @@ async def user_dashboard(uid: str, request: Request):
     if expires and expires < datetime.now(UTC):
         raise HTTPException(status_code=403, detail="User expired")
     quota_exceeded = link.get("limit_bytes") > 0 and link["used_bytes"] >= link["limit_bytes"]
-    status_html = '<span class="status"><span class="status-dot warn"></span><span>Quota Exceeded</span></span>' if quota_exceeded else '<span class="status"><span class="status-dot ok"></span><span>Active</span></span>' 
+    status_html = '<span class="status"><span class="status-dot warn"></span><span data-en="Quota Exceeded" data-fa="سهمیه تمام شد">Quota Exceeded</span></span>' if quota_exceeded else '<span class="status"><span class="status-dot ok"></span><span data-en="Active" data-fa="فعال">Active</span></span>' 
     used = link["used_bytes"]
     limit = link["limit_bytes"]
     usage_percent = 0 if limit == 0 else min(100, round(used / limit * 100, 1))
@@ -11284,7 +11393,9 @@ async def user_dashboard(uid: str, request: Request):
     )
     daily_data = [{"day": d["day"], "mb": round(d["bytes"]/1048576, 1)} for d in daily_usage]
     label_esc = html.escape(link['label'])
+    label_html = '<span data-en="This Server is Free" data-fa="این سرور رایگان است">This Server is Free</span>' if link['label'] == 'This Server is Free' else label_esc
     expiry_str_esc = html.escape(expiry_str)
+    expiry_html = '<span data-en="Unlimited ∞" data-fa="نامحدود ∞">Unlimited ∞</span>' if not expires else expiry_str_esc
     vless_link_esc = html.escape(vless_link)
     sub_url_esc = html.escape(sub_url)
     clash_url_esc = html.escape(clash_url)
@@ -11319,7 +11430,7 @@ async def user_dashboard(uid: str, request: Request):
 <body class="sx-doc-user">
 <div class="card">
   <div class="header-row">
-    <h1>{label_esc}</h1>
+    <h1>{label_html}</h1>
     <div class="lang-switch">
       <button class="lang-btn lang-en active" onclick="setLang('en')">EN</button>
       <button class="lang-btn lang-fa" onclick="setLang('fa')">FA</button>
@@ -11327,7 +11438,7 @@ async def user_dashboard(uid: str, request: Request):
   </div>
   <div class="info-box">
     <div class="row"><span class="label" data-en="Status" data-fa="وضعیت">Status</span><span class="value">{status_html}</span></div>
-    <div class="row"><span class="label" data-en="Expiration" data-fa="انقضا">Expiration</span><span class="value">{expiry_str_esc}</span></div>
+    <div class="row"><span class="label" data-en="Expiration" data-fa="انقضا">Expiration</span><span class="value">{expiry_html}</span></div>
     <div class="row row-wide"><span class="label" data-en="Data Usage" data-fa="مصرف داده">Data Usage</span><span class="value">{_fmt_bytes(used)} / {'∞' if limit == 0 else _fmt_bytes(limit)}</span></div>
     <div class="row"><span class="label" data-en="Remaining" data-fa="باقی‌مانده">Remaining</span><span class="value">{remaining_str}</span></div>
     <div class="progress-bar-bg"><div class="progress-bar-fill {{usage_bar_class}}"></div></div>
@@ -11342,7 +11453,7 @@ async def user_dashboard(uid: str, request: Request):
 </div>
   <div id="link-text-box" style="display:none;margin-top:12px;"><input id="link-text-input" readonly value="{vless_link_esc}" style="width:100%;padding:10px;border:1px solid var(--border);border-radius:8px;background:var(--surface-2);color:var(--text);font-size:13px;direction:ltr;text-align:start;"><button class="btn btn-outline" style="margin-top:8px;" onclick="copyToClip(document.getElementById('link-text-input').value, t('link_copied'))" data-en="Copy link text" data-fa="کپی متن لینک">Copy link text</button></div>
 </div>
-<div id="toast"><span class="ic" id="toast-ic"></span><span id="toast-msg">Copied!</span></div>
+<div id="toast"><span class="ic" id="toast-ic"></span><span id="toast-msg" data-en="Copied!" data-fa="کپی شد!">Copied!</span></div>
 <script>
 var lang = localStorage.getItem('ll') || 'en';
 var i18n = {{
@@ -13212,7 +13323,7 @@ def _webproxy_build_client_obfs_header(secret, dc=1):
     init = bytearray(os.urandom(64))
     while init[0] == 0xEF:
         init[0] = os.urandom(1)[0]
-    init[56:60] = b"\xef\xef\xef\xef"
+    init[56:60] = b"\xdd\xdd\xdd\xdd"
     init[60:62] = struct.pack("<h", int(dc))
     enc_key, enc_iv, _dk, _di = _mtproto_obfs_keys(bytes(init), secret)
     cipher = _mtproto_aes_ctr(enc_key, enc_iv)
@@ -13235,6 +13346,18 @@ def _webproxy_test_frame(frame_type, stream_id, payload):
     out[4:8] = struct.pack(">I", len(payload))
     out[8:] = payload
     return bytes(out)
+
+
+def _webproxy_lane_intercept_hint(payload):
+    sample = bytes(payload or b"")[:64]
+    if len(sample) < 8:
+        return False
+    if sample.startswith(b"muse:") or sample.startswith(b"HTTP/") or sample.startswith(b"<!doctype") or sample.startswith(b"<html"):
+        return True
+    printable = sum(1 for byte in sample if byte in (9, 10, 13) or 32 <= byte <= 126)
+    if printable * 10 >= len(sample) * 9 and b" " in sample:
+        return True
+    return False
 
 
 def _webproxy_test_split_frames(data):
@@ -13275,6 +13398,7 @@ async def _test_webproxy_lane_ws(ws_url, session_token, header, parsed, dc_timeo
         await ws.send(_webproxy_test_frame(1, lane_id, b"") + _webproxy_test_frame(2, lane_id, header))
         deadline = time.time() + 10.0
         window_ok = False
+        got_data = False
         while time.time() < deadline and not window_ok:
             try:
                 message = await asyncio.wait_for(ws.recv(), timeout=max(0.1, deadline - time.time()))
@@ -13285,10 +13409,16 @@ async def _test_webproxy_lane_ws(ws_url, session_token, header, parsed, dc_timeo
             for frame_type, stream_id, _payload in _webproxy_test_split_frames(bytes(message)):
                 if stream_id != lane_id:
                     continue
+                if frame_type == 2 and _payload:
+                    got_data = True
+                    if _webproxy_lane_intercept_hint(_payload):
+                        return False, "fail", "WEB proxy lane to Telegram DC1 received a plaintext non-Telegram response instead of MTProto data: outbound TCP to Telegram DCs is intercepted on this host (host-egress failure), the proxy itself is configured correctly"
                 if frame_type == 4:
                     window_ok = True
                 if frame_type == 3:
-                    return False, "fail", "WEB proxy lane to Telegram DC1 was closed by the server (DC unreachable or header rejected)"
+                    if got_data:
+                        return False, "fail", "WEB proxy lane to Telegram DC1 was closed by the server after DC data arrived (DC stage failure, no traffic flows through the DC)"
+                    return False, "fail", "WEB proxy lane to Telegram DC1 was closed by the server before any DC data arrived: the inner MTProto handshake was rejected by telemt (no matching user for this WEB secret)"
         if not window_ok:
             return False, "fail", "WEB proxy lane to Telegram DC1 got no answer within 10s"
         nonce = os.urandom(16)
@@ -13314,9 +13444,14 @@ async def _test_webproxy_lane_ws(ws_url, session_token, header, parsed, dc_timeo
                 if stream_id != lane_id:
                     continue
                 if frame_type == 3:
-                    return False, "fail", "Telegram DC1 closed the lane after the auth request (no traffic flows through the DC)"
+                    if got_data:
+                        return False, "fail", "Telegram DC1 closed the lane after the auth request (no traffic flows through the DC)"
+                    return False, "fail", "Telegram DC1 closed the lane after the auth request before any DC data arrived: the inner MTProto handshake was rejected by telemt (no matching user for this WEB secret)"
                 if frame_type != 2 or not payload:
                     continue
+                if _webproxy_lane_intercept_hint(payload):
+                    return False, "fail", "WEB proxy lane to Telegram DC1 received a plaintext non-Telegram response instead of MTProto data: outbound TCP to Telegram DCs is intercepted on this host (host-egress failure), the proxy itself is configured correctly"
+                got_data = True
                 plain = _webproxy_aes_ctr_at(parsed["write_key"], parsed["write_iv"], dc_pos, payload)
                 dc_pos += len(payload)
                 dc_buf += plain
@@ -13388,18 +13523,27 @@ async def _test_webproxy_lane_https(loopback, token, domain, session_token, head
             await _up(client, _webproxy_test_frame(1, lane_id, b"") + _webproxy_test_frame(2, lane_id, header))
             window_deadline = time.time() + 10.0
             window_ok = False
+            got_data = False
             while time.time() < window_deadline and not window_ok:
                 frames, closed = await _down(client, window_deadline, 10.0)
                 if closed:
-                    return False, "fail", "WEB proxy lane to Telegram DC1 was closed by the server (DC unreachable or header rejected)"
+                    if got_data:
+                        return False, "fail", "WEB proxy lane to Telegram DC1 was closed by the server after DC data arrived (DC stage failure, no traffic flows through the DC)"
+                    return False, "fail", "WEB proxy lane to Telegram DC1 was closed by the server before any DC data arrived: the inner MTProto handshake was rejected by telemt (no matching user for this WEB secret)"
                 if frames:
                     for frame_type, stream_id, _payload in _webproxy_test_split_frames(bytes(frames)):
                         if stream_id != lane_id:
                             continue
+                        if frame_type == 2 and _payload:
+                            got_data = True
+                            if _webproxy_lane_intercept_hint(_payload):
+                                return False, "fail", "WEB proxy lane to Telegram DC1 received a plaintext non-Telegram response instead of MTProto data: outbound TCP to Telegram DCs is intercepted on this host (host-egress failure), the proxy itself is configured correctly"
                         if frame_type == 4:
                             window_ok = True
                         if frame_type == 3:
-                            return False, "fail", "WEB proxy lane to Telegram DC1 was closed by the server (DC unreachable or header rejected)"
+                            if got_data:
+                                return False, "fail", "WEB proxy lane to Telegram DC1 was closed by the server after DC data arrived (DC stage failure, no traffic flows through the DC)"
+                            return False, "fail", "WEB proxy lane to Telegram DC1 was closed by the server before any DC data arrived: the inner MTProto handshake was rejected by telemt (no matching user for this WEB secret)"
             if not window_ok:
                 return False, "fail", "WEB proxy lane to Telegram DC1 got no answer within 10s"
             await _up(client, _webproxy_test_frame(2, lane_id, req_cipher))
@@ -13413,9 +13557,14 @@ async def _test_webproxy_lane_https(loopback, token, domain, session_token, head
                         if stream_id != lane_id:
                             continue
                         if frame_type == 3:
-                            return False, "fail", "Telegram DC1 closed the lane after the auth request (no traffic flows through the DC)"
+                            if got_data:
+                                return False, "fail", "Telegram DC1 closed the lane after the auth request (no traffic flows through the DC)"
+                            return False, "fail", "Telegram DC1 closed the lane after the auth request before any DC data arrived: the inner MTProto handshake was rejected by telemt (no matching user for this WEB secret)"
                         if frame_type != 2 or not payload:
                             continue
+                        if _webproxy_lane_intercept_hint(payload):
+                            return False, "fail", "WEB proxy lane to Telegram DC1 received a plaintext non-Telegram response instead of MTProto data: outbound TCP to Telegram DCs is intercepted on this host (host-egress failure), the proxy itself is configured correctly"
+                        got_data = True
                         plain = _webproxy_aes_ctr_at(parsed["write_key"], parsed["write_iv"], dc_pos, payload)
                         dc_pos += len(payload)
                         dc_buf += plain
@@ -13425,7 +13574,9 @@ async def _test_webproxy_lane_https(loopback, token, domain, session_token, head
                         if checked is False:
                             return False, "fail", "Telegram DC1 reply was not a valid MTProto response (bridge and session work, but the DC leg carries no real traffic)"
                 if closed:
-                    return False, "fail", "Telegram DC1 closed the lane after the auth request (no traffic flows through the DC)"
+                    if got_data:
+                        return False, "fail", "Telegram DC1 closed the lane after the auth request (no traffic flows through the DC)"
+                    return False, "fail", "Telegram DC1 closed the lane after the auth request before any DC data arrived: the inner MTProto handshake was rejected by telemt (no matching user for this WEB secret)"
             return False, "fail", "Telegram DC1 gave no valid MTProto answer to the auth request within " + str(int(dc_timeout)) + "s (bridge and session work, but no traffic flows through the DC)"
     except ValueError as exc:
         return False, "fail", "WEB proxy HTTPS carrier lane failed: " + str(exc)
@@ -17753,7 +17904,7 @@ bdi{unicode-bidi:isolate}
 .logo{display:inline-flex;align-items:center;gap:8px;font-family:var(--sx-font-sans);font-size:20px;font-weight:800;color:var(--sx-text);letter-spacing:-0.02em;flex-shrink:0}
 .logo::before{content:"";width:20px;height:20px;background:var(--sx-accent);border-radius:6px;flex:none;box-shadow:var(--sx-glow)}
 .version-tag{font-family:var(--sx-font-mono);font-size:var(--sx-text-xs);font-weight:600;background:var(--sx-surface-2);border:1px solid var(--sx-border);color:var(--sx-text-2);border-radius:var(--sx-radius-full);padding:2px 8px}
-.btn{font-family:inherit;font-size:var(--sx-text-md);font-weight:600;border-radius:var(--sx-radius-md);padding:8px 14px;min-height:var(--sx-control-h);cursor:pointer;display:inline-flex;align-items:center;justify-content:center;gap:8px;border:1px solid transparent;transition:background-color var(--sx-transition),color var(--sx-transition),border-color var(--sx-transition),transform 150ms ease-out;position:relative;letter-spacing:0.01em;background:var(--sx-surface-2);color:var(--sx-text)}
+.btn{font-family:inherit;font-size:var(--sx-text-md);font-weight:600;border-radius:var(--sx-radius-md);padding:12px 18px;min-height:var(--sx-control-h);cursor:pointer;display:inline-flex;align-items:center;justify-content:center;gap:8px;border:1px solid transparent;transition:background-color var(--sx-transition),color var(--sx-transition),border-color var(--sx-transition),transform 150ms ease-out;position:relative;letter-spacing:0.01em;background:var(--sx-surface-2);color:var(--sx-text)}
 .btn:active{transform:scale(0.97)}
 .btn:disabled{opacity:0.5;cursor:not-allowed}
 .btn-primary{background:var(--sx-accent-solid);color:var(--sx-on-accent);box-shadow:var(--sx-shadow-sm)}
@@ -17762,42 +17913,42 @@ bdi{unicode-bidi:isolate}
 .btn-outline:hover{background:var(--sx-surface-2);border-color:var(--sx-accent-border)}
 .btn-danger{background:var(--sx-danger-solid);color:var(--sx-on-danger)}
 .btn-danger:hover{background:var(--sx-danger-hover)}
-.btn-sm{min-height:var(--sx-control-h-sm);padding:4px 10px;font-size:var(--sx-text-sm)}
+.btn-sm{min-height:var(--sx-control-h-sm);padding:10px 14px;font-size:var(--sx-text-sm)}
 .btn-icon{display:inline-flex;align-items:center;justify-content:center;width:38px;height:38px;border-radius:var(--sx-radius-md);border:1px solid var(--sx-border);background:var(--sx-surface);color:var(--sx-text-2);cursor:pointer;transition:background-color var(--sx-transition),color var(--sx-transition),border-color var(--sx-transition);flex:none}
 .btn-icon:hover{background:var(--sx-surface-2);color:var(--sx-text);border-color:var(--sx-accent-border)}
 .btn-danger-icon:hover{color:var(--sx-danger);border-color:var(--sx-danger-border)}
 .btn:focus-visible,.btn-icon:focus-visible,.act-btn:focus-visible,.nav-link:focus-visible,.pill-btn:focus-visible,.chip:focus-visible,.seg-btn:focus-visible,.lang-btn:focus-visible,.mo-close:focus-visible{outline:2px solid var(--sx-focus);outline-offset:2px}
 .lang-switch{display:flex;gap:2px;background:var(--sx-surface-2);border:1px solid var(--sx-border);border-radius:var(--sx-radius-md);padding:3px}
-.lang-btn{padding:6px 12px;border:none;background:transparent;color:var(--sx-text-3);font-size:13px;font-weight:700;border-radius:var(--sx-radius-sm);cursor:pointer;font-family:inherit;transition:background-color var(--sx-transition),color var(--sx-transition)}
+.lang-btn{padding:10px 14px;border:none;background:transparent;color:var(--sx-text-3);font-size:15px;font-weight:700;border-radius:var(--sx-radius-sm);cursor:pointer;font-family:inherit;transition:background-color var(--sx-transition),color var(--sx-transition)}
 .lang-btn.active{background:var(--sx-accent-solid);color:var(--sx-on-accent)}
 .card{background:var(--sx-surface);border:1px solid var(--sx-border);border-radius:var(--sx-radius-xl);padding:20px;box-shadow:var(--sx-shadow-sm);min-width:0;transition:border-color var(--sx-transition),box-shadow var(--sx-transition)}
 .card:hover{border-color:var(--sx-border-strong)}
 .card-hd{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:14px}
 .card-title{font-size:var(--sx-text-lg);font-weight:700;color:var(--sx-text);letter-spacing:-0.01em}
-.fg{display:flex;flex-direction:column;gap:6px;margin-bottom:14px;min-width:0}
-.fl{font-size:var(--sx-text-sm);font-weight:700;color:var(--sx-text-2);letter-spacing:0.04em;text-transform:uppercase}
-.fi,.fs{width:100%;max-width:100%;min-height:var(--sx-control-h);padding:9px 12px;border:1px solid var(--sx-border);border-radius:var(--sx-radius-md);background:var(--sx-surface-2);color:var(--sx-text);font-size:var(--sx-text-md);font-family:inherit;transition:border-color var(--sx-transition),box-shadow var(--sx-transition)}
+.fg{display:flex;flex-direction:column;gap:10px;margin-bottom:20px;min-width:0}
+.fl{font-size:var(--sx-text-sm);font-weight:700;color:var(--sx-text-2);letter-spacing:0.04em;text-transform:uppercase;line-height:1.5}
+.fi,.fs{width:100%;max-width:100%;min-height:var(--sx-control-h);padding:13px 14px;border:1px solid var(--sx-border);border-radius:var(--sx-radius-md);background:var(--sx-surface-2);color:var(--sx-text);font-size:var(--sx-text-md);font-family:inherit;transition:border-color var(--sx-transition),box-shadow var(--sx-transition)}
 .fi:focus,.fs:focus{outline:none;border-color:var(--sx-accent);box-shadow:0 0 0 3px var(--sx-accent-soft)}
 .fi::placeholder{color:var(--sx-text-3)}
 textarea.fi{resize:vertical;min-height:130px;white-space:pre-wrap;overflow-wrap:break-word;word-break:break-word}
 select.fi,select.fs{cursor:pointer}
 input[type="color"].fi{padding:4px;height:44px}
-.hint{font-size:0.85rem;color:var(--sx-text-3);line-height:var(--sx-leading-relaxed)}
+.hint{font-size:0.95rem;color:var(--sx-text-3);line-height:var(--sx-leading-relaxed)}
 .tag{display:inline-flex;align-items:center;gap:4px;font-size:var(--sx-text-xs);font-weight:700;padding:3px 8px;border-radius:var(--sx-radius-full);background:var(--sx-surface-3);border:1px solid var(--sx-border);color:var(--sx-text-2);white-space:nowrap}
 .tag-on{background:var(--sx-success-soft);border-color:var(--sx-success-border);color:var(--sx-success-ink)}
 .tag-off{background:var(--sx-danger-soft);border-color:var(--sx-danger-border);color:var(--sx-danger-ink)}
 .tag-vless{background:var(--sx-accent-soft);border-color:var(--sx-accent-border);color:var(--sx-accent-ink)}
-.chip{display:inline-flex;align-items:center;gap:6px;padding:6px 12px;border-radius:var(--sx-radius-full);border:1px solid var(--sx-border);background:var(--sx-surface-2);color:var(--sx-text-2);font-size:var(--sx-text-sm);font-weight:600;cursor:pointer;transition:background-color var(--sx-transition),color var(--sx-transition),border-color var(--sx-transition)}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:10px 16px;border-radius:var(--sx-radius-full);border:1px solid var(--sx-border);background:var(--sx-surface-2);color:var(--sx-text-2);font-size:var(--sx-text-md);font-weight:600;cursor:pointer;transition:background-color var(--sx-transition),color var(--sx-transition),border-color var(--sx-transition)}
 .chip:hover{border-color:var(--sx-accent-border);color:var(--sx-text)}
 .chip.active{background:var(--sx-accent-solid);border-color:var(--sx-accent-solid);color:var(--sx-on-accent)}
 .chip:active{transform:scale(0.97)}
 .pill-group{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
-.pill-btn{padding:7px 14px;border-radius:var(--sx-radius-full);border:1px solid var(--sx-border);background:var(--sx-surface-2);color:var(--sx-text-2);font-size:var(--sx-text-sm);font-weight:600;cursor:pointer;transition:background-color var(--sx-transition),color var(--sx-transition),border-color var(--sx-transition)}
+.pill-btn{min-height:var(--sx-control-h);padding:11px 16px;border-radius:var(--sx-radius-full);border:1px solid var(--sx-border);background:var(--sx-surface-2);color:var(--sx-text-2);font-size:var(--sx-text-md);font-weight:600;cursor:pointer;transition:background-color var(--sx-transition),color var(--sx-transition),border-color var(--sx-transition)}
 .pill-btn:hover{border-color:var(--sx-accent-border);color:var(--sx-text)}
 .pill-btn.active{background:var(--sx-accent-solid);border-color:var(--sx-accent-solid);color:var(--sx-on-accent)}
 .pill-btn:active{transform:scale(0.97)}
-.seg-group{display:flex;gap:2px;background:var(--sx-surface-2);border:1px solid var(--sx-border);border-radius:var(--sx-radius-md);padding:3px;width:fit-content;max-width:100%}
-.seg-btn{padding:7px 14px;border:none;background:transparent;color:var(--sx-text-3);font-size:var(--sx-text-sm);font-weight:700;border-radius:var(--sx-radius-sm);cursor:pointer;font-family:inherit;transition:background-color var(--sx-transition),color var(--sx-transition)}
+.seg-group{display:flex;gap:4px;background:var(--sx-surface-2);border:1px solid var(--sx-border);border-radius:var(--sx-radius-md);padding:5px;width:fit-content;max-width:100%}
+.seg-btn{min-height:var(--sx-control-h);padding:12px 18px;border:none;background:transparent;color:var(--sx-text-3);font-size:var(--sx-text-md);font-weight:700;border-radius:var(--sx-radius-sm);cursor:pointer;font-family:inherit;transition:background-color var(--sx-transition),color var(--sx-transition)}
 .seg-btn.active{background:var(--sx-accent-solid);color:var(--sx-on-accent)}
 .seg-btn:hover:not(.active){color:var(--sx-text)}
 .seg-btn:active{transform:scale(0.97)}
@@ -17827,7 +17978,7 @@ html{scroll-padding-top:84px}
 .sx-side-brand .logo{font-size:22px}
 .sx-side-brand .logo::before{width:26px;height:26px;border-radius:8px}
 .sx-side-foot{margin-top:auto;padding:16px 20px;border-top:1px solid var(--sx-border);color:var(--sx-text-3);font-size:var(--sx-text-sm);display:flex;align-items:center;justify-content:space-between;gap:8px;flex:none}
-.sx-side-foot .sx-dot{width:8px;height:8px;border-radius:var(--sx-radius-full);background:var(--sx-success);display:inline-block;margin-inline-end:6px;vertical-align:1px}
+.sx-side-foot .sx-dot{width:8px;height:8px;border-radius:var(--sx-radius-full);background:var(--sx-success);display:inline-block;margin-inline-end:6px;vertical-align:1px}.sx-support{display:flex;flex-direction:column;gap:8px;padding:14px 20px;border-top:1px solid var(--sx-border);color:var(--sx-text-2);text-decoration:none;flex:none}.sx-support:hover{background:var(--sx-surface-2);color:var(--sx-text)}.sx-support-label{font-size:var(--sx-text-sm);font-weight:700}.sx-support-counts{display:flex;align-items:center;gap:12px}.sx-support-count{display:inline-flex;align-items:center;gap:6px;font-size:var(--sx-text-sm);font-weight:600;font-variant-numeric:tabular-nums}.sx-support-count .ic{color:var(--sx-accent-ink)}.sx-support-sep{width:1px;height:16px;background:var(--sx-border-strong)}
 .sx-nav-label{font-size:var(--sx-text-xs);font-weight:800;letter-spacing:0.1em;text-transform:uppercase;color:var(--sx-text-3);padding:20px 24px 8px}
 .sx-nav-group:first-child .sx-nav-label{padding-top:12px}
 .header-nav{display:flex;flex-direction:column;gap:2px;padding:0 12px 8px}
@@ -17842,18 +17993,18 @@ html{scroll-padding-top:84px}
 .sx-burger{display:none}
 .sx-shell>.header,.sx-shell>.main,.sx-shell>.footer{margin-inline-start:var(--sx-sidebar-w)}
 .header{min-height:64px;background:var(--sx-bg);border-bottom:1px solid var(--sx-border);display:flex;align-items:center;padding:0 24px;position:sticky;top:0;z-index:101}
-.header-inner{display:flex;align-items:center;justify-content:space-between;width:100%;max-width:1080px;margin-inline:auto;gap:16px;flex-wrap:wrap}
+.header-inner{display:flex;align-items:center;justify-content:space-between;width:100%;max-width:none;margin-inline:0;gap:16px;flex-wrap:wrap}
 .header .logo{display:none}
 .header-right{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 #panel-clock{font-weight:600;color:var(--sx-accent-ink);font-size:0.9rem;font-family:var(--sx-font-mono)}
-.main{display:block;width:auto;max-width:1080px;margin-inline-start:var(--sx-sidebar-w);margin-inline-end:auto;min-width:0;padding:var(--sx-space-6) var(--sx-space-4) var(--sx-space-7)}
-.sx-shell>.footer{max-width:1080px;margin-inline-end:auto}
+.main{display:block;width:auto;max-width:none;margin-inline-start:var(--sx-sidebar-w);margin-inline-end:0;min-width:0;padding:var(--sx-space-6) var(--sx-space-6) var(--sx-space-7)}
+.sx-shell>.footer{max-width:none;margin-inline-end:0}
 .page{display:none;scroll-margin-top:84px;min-width:0}
 .page.active{display:block}
 .page-header{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:20px}
 .page-title{font-size:26px;font-weight:800;color:var(--sx-text);letter-spacing:-0.02em;line-height:var(--sx-leading-tight)}
 .page-sub{font-size:var(--sx-text-md);color:var(--sx-text-2);margin-top:4px}
-.stats-row{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,240px),1fr));gap:16px;margin-bottom:20px}
+.stats-row{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,240px),1fr));gap:16px;margin-bottom:20px;align-items:start}
 .stat-card{background:var(--sx-surface);border:1px solid var(--sx-border);border-radius:var(--sx-radius-xl);padding:18px;box-shadow:var(--sx-shadow-sm);min-width:0;position:relative;overflow:hidden;transition:border-color var(--sx-transition),transform 150ms ease-out}
 .stat-card::before{content:"";position:absolute;top:0;inset-inline-start:0;bottom:0;width:3px;background:var(--sx-accent-solid);opacity:0.85}
 .stat-card:hover{border-color:var(--sx-border-strong);transform:translateY(-1px)}
@@ -17865,7 +18016,7 @@ html{scroll-padding-top:84px}
 .speed-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 .speed-item .stat-label{margin-bottom:4px}
 .speed-item .stat-val{font-size:1.4rem}
-.status-cards-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,200px),1fr));gap:12px;margin-bottom:20px}
+.status-cards-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,200px),1fr));gap:12px;margin-bottom:20px}#settings-status{grid-template-columns:repeat(3,minmax(0,1fr))}#settings-status .status-card{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;text-align:center;padding:12px 6px;font-size:0.85rem;min-width:0}
 .status-card{background:var(--sx-surface);border:1px solid var(--sx-border);border-radius:var(--sx-radius-lg);padding:14px 16px;cursor:pointer;transition:border-color var(--sx-transition),background-color var(--sx-transition);min-width:0}
 .status-card:hover{border-color:var(--sx-accent-border)}
 .status-card.active{border-color:var(--sx-success-border);background:var(--sx-success-soft)}
@@ -17883,7 +18034,7 @@ html{scroll-padding-top:84px}
 .chart-container canvas{max-width:100%}
 .tbl-wrap{overflow-x:auto;overflow-y:auto;-webkit-overflow-scrolling:touch;border:1px solid var(--sx-border);border-radius:var(--sx-radius-lg);background:var(--sx-surface);max-height:560px}
 .tbl{border-collapse:collapse;min-width:560px;width:100%}
-.tbl th{text-align:center;font-size:0.78rem;font-weight:700;color:var(--sx-text-3);padding:12px 16px;text-transform:uppercase;border-bottom:1px solid var(--sx-border);background:var(--sx-surface-3);letter-spacing:0.08em;position:sticky;top:0;z-index:1}
+.tbl th{text-align:center;font-size:0.78rem;font-weight:700;color:var(--sx-text-3);padding:12px 16px;text-transform:uppercase;border-bottom:1px solid var(--sx-border);background:var(--sx-surface-3);letter-spacing:0.08em;position:sticky;top:0;z-index:1;white-space:nowrap}
 .tbl td{padding:12px 16px;border-bottom:1px solid var(--sx-border);color:var(--sx-text);font-size:var(--sx-text-md);vertical-align:middle;overflow-wrap:break-word}
 .tbl tbody tr:hover td{background:var(--sx-row-alt)}
 .tbl tbody tr:nth-child(even) td{background:var(--sx-row-alt)}
@@ -17892,7 +18043,7 @@ html{scroll-padding-top:84px}
 #inbound-table{min-width:640px}
 #inbound-table th,#inbound-table td{text-align:start}
 #inbound-table th:nth-child(8),#inbound-table td:nth-child(8){text-align:center}
-#inbound-table td:nth-child(2),#inbound-table th:nth-child(2),#inbound-table td:nth-child(3),#inbound-table th:nth-child(3){overflow-wrap:anywhere}
+#inbound-table td:nth-child(2),#inbound-table th:nth-child(2),#inbound-table td:nth-child(3),#inbound-table th:nth-child(3){overflow-wrap:break-word;word-break:normal}#inbound-table td:nth-child(2),#inbound-table th:nth-child(2){min-width:180px}#inbound-table td:nth-child(3),#inbound-table th:nth-child(3){min-width:120px}.tbl td[data-label="Name"],.tbl td[data-label="Owner"]{overflow-wrap:break-word;word-break:normal}
 #proxy-lines-table{min-width:640px}
 #logs-table,#login-logs-table{min-width:560px}
 #logs-table th,#logs-tbody td{white-space:normal}
@@ -18012,12 +18163,12 @@ body[dir="rtl"] .row-act-grid{flex-direction:row}
 .stats-row{grid-template-columns:repeat(auto-fill,minmax(min(100%,240px),1fr))}
 .seg-group{flex-direction:column;width:100%}
 .seg-btn{width:100%}
-.page-title{font-size:20px}
+.page-title{font-size:22px}
 .header-right{gap:4px}
 .btn-icon{padding:6px;font-size:0.95rem}
-.lang-btn{padding:5px 8px;font-size:0.68rem}
-.btn{padding:8px 14px}
-.btn-primary{padding:10px 16px}
+.lang-btn{padding:9px 12px;font-size:0.9rem}
+.btn{padding:12px 16px}
+.btn-primary{padding:12px 18px}
 .mo-box{padding:24px 16px;max-width:min(560px,calc(100vw - 32px));border-radius:var(--sx-radius-xl)}
 .toast{padding:14px 20px;font-size:0.85rem;bottom:20px}
 }
@@ -18055,15 +18206,35 @@ body[dir="rtl"] .row-act-grid{flex-direction:row}
 .icon-github{mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='currentColor'%3E%3Cpath d='M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z'/%3E%3C/svg%3E");}
 .icon-telegram-link{mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='currentColor'%3E%3Cpath d='M11.944 0A12 12 0 000 12a12 12 0 0012 12 12 12 0 0012-12A12 12 0 0012 0a12 12 0 00-.056 0zm4.962 7.224c.1-.002.321.023.465.14a.506.506 0 01.171.325c.016.093.036.306.02.472-.18 1.898-.962 6.502-1.36 8.627-.168.9-.499 1.201-.82 1.23-.696.065-1.225-.46-1.9-.902-1.056-.693-1.653-1.124-2.678-1.8-1.185-.78-.417-1.21.258-1.91.177-.184 3.247-2.977 3.307-3.23.007-.032.014-.15-.056-.212s-.174-.041-.249-.024c-.106.024-1.793 1.14-5.061 3.345-.48.33-.913.49-1.302.48-.428-.008-1.252-.241-1.865-.44-.752-.245-1.349-.374-1.297-.789.027-.216.325-.437.893-.663 3.498-1.524 5.83-2.529 6.998-3.014 3.332-1.386 4.025-1.627 4.476-1.635z'/%3E%3C/svg%3E");}
 .icon-activity{mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Cpolyline points='22 12 18 12 15 21 9 3 6 12 2 12'/%3E%3C/svg%3E");}
+#page-settings .fl{font-size:15px;line-height:1.6;letter-spacing:0.03em}
+#page-settings .fl .ic{width:18px;height:18px}
+#page-settings .fg{gap:10px;margin-bottom:22px}
+#page-settings .fi,#page-settings .fs{min-height:52px;padding:14px 16px;font-size:16px;line-height:1.5}
+#page-settings textarea.fi{min-height:150px}
+#page-settings .seg-group{gap:4px;padding:5px;width:100%}
+#page-settings .seg-btn{min-height:52px;padding:13px 18px;font-size:16px;line-height:1.4;white-space:normal;overflow-wrap:break-word}
+#page-settings .status-card{padding:18px 14px;font-size:1rem;line-height:1.5;gap:10px;min-height:96px}
+#page-settings .status-card .ic{width:24px;height:24px}
+#page-settings .status-cards-grid{gap:14px}
+#page-settings .btn{min-height:52px;padding:13px 20px;font-size:16px}
+#page-settings .btn-sm{min-height:48px;padding:11px 16px;font-size:15px}
+#page-settings .pill-btn{min-height:48px;padding:11px 18px;font-size:15px}
+#page-settings .card{padding:24px}
+#page-settings .mo-title{font-size:1.75rem;margin-bottom:20px}
+#page-settings .page-title{font-size:28px}
+#page-settings .hint{font-size:1rem}
+#page-settings hr{margin:20px 0}
+@media (max-width:500px){#page-settings .page-title{font-size:24px}#page-settings .card{padding:20px 16px}#page-settings .seg-group{flex-direction:column;width:100%}#page-settings .seg-btn{width:100%;min-height:52px}}
+@media (max-width:360px){#page-settings .fi,#page-settings .fs{padding:12px 14px}#page-settings .seg-btn{padding:12px 14px}#page-settings .card{padding:18px 14px}}
 </style>
 
 </head>
 <body>
 <div class="toast" id="toast"><span class="ic" id="toast-ic"></span><span id="toast-msg"></span></div>
 <div id="login-page" style="display:none;width:100%">
-  <div style="display:flex;align-items:center;justify-content:center;min-height:100vh;">
+  <div style="display:flex;flex-wrap:wrap;align-items:center;justify-content:center;min-height:100vh;">
     <div style="background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:32px 24px;width:min(400px,calc(100vw - 32px));max-width:400px;">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:24px;">
+      <div style="display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;margin-bottom:24px;">
         <div class="lang-switch">
           <button class="lang-btn lang-en active" onclick="setLang('en')">EN</button>
           <button class="lang-btn lang-fa" onclick="setLang('fa')">FA</button>
@@ -18071,21 +18242,18 @@ body[dir="rtl"] .row-act-grid{flex-direction:row}
         <button class="btn-icon" onclick="toggleTheme()" title="Toggle theme" data-en-title="Toggle theme" data-fa-title="تغییر تم" aria-label="Toggle theme" data-en-aria="Toggle theme" data-fa-aria="تغییر تم"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg></span></button>
       </div>
       <div style="text-align:center;margin-bottom:32px;">
-        <div style="display:flex;align-items:center;justify-content:center;gap:10px;font-family:var(--font-sans);font-size:28px;font-weight:700;color:var(--text);letter-spacing:-0.02em;">
+        <div style="display:flex;flex-wrap:wrap;align-items:center;justify-content:center;gap:10px;font-family:var(--font-sans);font-size:28px;font-weight:700;color:var(--text);letter-spacing:-0.02em;">
           <span style="width:28px;height:28px;background:var(--accent);border-radius:8px;flex:none;"></span>SulgX Panel
-        </div>
-        <div style="display:flex;justify-content:center;margin-top:12px;">
-          <span style="font-family:var(--font-mono);font-size:11px;font-weight:600;background:var(--surface-2);border:1px solid var(--border);color:var(--text-2);border-radius:9999px;padding:2px 8px;">V 1.5.8</span>
         </div>
         <div style="font-size:1rem;color:var(--text-2);margin-top:12px;line-height:1.55;" data-en="Enter your password" data-fa="رمز عبور را وارد کنید">Enter your password</div>
         <div id="login-custom-message" style="margin-top:20px; text-align:center; color:var(--text-3); font-size:0.9rem;"></div>
       </div>
       <form id="login-form" onsubmit="doLogin();return false;" autocomplete="off">
-      <div class="fg"><label class="fl" data-en="PASSWORD" data-fa="رمز عبور">PASSWORD</label><input class="fi" type="password" id="login-pw" placeholder="••••••••" autocomplete="current-password"></div>
-      <button class="btn btn-primary" type="submit" id="login-btn" style="width:100%;justify-content:center;padding:14px;margin-top:16px;" data-en="LOGIN" data-fa="ورود">LOGIN</button>
+      <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="PASSWORD" data-fa="رمز عبور">PASSWORD</span></label><input class="fi" type="password" id="login-pw" placeholder="••••••••" autocomplete="current-password"></div>
+      <button class="btn btn-primary" type="submit" id="login-btn" style="width:100%;justify-content:center;padding:14px;margin-top:16px;"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></span><span data-en="LOGIN" data-fa="ورود">LOGIN</span></button>
       </form>
       <div id="login-err" style="color:var(--danger);font-size:0.9rem;margin-top:10px;text-align:center;display:none" data-en="Invalid password" data-fa="رمز عبور نامعتبر">Invalid password</div>
-      <div style="margin-top:20px; text-align:center; display:flex; justify-content:center; gap:20px;">
+      <div style="margin-top:20px; text-align:center; display:flex;flex-wrap:wrap; justify-content:center; gap:20px;">
         <a href="https://github.com/SulgX" target="_blank" style="color:var(--text-3); text-decoration:none; font-size:0.9rem; display:inline-flex; align-items:center; gap:6px;">
           <span class="icon icon-github"></span> GitHub
         </a>
@@ -18098,46 +18266,58 @@ body[dir="rtl"] .row-act-grid{flex-direction:row}
 </div>
 <div id="dashboard-page" style="display:none;width:100%">
 <div class="sx-shell">
-<aside class="sx-sidebar" aria-label="Navigation">
+<aside class="sx-sidebar" aria-label="Navigation" data-en-aria="Navigation" data-fa-aria="ناوبری">
 <div class="sx-side-brand"><span class="logo">SulgX</span><span class="version-tag">v1.5.8</span></div>
 <nav class="header-nav" id="mainNav">
 <div class="sx-nav-group"><div class="sx-nav-label" data-en="Main" data-fa="اصلی">Main</div><button class="nav-link active" data-page="dashboard">
-            <span class="nav-icon icon-dashboard"></span>
+            <span class="nav-icon ic" style="--ic:20px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg></span>
             <span data-en="Dashboard" data-fa="داشبورد">Dashboard</span>
           </button><button class="nav-link" data-page="inbounds">
-            <span class="nav-icon icon-inbounds"></span>
+            <span class="nav-icon ic" style="--ic:20px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg></span>
             <span data-en="Inbounds" data-fa="اینباندها">Inbounds</span>
           </button><button class="nav-link" data-page="active-users">
-            <span class="nav-icon icon-activity"></span>
+            <span class="nav-icon ic" style="--ic:20px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg></span>
             <span data-en="Active Users" data-fa="کاربران فعال">Active Users</span>
           </button></div>
 <div class="sx-nav-group"><div class="sx-nav-label" data-en="Network" data-fa="شبکه">Network</div><button class="nav-link" data-page="addresses">
-            <span class="nav-icon icon-cleanip"></span>
+            <span class="nav-icon ic" style="--ic:20px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/></svg></span>
             <span data-en="Clean IP" data-fa="آی‌پی تمیز">Clean IP</span>
           </button><button class="nav-link" data-page="ipscanner">
-            <span class="nav-icon icon-scanner"></span>
+            <span class="nav-icon ic" style="--ic:20px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><path d="M3.5 8.5A9 9 0 0 1 11 2"/></svg></span>
             <span data-en="IP Scanner" data-fa="اسکنر آی‌پی">IP Scanner</span>
           </button><button class="nav-link" data-page="logs">
-            <span class="nav-icon icon-logs"></span>
+            <span class="nav-icon ic" style="--ic:20px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg></span>
             <span data-en="Logs" data-fa="لاگ‌ها">Logs</span>
           </button></div>
 <div class="sx-nav-group"><div class="sx-nav-label" data-en="System" data-fa="سیستم">System</div><button class="nav-link" data-page="telegram">
-            <span class="nav-icon icon-telegram"></span>
+            <span class="nav-icon ic" style="--ic:20px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg></span>
             <span data-en="Telegram" data-fa="تلگرام">Telegram</span>
           </button><button class="nav-link" data-page="settings">
-            <span class="nav-icon icon-settings"></span>
+            <span class="nav-icon ic" style="--ic:20px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M19.1 4.9L17 7M7 17l-2.1 2.1"/></svg></span>
             <span data-en="Settings" data-fa="تنظیمات">Settings</span>
           </button></div>
+<div class="sx-nav-group"><div class="sx-nav-label" data-en="Project Introduction" data-fa="معرفی پروژه">Project Introduction</div><button class="nav-link" data-page="about">
+            <span class="nav-icon ic" style="--ic:20px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg></span>
+            <span data-en="About SulgX" data-fa="درباره SulgX">About SulgX</span>
+          </button></div>
 </nav>
-<div class="sx-side-foot"><span><span class="sx-dot"></span>SulgX Panel</span><span>v1.5.8</span></div>
+<a class="sx-support" href="https://github.com/SulgX/SulgX-Panel" target="_blank" rel="noopener">
+  <span class="sx-support-label" data-en="Support me" data-fa="از من حمایت کن">Support me</span>
+  <span class="sx-support-counts">
+    <span class="sx-support-count"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg></span><span id="gh-stars">–</span></span>
+    <span class="sx-support-sep" aria-hidden="true"></span>
+    <span class="sx-support-count"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><path d="M18 9v2c0 .6-.4 1-1 1H7c-.6 0-1-.4-1-1V9"/><path d="M12 12v3"/></svg></span><span id="gh-forks">–</span></span>
+  </span>
+</a>
+<div class="sx-side-foot"><span><span class="sx-dot"></span>SulgX Panel</span></div>
 </aside>
 <div class="sx-backdrop" onclick="toggleSxNav()"></div>
 
   <header class="header">
     <div class="header-inner">
-      <button class="sx-burger" onclick="toggleSxNav()" aria-label="Menu"><span></span><span></span><span></span></button>
-      <div style="display:flex;align-items:center;gap:16px;">
-        <span class="logo">SulgX</span><span class="version-tag">v1.5.8</span>
+      <button class="sx-burger" onclick="toggleSxNav()" aria-label="Menu" data-en-aria="Menu" data-fa-aria="منو"><span></span><span></span><span></span></button>
+      <div style="display:flex;flex-wrap:wrap;align-items:center;gap:16px;">
+        <span class="logo">SulgX</span>
         <span id="panel-clock" style="font-weight:600;color:var(--accent-ink);margin-inline-start:8px;font-size:0.9rem;"></span>
         
       </div>
@@ -18160,55 +18340,55 @@ body[dir="rtl"] .row-act-grid{flex-direction:row}
   </header>
   <main class="main">
     <section class="page active" id="page-dashboard">
-      <div class="page-header"><div><div class="page-title" data-en="Dashboard" data-fa="داشبورد">Dashboard</div><div class="page-sub" id="last-up">–</div></div><div style="display:flex;gap:6px;flex-wrap:wrap;"><button class="btn btn-outline btn-sm" id="health-check-btn-dash" onclick="runHealthCheckDash(this)" data-en="Health Check" data-fa="بررسی سلامت">Health Check</button><button class="btn btn-outline btn-sm" id="refresh-stats-btn" onclick="refreshStats(this)" data-en="Refresh" data-fa="بروزرسانی">Refresh</button></div></div>
+      <div class="page-header"><div><div class="page-title" data-en="Dashboard" data-fa="داشبورد">Dashboard</div><div class="page-sub" id="last-up">–</div></div><div style="display:flex;gap:6px;flex-wrap:wrap;"><button class="btn btn-outline btn-sm" id="health-check-btn-dash" onclick="runHealthCheckDash(this)"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></span><span data-en="Health Check" data-fa="بررسی سلامت">Health Check</span></button><button class="btn btn-outline btn-sm" id="refresh-stats-btn" onclick="refreshStats(this)"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg></span><span data-en="Refresh" data-fa="بروزرسانی">Refresh</span></button></div></div>
       <div id="db-fresh-banner" style="display:none;margin-bottom:12px;padding:12px 14px;border:1px solid var(--warning);border-radius:10px;background:var(--surface-3);color:var(--text);font-size:0.9rem;"><div data-en="Fresh database: no database file existed at boot, so all previous inbounds were lost. Attach a persistent volume to DB_PATH so inbounds survive restarts." data-fa="پایگاه‌داده تازه است: در زمان راه‌اندازی هیچ فایل پایگاه‌داده‌ای وجود نداشت و همه اینباندهای قبلی از بین رفتند. برای ماندگاری اینباندها پس از راه‌اندازی مجدد، یک والیوم پایدار به DB_PATH متصل کنید.">Fresh database: no database file existed at boot, so all previous inbounds were lost. Attach a persistent volume to DB_PATH so inbounds survive restarts.</div><div id="db-fresh-path" style="font-size:0.8rem;color:var(--text-2);direction:ltr;text-align:left;margin-top:4px;"></div></div>
       <div class="stats-row">
-        <div class="stat-card stat-traffic"><div class="stat-label" data-en="Traffic" data-fa="ترافیک">Traffic</div><div class="stat-val" id="sv-traffic">–<span class="stat-unit"> MB</span></div></div>
-        <div class="stat-card stat-requests"><div class="stat-label" data-en="Requests" data-fa="درخواست‌ها">Requests</div><div class="stat-val" id="sv-requests">–</div></div>
-        <div class="stat-card stat-uptime"><div class="stat-label" data-en="Uptime" data-fa="آپتایم">Uptime</div><div class="stat-val" id="sv-uptime" style="font-size:1.2rem;">–</div></div>
-        <div class="stat-card stat-disk"><div class="stat-label" data-en="Disk Free" data-fa="فضای دیسک">Disk Free</div><div class="stat-val" id="sv-disk">–<span class="stat-unit"> GB</span></div></div>
+        <div class="stat-card stat-traffic"><div class="stat-label"><span class="stat-icon ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 16V4M7 4L3 8M7 4l4 4M17 8v12M17 20l4-4M17 20l-4-4"/></svg></span><span data-en="Traffic" data-fa="ترافیک">Traffic</span></div><div class="stat-val" id="sv-traffic">–<span class="stat-unit"> MB</span></div></div>
+        <div class="stat-card stat-requests"><div class="stat-label"><span class="stat-icon ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></span><span data-en="Requests" data-fa="درخواست‌ها">Requests</span></div><div class="stat-val" id="sv-requests">–</div></div>
+        <div class="stat-card stat-uptime"><div class="stat-label"><span class="stat-icon ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></span><span data-en="Uptime" data-fa="آپتایم">Uptime</span></div><div class="stat-val" id="sv-uptime" style="font-size:1.2rem;">–</div></div>
+        <div class="stat-card stat-disk"><div class="stat-label"><span class="stat-icon ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg></span><span data-en="Disk Free" data-fa="فضای دیسک">Disk Free</span></div><div class="stat-val" id="sv-disk">–<span class="stat-unit"> GB</span></div></div>
       </div>
       <div class="stats-row">
-        <div class="stat-card stat-download"><div class="stat-label" data-en="Download Speed" data-fa="سرعت دانلود">Download Speed</div><div class="stat-val" id="sv-down-speed">–<span class="stat-unit"> KB/s</span></div></div>
-        <div class="stat-card stat-upload"><div class="stat-label" data-en="Upload Speed" data-fa="سرعت آپلود">Upload Speed</div><div class="stat-val" id="sv-up-speed">–<span class="stat-unit"> KB/s</span></div></div>
-        <div class="stat-card stat-monthly"><div class="stat-label" data-en="Monthly Usage" data-fa="مصرف ماهانه">Monthly Usage</div><div class="stat-val" id="sv-monthly">–<span class="stat-unit"> GB</span></div></div>
+        <div class="stat-card stat-download"><div class="stat-label"><span class="stat-icon ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg></span><span data-en="Download Speed" data-fa="سرعت دانلود">Download Speed</span></div><div class="stat-val" id="sv-down-speed">–<span class="stat-unit"> KB/s</span></div></div>
+        <div class="stat-card stat-upload"><div class="stat-label"><span class="stat-icon ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg></span><span data-en="Upload Speed" data-fa="سرعت آپلود">Upload Speed</span></div><div class="stat-val" id="sv-up-speed">–<span class="stat-unit"> KB/s</span></div></div>
+        <div class="stat-card stat-monthly"><div class="stat-label"><span class="stat-icon ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg></span><span data-en="Monthly Usage" data-fa="مصرف ماهانه">Monthly Usage</span></div><div class="stat-val" id="sv-monthly">–<span class="stat-unit"> GB</span></div></div>
         <div class="stat-card" style="font-size:0.8rem;">
-          <div class="stat-label" data-en="Settings Status" data-fa="وضعیت تنظیمات">Settings Status</div>
+          <div class="stat-label"><span class="stat-icon ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M19.1 4.9L17 7M7 17l-2.1 2.1"/></svg></span><span data-en="Settings Status" data-fa="وضعیت تنظیمات">Settings Status</span></div>
           <div class="status-cards-grid" id="settings-status">
-            <div class="status-card inactive" id="st-log" onclick="switchPage('settings')" role="button" tabindex="0" title="Open Settings" data-en="Logging" data-fa="لاگ">
-              <span class="status-icon icon-logging"></span> Logging
+            <div class="status-card inactive" id="st-log" onclick="switchPage('settings')" role="button" tabindex="0" title="Open Settings" data-en-title="Open Settings" data-fa-title="باز کردن تنظیمات">
+              <span class="status-icon ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg></span><span data-en="Logging" data-fa="لاگ">Logging</span>
             </div>
-            <div class="status-card inactive" id="st-auto" onclick="switchPage('settings')" role="button" tabindex="0" title="Open Settings" data-en="Auto Disable" data-fa="غیرفعال‌سازی">
-              <span class="status-icon icon-auto-disable"></span> Auto Disable
+            <div class="status-card inactive" id="st-auto" onclick="switchPage('settings')" role="button" tabindex="0" title="Open Settings" data-en-title="Open Settings" data-fa-title="باز کردن تنظیمات">
+              <span class="status-icon ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></svg></span><span data-en="Auto Disable" data-fa="غیرفعال‌سازی">Auto Disable</span>
             </div>
-            <div class="status-card inactive" id="st-tgrep" onclick="switchPage('settings')" role="button" tabindex="0" title="Open Settings" data-en="TG Reports" data-fa="گزارش تلگرام">
-              <span class="status-icon icon-tg-reports"></span> TG Reports
+            <div class="status-card inactive" id="st-tgrep" onclick="switchPage('settings')" role="button" tabindex="0" title="Open Settings" data-en-title="Open Settings" data-fa-title="باز کردن تنظیمات">
+              <span class="status-icon ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/></svg></span><span data-en="TG Reports" data-fa="گزارش تلگرام">TG Reports</span>
             </div>
-            <div class="status-card inactive" id="st-tgnot" onclick="switchPage('settings')" role="button" tabindex="0" title="Open Settings" data-en="TG Notify" data-fa="اعلان تلگرام">
-              <span class="status-icon icon-tg-notify"></span> TG Notify
+            <div class="status-card inactive" id="st-tgnot" onclick="switchPage('settings')" role="button" tabindex="0" title="Open Settings" data-en-title="Open Settings" data-fa-title="باز کردن تنظیمات">
+              <span class="status-icon ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg></span><span data-en="TG Notify" data-fa="اعلان تلگرام">TG Notify</span>
             </div>
-            <div class="status-card inactive" id="st-bot" onclick="switchPage('settings')" role="button" tabindex="0" title="Open Settings" data-en="Bot" data-fa="ربات">
-              <span class="status-icon icon-bot"></span> Bot
+            <div class="status-card inactive" id="st-bot" onclick="switchPage('settings')" role="button" tabindex="0" title="Open Settings" data-en-title="Open Settings" data-fa-title="باز کردن تنظیمات">
+              <span class="status-icon ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="8" width="14" height="12" rx="2"/><line x1="12" y1="8" x2="12" y2="4"/><circle cx="12" cy="3" r="1"/><circle cx="9" cy="13" r="1" fill="currentColor" stroke="none"/><circle cx="15" cy="13" r="1" fill="currentColor" stroke="none"/><line x1="9" y1="17" x2="15" y2="17"/></svg></span><span data-en="Bot" data-fa="ربات">Bot</span>
             </div>
-            <div class="status-card inactive" id="st-stealth" onclick="switchPage('settings')" role="button" tabindex="0" title="Open Settings" data-en="Stealth" data-fa="استتار">
-              <span class="status-icon icon-stealth"></span> Stealth
+            <div class="status-card inactive" id="st-stealth" onclick="switchPage('settings')" role="button" tabindex="0" title="Open Settings" data-en-title="Open Settings" data-fa-title="باز کردن تنظیمات">
+              <span class="status-icon ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></span><span data-en="Stealth" data-fa="استتار">Stealth</span>
             </div>
           </div>
         </div>
       </div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
-        <div class="card"><div class="card-hd"><span class="card-title" data-en="CPU" data-fa="پردازنده">CPU</span><span id="cpu-v" style="font-weight:700;color:var(--accent-ink);">–%</span></div><div class="sys-bar"><div class="sys-fill" id="cpu-b" style="background:var(--accent);width:0%"></div></div></div>
-        <div class="card"><div class="card-hd"><span class="card-title" data-en="Memory" data-fa="حافظه">Memory</span><span id="mem-v" style="font-weight:700;color:var(--success);">–%</span></div><div class="sys-bar"><div class="sys-fill" id="mem-b" style="background:var(--success);width:0%"></div></div></div>
+        <div class="card"><div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg></span><span class="card-title" data-en="CPU" data-fa="پردازنده">CPU</span></span><span id="cpu-v" style="font-weight:700;color:var(--accent-ink);">–%</span></div><div class="sys-bar"><div class="sys-fill" id="cpu-b" style="background:var(--accent);width:0%"></div></div></div>
+        <div class="card"><div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="20" height="12" rx="2"/><line x1="6" y1="19" x2="6" y2="22"/><line x1="10" y1="19" x2="10" y2="22"/><line x1="14" y1="19" x2="14" y2="22"/><line x1="18" y1="19" x2="18" y2="22"/><line x1="6" y1="7" x2="6" y2="4"/><line x1="10" y1="7" x2="10" y2="4"/><line x1="14" y1="7" x2="14" y2="4"/><line x1="18" y1="7" x2="18" y2="4"/></svg></span><span class="card-title" data-en="Memory" data-fa="حافظه">Memory</span></span><span id="mem-v" style="font-weight:700;color:var(--success);">–%</span></div><div class="sys-bar"><div class="sys-fill" id="mem-b" style="background:var(--success);width:0%"></div></div></div>
       </div>
-      <div class="card"><div class="card-hd"><span class="card-title" data-en="Protocols" data-fa="پروتکل‌ها">Protocols</span></div><div id="proto-summary" style="display:flex;flex-wrap:wrap;gap:8px;min-height:24px;"></div></div>
-      <div class="card" id="dash-health-card" style="display:none;"><div class="card-hd"><span class="card-title" data-en="Protocol Health" data-fa="سلامت پروتکل">Protocol Health</span></div><div id="dash-health"></div></div>
-      <div class="card"><div class="card-hd"><span class="card-title" data-en="Hourly Traffic" data-fa="ترافیک ساعتی">Hourly Traffic</span></div><div class="chart-container"><canvas id="tc"></canvas></div></div>
-      <div class="card"><div class="card-hd"><span class="card-title" data-en="Usage Distribution" data-fa="توزیع مصرف">Usage Distribution</span></div><div class="chart-container"><canvas id="doughnut-chart"></canvas></div><div id="doughnut-total" style="text-align:center;color:var(--text-3);font-size:0.85rem;padding:4px 0 8px;"></div></div>
-      <div class="card"><div class="card-hd"><span class="card-title" data-en="Live Speed" data-fa="سرعت زنده">Live Speed</span></div><div class="chart-container"><canvas id="speed-chart"></canvas></div></div>
+      <div class="card"><div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg></span><span class="card-title" data-en="Protocols" data-fa="پروتکل‌ها">Protocols</span></span></div><div id="proto-summary" style="display:flex;flex-wrap:wrap;gap:8px;min-height:24px;"></div></div>
+      <div class="card" id="dash-health-card" style="display:none;"><div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></span><span class="card-title" data-en="Protocol Health" data-fa="سلامت پروتکل">Protocol Health</span></span></div><div id="dash-health"></div></div>
+      <div class="card"><div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg></span><span class="card-title" data-en="Hourly Traffic" data-fa="ترافیک ساعتی">Hourly Traffic</span></span></div><div class="chart-container"><canvas id="tc"></canvas></div></div>
+      <div class="card"><div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg></span><span class="card-title" data-en="Usage Distribution" data-fa="توزیع مصرف">Usage Distribution</span></span></div><div class="chart-container"><canvas id="doughnut-chart"></canvas></div><div id="doughnut-total" style="text-align:center;color:var(--text-3);font-size:0.85rem;padding:4px 0 8px;"></div></div>
+      <div class="card"><div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg></span><span class="card-title" data-en="Live Speed" data-fa="سرعت زنده">Live Speed</span></span></div><div class="chart-container"><canvas id="speed-chart"></canvas></div></div>
       <div class="card">
   <div class="card-hd">
-    <span class="card-title" data-en="Recent Activity" data-fa="فعالیت‌های اخیر">Recent Activity</span>
-    <button class="btn btn-danger btn-sm" onclick="clearRecentActivity()" data-en="Clear" data-fa="پاک‌سازی">Clear</button>
+    <span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg></span><span class="card-title" data-en="Recent Activity" data-fa="فعالیت‌های اخیر">Recent Activity</span></span>
+    <button class="btn btn-danger btn-sm" onclick="clearRecentActivity()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg></span><span data-en="Clear" data-fa="پاک‌سازی">Clear</span></button>
   </div>
   <div class="logs-table-container" style="overflow-x: auto; -webkit-overflow-scrolling: touch;">
     <table class="tbl" id="login-logs-table">
@@ -18231,45 +18411,45 @@ body[dir="rtl"] .row-act-grid{flex-direction:row}
       <div class="page-header">
         <div><div class="page-title" data-en="Inbounds" data-fa="اینباندها">Inbounds</div><div class="page-sub" data-en="Manage VLESS Configs" data-fa="مدیریت کانفیگ‌های VLESS">Manage VLESS Configs</div></div>
         <div style="display:flex;gap:6px;flex-wrap:wrap;">
-          <button class="btn btn-primary" onclick="showAddMo()" data-en="+ Create" data-fa="+ ایجاد">+ Create</button>
-          <button class="btn btn-outline btn-sm" onclick="exportLinks()" data-en="Export" data-fa="خروجی">Export</button>
-          <button class="btn btn-outline btn-sm" onclick="document.getElementById('import-file').click()" data-en="Import" data-fa="ورودی">Import</button>
-          <button class="btn btn-outline btn-sm" id="health-check-btn-inb" onclick="runHealthCheck(this)" data-en="Health Check" data-fa="بررسی سلامت">Health Check</button>
-          <button class="btn btn-outline btn-sm" id="refresh-links-btn" onclick="refreshLinks(this)" data-en="Refresh" data-fa="بروزرسانی">Refresh</button>
+          <button class="btn btn-primary" onclick="showAddMo()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></span><span data-en="Create" data-fa="ایجاد">Create</span></button>
+          <button class="btn btn-outline btn-sm" onclick="exportLinks()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg></span><span data-en="Export" data-fa="خروجی">Export</span></button>
+          <button class="btn btn-outline btn-sm" onclick="document.getElementById('import-file').click()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg></span><span data-en="Import" data-fa="ورودی">Import</span></button>
+          <button class="btn btn-outline btn-sm" id="health-check-btn-inb" onclick="runHealthCheck(this)"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></span><span data-en="Health Check" data-fa="بررسی سلامت">Health Check</span></button>
+          <button class="btn btn-outline btn-sm" id="refresh-links-btn" onclick="refreshLinks(this)"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg></span><span data-en="Refresh" data-fa="بروزرسانی">Refresh</span></button>
           <input type="file" id="import-file" style="display:none" accept=".json" onchange="importLinks(this)">
         </div>
       </div>
-      <div class="inbound-tools" style="display:flex;gap:10px;margin-bottom:16px;">
+      <div class="inbound-tools" style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:16px;">
         <input id="srch" dir="auto" placeholder="Search…" data-ph-en="Search…" data-ph-fa="جستجو…" oninput="filterLinks()" class="fi" style="flex:1;">
         <button class="chip active" data-filter="all" data-en="All" data-fa="همه" onclick="setFilter('all',this)">All</button>
         <button class="chip" data-filter="active" data-en="Active" data-fa="فعال" onclick="setFilter('active',this)">Active</button>
         <button class="chip" data-filter="off" data-en="Off" data-fa="خاموش" onclick="setFilter('off',this)">Off</button>
       </div>
-      <div class="bulk-actions" style="display:flex;gap:6px;margin-bottom:10px;">
-        <button class="btn btn-outline btn-sm" onclick="batchAction('activate')" data-en="Activate Selected" data-fa="فعال‌سازی انتخاب">Activate Selected</button>
-        <button class="btn btn-outline btn-sm" onclick="batchAction('deactivate')" data-en="Deactivate Selected" data-fa="غیرفعال‌سازی انتخاب">Deactivate Selected</button>
-        <button class="btn btn-outline btn-sm" onclick="batchAction('reset_usage')" data-en="Reset Usage Selected" data-fa="بازنشانی مصرف انتخاب">Reset Usage Selected</button>
-        <button class="btn btn-danger btn-sm" onclick="batchAction('delete')" data-en="Delete Selected" data-fa="حذف انتخاب">Delete Selected</button>
+      <div class="bulk-actions" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px;">
+        <button class="btn btn-outline btn-sm" onclick="batchAction('activate')"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></span><span data-en="Activate Selected" data-fa="فعال‌سازی انتخاب">Activate Selected</span></button>
+        <button class="btn btn-outline btn-sm" onclick="batchAction('deactivate')"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg></span><span data-en="Deactivate Selected" data-fa="غیرفعال‌سازی انتخاب">Deactivate Selected</span></button>
+        <button class="btn btn-outline btn-sm" onclick="batchAction('reset_usage')"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg></span><span data-en="Reset Usage Selected" data-fa="بازنشانی مصرف انتخاب">Reset Usage Selected</span></button>
+        <button class="btn btn-danger btn-sm" onclick="batchAction('delete')"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg></span><span data-en="Delete Selected" data-fa="حذف انتخاب">Delete Selected</span></button>
       </div>
       <div class="card" style="padding:0;overflow:hidden;">
         <div class="tbl-wrap">
         <table class="tbl" id="inbound-table"><thead><tr><th><input type="checkbox" id="select-all" onchange="toggleSelectAll()"></th><th data-sort="label" onclick="sortLinks('label')"><span data-en="Name" data-fa="نام">Name</span> ↕</th><th data-en="Owner" data-fa="مالک">Owner</th><th data-en="Type" data-fa="نوع">Type</th><th data-sort="used_bytes" onclick="sortLinks('used_bytes')"><span data-en="Usage" data-fa="مصرف">Usage</span> ↕</th><th data-en="Sessions" data-fa="نشست‌ها">Sessions</th><th data-sort="expires_at" onclick="sortLinks('expires_at')"><span data-en="Expiry" data-fa="انقضا">Expiry</span> ↕</th><th data-en="Status" data-fa="وضعیت">Status</th><th data-en="Test" data-fa="تست">Test</th><th data-en="Actions" data-fa="عملیات">Actions</th></tr></thead><tbody id="ltb"></tbody></table></div>
-        <div class="empty" id="lempty" style="display:none;padding:30px;" data-en="No inbounds found" data-fa="اینباندی یافت نشد">No inbounds found</div>
+        <div class="empty" id="lempty" style="display:none;padding:30px;"><span class="ic" style="--ic:28px;display:block;margin:0 auto 10px;" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></span><span data-en="No inbounds found" data-fa="اینباندی یافت نشد">No inbounds found</span></div>
       </div>
 <div class="card" style="margin-top:20px;">
   <div class="card-hd">
-    <span class="card-title" data-en="Proxy Lines" data-fa="پروکسی لاین">Proxy Lines</span>
+    <span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg></span><span class="card-title" data-en="Proxy Lines" data-fa="پروکسی لاین">Proxy Lines</span></span>
     <div style="display:flex; gap:6px; flex-wrap:wrap;">
-      <button class="btn btn-primary btn-sm" onclick="showAddProxyMo()" data-en="+ Add Proxy" data-fa="+ افزودن پروکسی">+ Add Proxy</button>
-      <button class="btn btn-outline btn-sm" onclick="testAllProxies()" data-en="Test All" data-fa="تست همه">Test All</button>
-      <button id="proxy-stop-btn" class="btn btn-danger btn-sm" style="display:none;" onclick="stopProxyTest()" data-en="Stop" data-fa="توقف">Stop</button>
+      <button class="btn btn-primary btn-sm" onclick="showAddProxyMo()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></span><span data-en="Add Proxy" data-fa="افزودن پروکسی">Add Proxy</span></button>
+      <button class="btn btn-outline btn-sm" onclick="testAllProxies()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h6"/><path d="M10 3v6L4.5 19a2 2 0 0 0 1.8 3h11.4a2 2 0 0 0 1.8-3L14 9V3"/><path d="M7.5 14h9"/></svg></span><span data-en="Test All" data-fa="تست همه">Test All</span></button>
+      <button id="proxy-stop-btn" class="btn btn-danger btn-sm" style="display:none;" onclick="stopProxyTest()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg></span><span data-en="Stop" data-fa="توقف">Stop</span></button>
       <button class="btn btn-outline btn-sm" onclick="resolveProxyFlags()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg></span><span data-en="Resolve Flags" data-fa="دریافت پرچم‌ها">Resolve Flags</span></button>
       <button class="btn btn-danger btn-sm" onclick="deleteFailedProxies()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg></span><span data-en="Delete Failed" data-fa="حذف خراب‌ها">Delete Failed</span></button>
       <button class="btn btn-danger btn-sm" onclick="deleteSelectedProxies()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg></span><span data-en="Delete Selected" data-fa="حذف انتخاب‌شده">Delete Selected</span></button>
       <button class="btn btn-outline btn-sm" onclick="copySelectedProxies()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></span><span data-en="Copy Selected" data-fa="کپی انتخاب‌شده">Copy Selected</span></button>
     </div>
   </div>
-  <div style="display:flex; align-items:center; gap:8px; margin:10px 0;">
+  <div style="display:flex;flex-wrap:wrap; align-items:center; gap:8px; margin:10px 0;">
     <div style="flex:1;">
       <div class="sys-bar" style="height:6px;">
         <div id="proxy-test-bar" class="sys-fill" style="width:0%; background:var(--accent);"></div>
@@ -18295,7 +18475,7 @@ body[dir="rtl"] .row-act-grid{flex-direction:row}
   </div>
 </div>
 <div class="card" style="margin-top:20px;">
-  <div class="card-hd"><span class="card-title" data-en="Inbounds & Outbounds" data-fa="ورودی‌ها و خروجی‌ها">Inbounds &amp; Outbounds</span><button class="btn btn-outline btn-sm" onclick="refreshInbOutCard(this)" data-en="Refresh" data-fa="بروزرسانی">Refresh</button></div>
+  <div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg></span><span class="card-title" data-en="Inbounds & Outbounds" data-fa="ورودی‌ها و خروجی‌ها">Inbounds &amp; Outbounds</span></span><button class="btn btn-outline btn-sm" onclick="refreshInbOutCard(this)"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg></span><span data-en="Refresh" data-fa="بروزرسانی">Refresh</span></button></div>
   <div id="inb-out-body" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;min-width:0;" data-en="Loading…" data-fa="در حال بارگیری…">Loading…</div>
   <div id="inb-out-health" style="margin-top:10px;"></div>
 </div>
@@ -18309,26 +18489,26 @@ body[dir="rtl"] .row-act-grid{flex-direction:row}
         <button class="pill-btn active" data-profile="all" onclick="switchProfileView('all')" data-en="All" data-fa="همه">All</button>
       </div>
       <div class="card" id="addresses-card">
-        <div class="fg"><label class="fl" data-en="Add Addresses (one per line)" data-fa="افزودن آدرس (هر خط یک)">Add Addresses (one per line)</label><textarea class="fi" id="batch-addrs" rows="4" placeholder="8.8.8.8
+        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Add Addresses (one per line)" data-fa="افزودن آدرس (هر خط یک)">Add Addresses (one per line)</span></label><textarea class="fi" id="batch-addrs" rows="4" placeholder="8.8.8.8
 example.com"></textarea></div>
-        <div style="display:flex; gap:6px; margin-bottom:12px;">
-          <button class="btn btn-primary" onclick="addBatchAddrs()" data-en="Add All" data-fa="افزودن همه">Add All</button>
-          <button class="btn btn-danger btn-sm" onclick="deleteAllAddrs()" data-en="Delete All" data-fa="حذف همه">Delete All</button>
-          <button class="btn btn-danger btn-sm" onclick="bulkDeleteAddrs()" data-en="Delete Selected" data-fa="حذف انتخاب‌شده">Delete Selected</button>
-          <button class="btn btn-outline btn-sm" onclick="toggleAllAddresses()" data-en="Select All" data-fa="انتخاب همه">Select All</button>
+        <div style="display:flex;flex-wrap:wrap; gap:6px; margin-bottom:12px;">
+          <button class="btn btn-primary" onclick="addBatchAddrs()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></span><span data-en="Add All" data-fa="افزودن همه">Add All</span></button>
+          <button class="btn btn-danger btn-sm" onclick="deleteAllAddrs()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg></span><span data-en="Delete All" data-fa="حذف همه">Delete All</span></button>
+          <button class="btn btn-danger btn-sm" onclick="bulkDeleteAddrs()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg></span><span data-en="Delete Selected" data-fa="حذف انتخاب‌شده">Delete Selected</span></button>
+          <button class="btn btn-outline btn-sm" onclick="toggleAllAddresses()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></span><span data-en="Select All" data-fa="انتخاب همه">Select All</span></button>
           <button class="btn btn-outline btn-sm" onclick="copySelectedAddrs()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></span><span data-en="Copy Selected" data-fa="کپی انتخاب‌ها">Copy Selected</span></button>
           <input type="file" id="import-ip-file" accept=".txt" style="display:none" onchange="importIpFile(this)">
-          <button class="btn btn-outline btn-sm" onclick="document.getElementById('import-ip-file').click()" data-en="Import .txt" data-fa="ورودی فایل">Import .txt</button>
-          <button class="btn btn-outline btn-sm" onclick="resolveAllFlags()" data-en="Resolve All Flags" data-fa="دریافت همه پرچم‌ها">Resolve All Flags</button>
+          <button class="btn btn-outline btn-sm" onclick="document.getElementById('import-ip-file').click()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg></span><span data-en="Import .txt" data-fa="ورودی فایل">Import .txt</span></button>
+          <button class="btn btn-outline btn-sm" onclick="resolveAllFlags()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg></span><span data-en="Resolve All Flags" data-fa="دریافت همه پرچم‌ها">Resolve All Flags</span></button>
         </div>
         <div class="addr-list-scroll" id="addr-list" style="margin-top:16px;"></div>
       </div>
       <div class="card" style="margin-top:16px;">
-        <div class="card-hd"><span class="card-title" data-en="IP Profiles" data-fa="پروفایل‌های آی‌پی">IP Profiles</span></div>
+        <div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/></svg></span><span class="card-title" data-en="IP Profiles" data-fa="پروفایل‌های آی‌پی">IP Profiles</span></span></div>
         <div class="status-cards-grid" id="ip-profiles-list"></div>
-        <div style="display:flex; gap:6px; margin-top:8px;">
+        <div style="display:flex;flex-wrap:wrap; gap:6px; margin-top:8px;">
           <input class="fi" id="new-profile-name" dir="auto" placeholder="Profile name" data-ph-en="Profile name" data-ph-fa="نام پروفایل" style="flex:1;">
-          <button class="btn btn-primary btn-sm" onclick="createIpProfile()" data-en="Create" data-fa="ایجاد">Create</button>
+          <button class="btn btn-primary btn-sm" onclick="createIpProfile()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></span><span data-en="Create" data-fa="ایجاد">Create</span></button>
         </div>
       </div>
     </section>
@@ -18340,27 +18520,27 @@ example.com"></textarea></div>
         <div id="railway-note" style="display:none; margin-top:8px; color: var(--text-2);"><span data-en="Note: For Railway provider, only Railway-related IPs will work." data-fa="نکته: در ارائه‌دهنده Railway فقط آی‌پی‌های مربوط به آن کار خواهد کرد."></span></div>
       </div>
       <div class="card">
-        <div class="fg"><label class="fl" data-en="Provider" data-fa="ارائه‌دهنده">Provider</label><input class="fi provider-search" id="provider-search" data-ph-en="Search providers…" data-ph-fa="جستجوی ارائه‌دهنده…" placeholder="Search providers…" oninput="filterProviders(this.value)"><div id="provider-btns" class="pill-group"></div><div style="margin-top:8px;"><button class="btn btn-outline btn-sm" onclick="scanAllProviders()" data-en="Scan all providers" data-fa="اسکن همه ارائه‌دهنده‌ها">Scan all providers</button></div></div>
-        <div class="fg" id="range-section" style="display:none;"><label class="fl" data-en="Ranges" data-fa="رنج‌ها">Ranges</label><div id="range-btns" class="pill-group"></div></div>
-        <div class="fg"><label class="fl" data-en="IPs / Domains / CIDR Ranges (one per line)" data-fa="آی‌پی‌ها / دامنه‌ها / رنج‌های CIDR (هر خط یک)">IPs / Domains / CIDR Ranges (one per line)</label><textarea class="fi" id="scan-ips" rows="5" placeholder="8.8.8.8
+        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Provider" data-fa="ارائه‌دهنده">Provider</span></label><input class="fi provider-search" id="provider-search" data-ph-en="Search providers…" data-ph-fa="جستجوی ارائه‌دهنده…" placeholder="Search providers…" oninput="filterProviders(this.value)"><div id="provider-btns" class="pill-group"></div><div style="margin-top:8px;"><button class="btn btn-outline btn-sm" onclick="scanAllProviders()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><path d="M3.5 8.5A9 9 0 0 1 11 2"/></svg></span><span data-en="Scan all providers" data-fa="اسکن همه ارائه‌دهنده‌ها">Scan all providers</span></button></div></div>
+        <div class="fg" id="range-section" style="display:none;"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Ranges" data-fa="رنج‌ها">Ranges</span></label><div id="range-btns" class="pill-group"></div></div>
+        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="IPs / Domains / CIDR Ranges (one per line)" data-fa="آی‌پی‌ها / دامنه‌ها / رنج‌های CIDR (هر خط یک)">IPs / Domains / CIDR Ranges (one per line)</span></label><textarea class="fi" id="scan-ips" rows="5" placeholder="8.8.8.8
 example.com
 192.168.1.0/24"></textarea></div>
-        <div style="display:flex;gap:6px;">
-          <button class="btn btn-primary" id="scan-start-btn" onclick="startIPScan()" data-en="Scan (port 443)" data-fa="اسکن (پورت ۴۴۳)">Scan (port 443)</button>
-          <button class="btn btn-danger btn-sm" id="scan-stop-btn" onclick="stopScan()" style="display:none;" data-en="Stop" data-fa="توقف">Stop</button>
+        <div style="display:flex;flex-wrap:wrap;gap:6px;">
+          <button class="btn btn-primary" id="scan-start-btn" onclick="startIPScan()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><path d="M3.5 8.5A9 9 0 0 1 11 2"/></svg></span><span data-en="Scan (port 443)" data-fa="اسکن (پورت ۴۴۳)">Scan (port 443)</span></button>
+          <button class="btn btn-danger btn-sm" id="scan-stop-btn" onclick="stopScan()" style="display:none;"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg></span><span data-en="Stop" data-fa="توقف">Stop</span></button>
         </div>
         <div class="scan-note" id="scan-egress-note"><span data-en="Outbound TCP from this server appears blocked: no scanned address answered. The scanner needs a VPS or a host with allowed outbound TCP (port 443)." data-fa="به‌نظر می‌رسد TCP خروجی این سرور مسدود است: هیچ آدرسی پاسخ نداد. اسکنر به یک VPS یا هاستی با TCP خروجی مجاز (پورت ۴۴۳) نیاز دارد.">Outbound TCP from this server appears blocked: no scanned address answered. The scanner needs a VPS or a host with allowed outbound TCP (port 443).</span></div>
         <div style="color:var(--text-3);font-size:0.8rem;margin-top:8px;" data-en="Scanner opens outbound TCP from this server. If every scan fails at 0%, the host blocks egress — run the panel on a VPS instead." data-fa="اسکنر از این سرور TCP خروجی باز می‌کند. اگر همه اسکن‌ها در ۰٪ شکست خوردند، هاست خروجی را مسدود کرده است — پنل را روی یک VPS اجرا کنید.">Scanner opens outbound TCP from this server. If every scan fails at 0%, the host blocks egress — run the panel on a VPS instead.</div>
-        <div class="fg" style="margin-bottom:10px;"><div style="display:flex;align-items:center;gap:8px;"><div class="sys-bar" style="flex:1; height:6px;"><div id="scan-progress" class="sys-fill" style="width:0%; background:var(--accent);"></div></div><span id="progress-text" style="font-size:0.8rem; color:var(--text-3);">0%</span></div></div>
+        <div class="fg" style="margin-bottom:10px;"><div style="display:flex;flex-wrap:wrap;align-items:center;gap:8px;"><div class="sys-bar" style="flex:1; height:6px;"><div id="scan-progress" class="sys-fill" style="width:0%; background:var(--accent);"></div></div><span id="progress-text" style="font-size:0.8rem; color:var(--text-3);">0%</span></div></div>
         <div class="scanner-location-filter" id="location-filter" style="display:none; flex-wrap:wrap; gap:6px; align-items:center;">
           <span style="color:var(--text-3); font-size:0.8rem;" data-en="Location:" data-fa="موقعیت:">Location:</span>
           <div id="location-checkboxes" style="display:flex; flex-wrap:wrap; gap:4px;"></div>
-          <button class="btn btn-outline btn-sm" onclick="resetLocationFilter()" data-en="Show All" data-fa="نمایش همه">Show All</button>
+          <button class="btn btn-outline btn-sm" onclick="resetLocationFilter()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></span><span data-en="Show All" data-fa="نمایش همه">Show All</span></button>
         </div>
         <div class="scan-results-container" style="margin-top:8px;">
           <table class="tbl scanner-tbl"><thead><tr><th data-en="Address" data-fa="آدرس">Address</th><th data-en="Status" data-fa="وضعیت">Status</th><th data-en="TCP" data-fa="TCP">TCP</th><th data-en="HTTPS" data-fa="HTTPS">HTTPS</th><th data-en="Location" data-fa="موقعیت">Location</th></tr></thead><tbody id="scan-tbody"></tbody></table>
         </div>
-        <div style="display:flex;gap:6px;margin-top:8px;">
+        <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;">
           <button class="btn btn-outline btn-sm" onclick="sortBestIPs()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg></span><span data-en="Sort Best IPs" data-fa="مرتب‌سازی بهترین‌ها">Sort Best IPs</span></button>
           <button class="btn btn-outline btn-sm" onclick="copyReachableSorted()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></span><span data-en="Copy Reachable (sorted)" data-fa="کپی قابل دسترس (مرتب)">Copy Reachable (sorted)</span></button>
           <button class="btn btn-primary btn-sm" onclick="createProfileFromReachable()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg></span><span data-en="Save as Profile" data-fa="ذخیره به‌عنوان پروفایل">Save as Profile</span></button>
@@ -18369,7 +18549,7 @@ example.com
     </section>
     <section class="page" id="page-logs">
       <div class="page-header"><div class="page-title" data-en="Logs" data-fa="لاگ‌ها">Logs</div></div>
-      <div class="inbound-tools" style="display:flex;gap:10px;margin-bottom:16px;">
+      <div class="inbound-tools" style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:16px;">
         <input id="log-search" dir="auto" placeholder="Search logs…" data-ph-en="Search logs…" data-ph-fa="جستجوی لاگ‌ها…" oninput="filterLogs()" class="fi" style="flex:1;">
         <button class="btn btn-outline btn-sm" onclick="clearLogSearch()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></span></button>
       </div>
@@ -18380,9 +18560,9 @@ example.com
             <tbody id="logs-tbody"></tbody>
           </table>
         </div>
-        <div class="empty" id="logs-empty" style="display:none;padding:30px;" data-en="No events recorded" data-fa="رویدادی ثبت نشده است">No events recorded</div>
+        <div class="empty" id="logs-empty" style="display:none;padding:30px;"><span class="ic" style="--ic:28px;display:block;margin:0 auto 10px;" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg></span><span data-en="No events recorded" data-fa="رویدادی ثبت نشده است">No events recorded</span></div>
       </div>
-      <div style="display:flex;gap:6px;margin-top:8px;">
+      <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;">
         <button class="btn btn-outline btn-sm" onclick="refreshLogs()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg></span><span data-en="Refresh" data-fa="بروزرسانی">Refresh</span></button>
         <button class="btn btn-outline btn-sm" onclick="fetchLogSize()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 17L17 3l4 4L7 21z"/><line x1="8" y1="12" x2="10" y2="14"/><line x1="11" y1="9" x2="13" y2="11"/><line x1="14" y1="6" x2="16" y2="8"/></svg></span><span data-en="Log Size" data-fa="حجم لاگ">Log Size</span></button>
         <button class="btn btn-danger btn-sm" onclick="clearLogs()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg></span><span data-en="Clear Logs" data-fa="پاک‌سازی لاگ‌ها">Clear Logs</span></button>
@@ -18391,11 +18571,11 @@ example.com
     <section class="page" id="page-telegram">
       <div class="page-header"><div class="page-title" data-en="Telegram" data-fa="تلگرام">Telegram</div></div>
       <div class="card">
-        <div class="card-hd"><span class="card-title" data-en="Telegram Bot" data-fa="ربات تلگرام">Telegram Bot</span><span id="tg-bot-status" class="tag tag-off">not configured</span></div>
-        <div id="tg-bot-status-line" style="color:var(--text-3);font-size:0.85rem;padding:2px 0 8px;">Add Bot Token and Chat ID, then press Test.</div>
-        <div class="fg"><label class="fl" data-en="Bot Token" data-fa="توکن ربات">Bot Token</label><input class="fi" id="tg-token"></div>
-        <div class="fg"><label class="fl" data-en="Chat ID" data-fa="شناسه چت">Chat ID</label><input class="fi" id="tg-chat-id"></div>
-        <div class="fg"><label class="fl" data-en="Notify Events" data-fa="رویدادهای اطلاع‌رسانی">Notify Events</label>
+        <div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="8" width="14" height="12" rx="2"/><line x1="12" y1="8" x2="12" y2="4"/><circle cx="12" cy="3" r="1"/><circle cx="9" cy="13" r="1" fill="currentColor" stroke="none"/><circle cx="15" cy="13" r="1" fill="currentColor" stroke="none"/><line x1="9" y1="17" x2="15" y2="17"/></svg></span><span class="card-title" data-en="Telegram Bot" data-fa="ربات تلگرام">Telegram Bot</span></span><span id="tg-bot-status" class="tag tag-off" data-en="not configured" data-fa="تنظیم نشده">not configured</span></div>
+        <div id="tg-bot-status-line" style="color:var(--text-3);font-size:0.85rem;padding:2px 0 8px;" data-en="Add Bot Token and Chat ID, then press Test." data-fa="توکن ربات و شناسه چت را اضافه کنید، سپس «تست» را بزنید.">Add Bot Token and Chat ID, then press Test.</div>
+        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Bot Token" data-fa="توکن ربات">Bot Token</span></label><input class="fi" id="tg-token"></div>
+        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Chat ID" data-fa="شناسه چت">Chat ID</span></label><input class="fi" id="tg-chat-id"></div>
+        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Notify Events" data-fa="رویدادهای اطلاع‌رسانی">Notify Events</span></label>
           <div style="display:flex;flex-wrap:wrap;gap:6px;">
             <label><input type="checkbox" value="quota_90" class="tg-event"> <span data-en="Quota 90%" data-fa="کوتا ۹۰٪">Quota 90%</span></label>
             <label><input type="checkbox" value="login" class="tg-event"> <span data-en="Login" data-fa="ورود">Login</span></label>
@@ -18408,55 +18588,55 @@ example.com
             These events trigger instant alerts, not the periodic stats report.
           </small>
         </div>
-        <div class="fg"><label class="fl" data-en="Report Interval (hours)" data-fa="فاصله گزارش (ساعت)">Report Interval (hours)</label><input class="fi" type="number" id="tg-interval" value="1" min="0.5" step="0.5"></div>
-        <div class="fg"><label class="fl" data-en="Telegram Language" data-fa="زبان تلگرام">Telegram Language</label>
+        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Report Interval (hours)" data-fa="فاصله گزارش (ساعت)">Report Interval (hours)</span></label><input class="fi" type="number" id="tg-interval" value="1" min="0.5" step="0.5"></div>
+        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Telegram Language" data-fa="زبان تلگرام">Telegram Language</span></label>
           <div class="toggle on" id="tg-lang-toggle" onpointerdown="toggleTgLang()"></div>
           <span id="tg-lang-label" data-en="English" data-fa="انگلیسی">English</span>
           <input type="hidden" id="tg-lang-hidden" value="en">
         </div>
-        <div class="fg"><label class="fl" data-en="Custom Templates (EN)" data-fa="قالب‌های سفارشی (EN)">Custom Templates (EN)</label>
+        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Custom Templates (EN)" data-fa="قالب‌های سفارشی (EN)">Custom Templates (EN)</span></label>
           <textarea class="fi" id="tg-templates-en" rows="4" dir="ltr" wrap="soft" style="white-space:pre-wrap;overflow-wrap:break-word;word-break:break-word;">{"quota_90":"{label} ({uid}) used 90% of quota","login":"SulgX Panel login\nIP: {ip}\nUA: {ua}\n{time}","expiry":"{label} expired","error":"Error on {label}: check logs"}</textarea>
-          <small style="color:var(--text-3);font-size:0.8rem;display:block;margin-top:4px;">One JSON message per event. Placeholders: {label} link name, {uid} link id, {ip} login IP, {ua} browser, {time} time. Keys: quota_90, login, expiry, error.</small>
+          <small style="color:var(--text-3);font-size:0.8rem;display:block;margin-top:4px;" data-en="One JSON message per event. Placeholders: {label} link name, {uid} link id, {ip} login IP, {ua} browser, {time} time. Keys: quota_90, login, expiry, error." data-fa="یک پیام JSON برای هر رویداد. جای‌گذارها: {label} نام لینک، {uid} شناسه لینک، {ip} آی‌پی ورود، {ua} مرورگر، {time} زمان. کلیدها: quota_90 و login و expiry و error.">One JSON message per event. Placeholders: {label} link name, {uid} link id, {ip} login IP, {ua} browser, {time} time. Keys: quota_90, login, expiry, error.</small>
         </div>
-        <div class="fg"><label class="fl" data-en="Custom Templates (FA)" data-fa="قالب‌های سفارشی (FA)">Custom Templates (FA)</label>
+        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Custom Templates (FA)" data-fa="قالب‌های سفارشی (FA)">Custom Templates (FA)</span></label>
           <textarea class="fi" id="tg-templates-fa" rows="4" dir="auto" wrap="soft" style="white-space:pre-wrap;overflow-wrap:break-word;word-break:break-word;">{"quota_90":"{label} ({uid}) ۹۰٪ کوتا","login":"ورود SulgX\nIP: {ip}\nUA: {ua}\n{time}","expiry":"{label} منقضی شد","error":"خطا در {label}: بررسی شود"}</textarea>
-          <small style="color:var(--text-3);font-size:0.8rem;display:block;margin-top:4px;" dir="auto">یک پیام JSON برای هر رویداد. جای‌گذارها: {label} نام لینک، {uid} شناسه لینک، {ip} آی‌پی ورود، {ua} مرورگر، {time} زمان. کلیدها: quota_90 و login و expiry و error.</small>
+          <small style="color:var(--text-3);font-size:0.8rem;display:block;margin-top:4px;" dir="auto" data-en="One JSON message per event. Placeholders: {label} link name, {uid} link id, {ip} login IP, {ua} browser, {time} time. Keys: quota_90, login, expiry, error." data-fa="یک پیام JSON برای هر رویداد. جای‌گذارها: {label} نام لینک، {uid} شناسه لینک، {ip} آی‌پی ورود، {ua} مرورگر، {time} زمان. کلیدها: quota_90 و login و expiry و error.">یک پیام JSON برای هر رویداد. جای‌گذارها: {label} نام لینک، {uid} شناسه لینک، {ip} آی‌پی ورود، {ua} مرورگر، {time} زمان. کلیدها: quota_90 و login و expiry و error.</small>
         </div>
         <div style="margin:6px 0;">
-          <button class="btn btn-outline btn-sm" onclick="previewTemplate()" data-en="Preview" data-fa="پیش‌نمایش">Preview</button>
+          <button class="btn btn-outline btn-sm" onclick="previewTemplate()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></span><span data-en="Preview" data-fa="پیش‌نمایش">Preview</span></button>
           <div id="tg-preview" style="margin-top:6px; padding:8px; background:var(--surface-3); border-radius:8px; white-space:pre-wrap;"></div>
         </div>
-        <div style="display:flex;gap:6px;"><button class="btn btn-primary" onclick="saveTelegramSettings()" data-en="Save" data-fa="ذخیره">Save</button><button class="btn btn-outline btn-sm" onclick="testTelegram()" data-en="Test" data-fa="تست">Test</button></div>
+        <div style="display:flex;flex-wrap:wrap;gap:6px;"><button class="btn btn-primary" onclick="saveTelegramSettings()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg></span><span data-en="Save" data-fa="ذخیره">Save</span></button><button class="btn btn-outline btn-sm" onclick="testTelegram()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h6"/><path d="M10 3v6L4.5 19a2 2 0 0 0 1.8 3h11.4a2 2 0 0 0 1.8-3L14 9V3"/><path d="M7.5 14h9"/></svg></span><span data-en="Test" data-fa="تست">Test</span></button></div>
       </div>
 <div class="card" style="margin-top:20px;">
-  <div class="card-hd"><span class="card-title" data-en="Telegram Proxy" data-fa="پروکسی تلگرام">Telegram Proxy</span><button class="btn btn-outline btn-sm" id="tg-proxy-refresh-btn" onclick="refreshTgProxyCard(this)" data-en="Refresh" data-fa="بروزرسانی">Refresh</button></div>
+  <div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg></span><span class="card-title" data-en="Telegram Proxy" data-fa="پروکسی تلگرام">Telegram Proxy</span></span><button class="btn btn-outline btn-sm" id="tg-proxy-refresh-btn" onclick="refreshTgProxyCard(this)"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg></span><span data-en="Refresh" data-fa="بروزرسانی">Refresh</span></button></div>
   <div id="tg-proxy-body" data-en="Loading…" data-fa="در حال بارگذاری…">Loading…</div>
 </div>
     </section>
     <section class="page" id="page-active-users">
-      <div class="page-header"><div><div class="page-title" data-en="Active Users" data-fa="کاربران فعال">Active Users</div><div class="page-sub" data-en="Live sessions — updated from the server every 3 seconds" data-fa="نشست‌های زنده — هر ۳ ثانیه از سرور به‌روز می‌شود">Live sessions — updated from the server every 3 seconds</div></div><button class="btn btn-outline btn-sm" onclick="refreshActiveUsers(this)" data-en="Refresh" data-fa="بروزرسانی">Refresh</button></div>
+      <div class="page-header"><div><div class="page-title" data-en="Active Users" data-fa="کاربران فعال">Active Users</div><div class="page-sub" data-en="Live sessions — updated from the server every 3 seconds" data-fa="نشست‌های زنده — هر ۳ ثانیه از سرور به‌روز می‌شود">Live sessions — updated from the server every 3 seconds</div></div><button class="btn btn-outline btn-sm" onclick="refreshActiveUsers(this)"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg></span><span data-en="Refresh" data-fa="بروزرسانی">Refresh</span></button></div>
       <div class="card">
-        <div class="card-hd"><span class="card-title" data-en="Sessions" data-fa="نشست‌ها">Sessions</span><span id="active-users-summary" style="color:var(--text-2);font-size:0.85rem;"></span></div>
+        <div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></span><span class="card-title" data-en="Sessions" data-fa="نشست‌ها">Sessions</span></span><span id="active-users-summary" style="color:var(--text-2);font-size:0.85rem;"></span></div>
         <div id="active-users-cards" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px;"></div>
       </div>
       <div class="card" style="margin-top:12px;">
-        <div class="card-hd"><span class="card-title" data-en="Disabled users" data-fa="کاربران مسدودشده">Disabled users</span><span style="color:var(--text-2);font-size:0.85rem;" data-en="Blocked IPs stay blocked until released" data-fa="آی‌پی‌های مسدودشده تا زمان رفع مسدودیت، مسدود می‌مانند">Blocked IPs stay blocked until released</span></div>
+        <div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></span><span class="card-title" data-en="Disabled users" data-fa="کاربران مسدودشده">Disabled users</span></span><span style="color:var(--text-2);font-size:0.85rem;" data-en="Blocked IPs stay blocked until released" data-fa="آی‌پی‌های مسدودشده تا زمان رفع مسدودیت، مسدود می‌مانند">Blocked IPs stay blocked until released</span></div>
         <div id="blocked-users-list" style="display:grid;gap:8px;"></div>
       </div>
       <div class="card" style="margin-top:12px;">
-        <div class="card-hd"><span class="card-title" data-en="Restricted users" data-fa="کاربران محدود شده">Restricted users</span><span style="color:var(--text-2);font-size:0.85rem;" data-en="Blocked source IPs and ranges cannot connect to any config" data-fa="آی‌پی‌ها و بازه‌های مسدودشده نمی‌توانند به هیچ کانفیگی متصل شوند">Blocked source IPs and ranges cannot connect to any config</span></div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;"><input class="fi" id="restricted-entry" style="flex:1;min-width:200px;" data-ph-en="IP or CIDR, e.g. 203.0.113.7 or 203.0.113.0/24" data-ph-fa="آی‌پی یا CIDR، مثلاً 203.0.113.7 یا 203.0.113.0/24" placeholder="IP or CIDR, e.g. 203.0.113.7 or 203.0.113.0/24"><button class="btn btn-outline btn-sm" onclick="addRestrictedUser()" data-en="Restrict" data-fa="محدود کردن">Restrict</button></div>
+        <div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg></span><span class="card-title" data-en="Restricted users" data-fa="کاربران محدود شده">Restricted users</span></span><span style="color:var(--text-2);font-size:0.85rem;" data-en="Blocked source IPs and ranges cannot connect to any config" data-fa="آی‌پی‌ها و بازه‌های مسدودشده نمی‌توانند به هیچ کانفیگی متصل شوند">Blocked source IPs and ranges cannot connect to any config</span></div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;"><input class="fi" id="restricted-entry" style="flex:1;min-width:200px;" data-ph-en="IP or CIDR, e.g. 203.0.113.7 or 203.0.113.0/24" data-ph-fa="آی‌پی یا CIDR، مثلاً 203.0.113.7 یا 203.0.113.0/24" placeholder="IP or CIDR, e.g. 203.0.113.7 or 203.0.113.0/24"><button class="btn btn-outline btn-sm" onclick="addRestrictedUser()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></span><span data-en="Restrict" data-fa="محدود کردن">Restrict</span></button></div>
         <div id="restricted-users-list" style="display:grid;gap:8px;margin-top:8px;"></div>
       </div>
     </section>
     <section class="page" id="page-settings">
       <div class="page-header"><div class="page-title" data-en="Settings" data-fa="تنظیمات">Settings</div></div>
       <div class="card">
-        <div class="fg"><label class="fl" data-en="Login Text" data-fa="متن ورود">Login Text</label><input class="fi" id="set-footer" dir="auto"></div>
-        <div class="fg"><label class="fl" data-en="Default Path" data-fa="مسیر پیش‌فرض">Default Path</label><input class="fi" id="set-default-path" placeholder="/ws/{uid}"></div>
-        <div class="fg"><label class="fl" data-en="Default XHTTP Path" data-fa="مسیر پیش‌فرض XHTTP">Default XHTTP Path</label><input class="fi" id="set-default-xhttp-path" placeholder="/xhttp"></div>
+        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Login Text" data-fa="متن ورود">Login Text</span></label><input class="fi" id="set-footer" dir="auto"></div>
+        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Default Path" data-fa="مسیر پیش‌فرض">Default Path</span></label><input class="fi" id="set-default-path" placeholder="/ws/{uid}"></div>
+        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Default XHTTP Path" data-fa="مسیر پیش‌فرض XHTTP">Default XHTTP Path</span></label><input class="fi" id="set-default-xhttp-path" placeholder="/xhttp"></div>
         <div class="fg">
-          <label class="fl" data-en="Timezone / Region" data-fa="منطقه زمانی / ساعت">Timezone / Region</label>
+          <label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Timezone / Region" data-fa="منطقه زمانی / ساعت">Timezone / Region</span></label>
           <div class="seg-group" id="tz-seg-group">
             <button type="button" class="seg-btn active" id="btn-tz-utc" onclick="setPanelTZ(0, 'UTC')" data-en="UTC (00:00)" data-fa="UTC (۰۰:۰۰)">UTC (00:00)</button>
             <button type="button" class="seg-btn" id="btn-tz-tehran" onclick="setPanelTZ(3.5, 'Tehran')" data-en="Tehran (+3:30)" data-fa="تهران (+۳:۳۰)">Tehran (+3:30)</button>
@@ -18467,7 +18647,7 @@ example.com
           </div>
         </div>
         <div class="fg">
-          <label class="fl" data-en="Interface Theme" data-fa="تم محیط کاربری">Interface Theme</label>
+          <label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Interface Theme" data-fa="تم محیط کاربری">Interface Theme</span></label>
           <div class="seg-group" id="theme-seg-group">
             <button type="button" class="seg-btn active" id="btn-theme-dark" onclick="setPanelTheme('dark')" data-en="Dark" data-fa="تیره">Dark</button>
             <button type="button" class="seg-btn" id="btn-theme-light" onclick="setPanelTheme('light')" data-en="Light" data-fa="روشن">Light</button>
@@ -18476,13 +18656,13 @@ example.com
           <input type="hidden" id="set-theme-color" value="dark">
         </div>
         <div class="fg">
-          <label class="fl" data-en="Panel Language" data-fa="زبان پنل">Panel Language</label>
+          <label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Panel Language" data-fa="زبان پنل">Panel Language</span></label>
           <div class="seg-group" id="lang-seg-group">
             <button type="button" class="seg-btn active" id="btn-lang-en" onclick="setPanelLanguage('en')" data-en="English" data-fa="انگلیسی">English</button>
-            <button type="button" class="seg-btn" id="btn-lang-fa" onclick="setPanelLanguage('fa')">فارسی</button>
+            <button type="button" class="seg-btn" id="btn-lang-fa" onclick="setPanelLanguage('fa')" data-en="Persian" data-fa="فارسی">فارسی</button>
           </div>
         </div>
-        <div class="fg"><label class="fl" data-en="Keep Alive" data-fa="ضدخواب">Keep Alive</label>
+        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Keep Alive" data-fa="ضدخواب">Keep Alive</span></label>
           <div class="seg-group" id="keepalive-mode-group">
             <button type="button" class="seg-btn active" id="btn-keepalive-simple" onclick="setKeepAliveMode('simple')" data-en="Simple" data-fa="ساده">Simple</button>
             <button type="button" class="seg-btn" id="btn-keepalive-advanced" onclick="setKeepAliveMode('advanced')" data-en="Advanced" data-fa="پیشرفته">Advanced</button>
@@ -18495,35 +18675,35 @@ example.com
             </div>
           </div>
         </div>
-        <div class="fg"><label class="fl" data-en="Keep Alive Interval (seconds)" data-fa="فاصله ضدخواب (ثانیه)">Keep Alive Interval (seconds)</label>
+        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Keep Alive Interval (seconds)" data-fa="فاصله ضدخواب (ثانیه)">Keep Alive Interval (seconds)</span></label>
           <input class="fi" type="number" id="set-keep-alive-interval" placeholder="300" min="60">
         </div>
-        <div class="fg"><label class="fl" data-en="Default Traffic Limit (GB)" data-fa="محدودیت ترافیک پیش‌فرض (گیگابایت)">Default Traffic Limit (GB)</label><input class="fi" type="number" id="set-default-limit" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
-        <div class="fg"><label class="fl" data-en="Default Expiry (Days)" data-fa="انقضای پیش‌فرض (روز)">Default Expiry (Days)</label><input class="fi" type="number" id="set-default-expiry" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
-        <div class="fg"><label class="fl" data-en="Default Max Connections" data-fa="حداکثر اتصالات پیش‌فرض">Default Max Connections</label><input class="fi" type="number" id="set-default-maxconn" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
-        <div class="fg"><label class="fl" data-en="Scanner Timeout (seconds)" data-fa="تایم‌اوت اسکنر (ثانیه)">Scanner Timeout (seconds)</label><input class="fi" type="number" id="set-scanner-timeout" placeholder="4"></div>
-        <div class="fg"><label class="fl" data-en="Max Scan IPs" data-fa="حداکثر آی‌پی اسکن">Max Scan IPs</label><input class="fi" type="number" id="set-max-scan-ips" placeholder="256"></div>
-        <div class="fg"><label class="fl" data-en="Monthly Limit (GB)" data-fa="محدودیت ماهانه (گیگابایت)">Monthly Limit (GB)</label><input class="fi" type="number" id="set-monthly-limit" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
-        <div class="fg"><label class="fl" data-en="Default Protocol" data-fa="پروتکل پیش‌فرض">Default Protocol</label><select class="fs" id="set-default-protocol"><option value="vless-ws" data-en="VLESS + WS" data-fa="VLESS + WS">VLESS + WS</option><option value="vmess-ws" data-en="VMess + WS" data-fa="VMess + WS">VMess + WS</option><option value="trojan-ws" data-en="Trojan + WS" data-fa="Trojan + WS">Trojan + WS</option><option value="ss-ws" data-en="Shadowsocks + WS" data-fa="Shadowsocks + WS">Shadowsocks + WS</option><option value="xhttp-auto" data-en="XHTTP Auto" data-fa="XHTTP Auto">XHTTP Auto</option><option value="xhttp-stream-one" data-en="XHTTP Stream-One" data-fa="XHTTP Stream-One">XHTTP Stream-One</option><option value="xhttp-stream-up" data-en="XHTTP Stream-Up" data-fa="XHTTP Stream-Up">XHTTP Stream-Up</option><option value="xhttp-packet-up" data-en="XHTTP Packet-Up" data-fa="XHTTP Packet-Up">XHTTP Packet-Up</option><option value="socks5" data-en="SOCKS5" data-fa="SOCKS5">SOCKS5</option><option value="mtproto" data-en="Telegram MTProto" data-fa="تلگرام MTProto">Telegram MTProto</option><option value="webproxy" data-en="Telegram WEB proxy" data-fa="پروکسی WEB تلگرام">Telegram WEB proxy</option><option value="http-proxy" data-en="HTTP proxy" data-fa="پروکسی HTTP">HTTP proxy</option></select></div>
-        <div class="fg"><label class="fl" data-en="Default Shadowsocks Method" data-fa="روش شادوساکس پیش‌فرض">Default Shadowsocks Method</label><select class="fs" id="set-default-ss-method"><option value="2022-blake3-aes-256-gcm" data-en="2022-blake3-aes-256-gcm" data-fa="2022-blake3-aes-256-gcm">2022-blake3-aes-256-gcm</option><option value="2022-blake3-aes-128-gcm" data-en="2022-blake3-aes-128-gcm" data-fa="2022-blake3-aes-128-gcm">2022-blake3-aes-128-gcm</option><option value="2022-blake3-chacha20-poly1305" data-en="2022-blake3-chacha20-poly1305" data-fa="2022-blake3-chacha20-poly1305">2022-blake3-chacha20-poly1305</option><option value="aes-256-gcm" data-en="aes-256-gcm (classic)" data-fa="aes-256-gcm (کلاسیک)">aes-256-gcm (classic)</option><option value="aes-128-gcm" data-en="aes-128-gcm (classic)" data-fa="aes-128-gcm (کلاسیک)">aes-128-gcm (classic)</option><option value="chacha20-ietf-poly1305" data-en="chacha20-ietf-poly1305 (classic)" data-fa="chacha20-ietf-poly1305 (کلاسیک)">chacha20-ietf-poly1305 (classic)</option></select></div>
-        <div class="fg"><label class="fl" data-en="Default Outbound Mode" data-fa="حالت خروجی پیش‌فرض">Default Outbound Mode</label><select class="fs" id="set-default-outbound-mode"><option value="auto" data-en="Auto" data-fa="خودکار">Auto</option><option value="direct" data-en="Direct" data-fa="مستقیم">Direct</option><option value="proxy" data-en="Proxy line" data-fa="خط پروکسی">Proxy line</option><option value="block" data-en="Block" data-fa="مسدود">Block</option></select></div>
-        <div class="fg"><label class="fl" data-en="Default Gaming Profile" data-fa="پروفایل گیمینگ پیش‌فرض">Default Gaming Profile</label><select class="fs" id="set-default-gaming-profile"><option value="off" data-en="Off (no gaming changes)" data-fa="خاموش (بدون تغییر گیمینگ)">Off (no gaming changes)</option><option value="balanced" data-en="Balanced" data-fa="متعادل">Balanced</option><option value="gaming" data-en="Gaming" data-fa="گیمینگ">Gaming</option><option value="low-overhead" data-en="Low Overhead" data-fa="سربار کم">Low Overhead</option><option value="stealth" data-en="Stealth" data-fa="مخفی">Stealth</option></select></div>
-        <div class="fg"><label class="fl" data-en="WS Rate Limit (attempts)" data-fa="محدودیت نرخ WS (تلاش)">WS Rate Limit (attempts)</label><input class="fi" type="number" id="set-ws-rate-max" placeholder="20" min="1"></div>
-        <div class="fg"><label class="fl" data-en="WS Rate Window (seconds)" data-fa="پنجره نرخ WS (ثانیه)">WS Rate Window (seconds)</label><input class="fi" type="number" id="set-ws-rate-window" placeholder="60" min="5"></div>
-        <div class="fg"><label class="fl" data-en="Subscription Update Interval (hours)" data-fa="فاصله به‌روزرسانی اشتراک (ساعت)">Subscription Update Interval (hours)</label><input class="fi" type="number" id="set-sub-update-interval" placeholder="6" min="1"></div>
-        <div class="fg"><label class="fl" data-en="Max XHTTP Sessions" data-fa="حداکثر نشست‌های XHTTP">Max XHTTP Sessions</label><input class="fi" type="number" id="set-max-xhttp-sessions" placeholder="200" min="10"></div>
+        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Default Traffic Limit (GB)" data-fa="محدودیت ترافیک پیش‌فرض (گیگابایت)">Default Traffic Limit (GB)</span></label><input class="fi" type="number" id="set-default-limit" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
+        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Default Expiry (Days)" data-fa="انقضای پیش‌فرض (روز)">Default Expiry (Days)</span></label><input class="fi" type="number" id="set-default-expiry" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
+        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Default Max Connections" data-fa="حداکثر اتصالات پیش‌فرض">Default Max Connections</span></label><input class="fi" type="number" id="set-default-maxconn" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
+        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Scanner Timeout (seconds)" data-fa="تایم‌اوت اسکنر (ثانیه)">Scanner Timeout (seconds)</span></label><input class="fi" type="number" id="set-scanner-timeout" placeholder="4"></div>
+        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Max Scan IPs" data-fa="حداکثر آی‌پی اسکن">Max Scan IPs</span></label><input class="fi" type="number" id="set-max-scan-ips" placeholder="256"></div>
+        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Monthly Limit (GB)" data-fa="محدودیت ماهانه (گیگابایت)">Monthly Limit (GB)</span></label><input class="fi" type="number" id="set-monthly-limit" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
+        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Default Protocol" data-fa="پروتکل پیش‌فرض">Default Protocol</span></label><select class="fs" id="set-default-protocol"><option value="vless-ws" data-en="VLESS + WS" data-fa="VLESS + WS">VLESS + WS</option><option value="vmess-ws" data-en="VMess + WS" data-fa="VMess + WS">VMess + WS</option><option value="trojan-ws" data-en="Trojan + WS" data-fa="Trojan + WS">Trojan + WS</option><option value="ss-ws" data-en="Shadowsocks + WS" data-fa="Shadowsocks + WS">Shadowsocks + WS</option><option value="xhttp-auto" data-en="XHTTP Auto" data-fa="XHTTP خودکار">XHTTP Auto</option><option value="xhttp-stream-one" data-en="XHTTP Stream-One" data-fa="XHTTP استریم‌وان">XHTTP Stream-One</option><option value="xhttp-stream-up" data-en="XHTTP Stream-Up" data-fa="XHTTP استریم‌آپ">XHTTP Stream-Up</option><option value="xhttp-packet-up" data-en="XHTTP Packet-Up" data-fa="XHTTP پکت‌آپ">XHTTP Packet-Up</option><option value="socks5" data-en="SOCKS5" data-fa="SOCKS5">SOCKS5</option><option value="mtproto" data-en="Telegram MTProto" data-fa="تلگرام MTProto">Telegram MTProto</option><option value="webproxy" data-en="Telegram WEB proxy" data-fa="پروکسی WEB تلگرام">Telegram WEB proxy</option><option value="http-proxy" data-en="HTTP proxy" data-fa="پروکسی HTTP">HTTP proxy</option></select></div>
+        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Default Shadowsocks Method" data-fa="روش شادوساکس پیش‌فرض">Default Shadowsocks Method</span></label><select class="fs" id="set-default-ss-method"><option value="2022-blake3-aes-256-gcm" data-en="2022-blake3-aes-256-gcm" data-fa="2022-blake3-aes-256-gcm">2022-blake3-aes-256-gcm</option><option value="2022-blake3-aes-128-gcm" data-en="2022-blake3-aes-128-gcm" data-fa="2022-blake3-aes-128-gcm">2022-blake3-aes-128-gcm</option><option value="2022-blake3-chacha20-poly1305" data-en="2022-blake3-chacha20-poly1305" data-fa="2022-blake3-chacha20-poly1305">2022-blake3-chacha20-poly1305</option><option value="aes-256-gcm" data-en="aes-256-gcm (classic)" data-fa="aes-256-gcm (کلاسیک)">aes-256-gcm (classic)</option><option value="aes-128-gcm" data-en="aes-128-gcm (classic)" data-fa="aes-128-gcm (کلاسیک)">aes-128-gcm (classic)</option><option value="chacha20-ietf-poly1305" data-en="chacha20-ietf-poly1305 (classic)" data-fa="chacha20-ietf-poly1305 (کلاسیک)">chacha20-ietf-poly1305 (classic)</option></select></div>
+        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Default Outbound Mode" data-fa="حالت خروجی پیش‌فرض">Default Outbound Mode</span></label><select class="fs" id="set-default-outbound-mode"><option value="auto" data-en="Auto" data-fa="خودکار">Auto</option><option value="direct" data-en="Direct" data-fa="مستقیم">Direct</option><option value="proxy" data-en="Proxy line" data-fa="خط پروکسی">Proxy line</option><option value="block" data-en="Block" data-fa="مسدود">Block</option></select></div>
+        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Default Gaming Profile" data-fa="پروفایل گیمینگ پیش‌فرض">Default Gaming Profile</span></label><select class="fs" id="set-default-gaming-profile"><option value="off" data-en="Off (no gaming changes)" data-fa="خاموش (بدون تغییر گیمینگ)">Off (no gaming changes)</option><option value="balanced" data-en="Balanced" data-fa="متعادل">Balanced</option><option value="gaming" data-en="Gaming" data-fa="گیمینگ">Gaming</option><option value="low-overhead" data-en="Low Overhead" data-fa="سربار کم">Low Overhead</option><option value="stealth" data-en="Stealth" data-fa="مخفی">Stealth</option></select></div>
+        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="WS Rate Limit (attempts)" data-fa="محدودیت نرخ WS (تلاش)">WS Rate Limit (attempts)</span></label><input class="fi" type="number" id="set-ws-rate-max" placeholder="20" min="1"></div>
+        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="WS Rate Window (seconds)" data-fa="پنجره نرخ WS (ثانیه)">WS Rate Window (seconds)</span></label><input class="fi" type="number" id="set-ws-rate-window" placeholder="60" min="5"></div>
+        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Subscription Update Interval (hours)" data-fa="فاصله به‌روزرسانی اشتراک (ساعت)">Subscription Update Interval (hours)</span></label><input class="fi" type="number" id="set-sub-update-interval" placeholder="6" min="1"></div>
+        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Max XHTTP Sessions" data-fa="حداکثر نشست‌های XHTTP">Max XHTTP Sessions</span></label><input class="fi" type="number" id="set-max-xhttp-sessions" placeholder="200" min="10"></div>
         <div class="fg">
-          <label class="fl" data-en="DoH Upstreams" data-fa="آپ‌استریم‌های DoH">DoH Upstreams</label>
+          <label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="DoH Upstreams" data-fa="آپ‌استریم‌های DoH">DoH Upstreams</span></label>
           <div class="pill-group" id="doh-presets"></div>
           <div style="margin-top: 8px;">
-            <button class="btn btn-outline btn-sm" onclick="testDohPing()" data-en="Test Ping" data-fa="تست پینگ">Test Ping</button>
+            <button class="btn btn-outline btn-sm" onclick="testDohPing()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h6"/><path d="M10 3v6L4.5 19a2 2 0 0 0 1.8 3h11.4a2 2 0 0 0 1.8-3L14 9V3"/><path d="M7.5 14h9"/></svg></span><span data-en="Test Ping" data-fa="تست پینگ">Test Ping</span></button>
             <table class="tbl" id="doh-ping-table" style="display:none; margin-top:8px;">
                 <thead><tr><th data-en="Upstream" data-fa="آپ‌استریم">Upstream</th><th data-en="Latency" data-fa="تأخیر">Latency</th><th data-en="Status" data-fa="وضعیت">Status</th></tr></thead>
                 <tbody></tbody>
             </table>
           </div>
           <input class="fi" id="custom-doh-input" placeholder="Custom upstream URL" data-ph-en="Custom upstream URL" data-ph-fa="آدرس آپ‌استریم سفارشی" style="margin-top:6px;">
-          <button class="btn btn-outline btn-sm" onclick="addCustomDoh()" data-en="Add" data-fa="افزودن">Add</button>
+          <button class="btn btn-outline btn-sm" onclick="addCustomDoh()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></span><span data-en="Add" data-fa="افزودن">Add</span></button>
           <div class="status-cards-grid" style="margin-top:8px;">
             <div class="status-card active" id="card-doh" onclick="toggleSettingCard('card-doh', 'set-doh-enabled')">
               <span class="ic" style="--ic:24px;"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg></span><span data-en="DoH Enabled" data-fa="DoH فعال">DoH Enabled</span>
@@ -18531,71 +18711,78 @@ example.com
             </div>
           </div>
           <div style="margin-top:12px;">
-            <label class="fl" style="font-size:0.7rem;" data-en="Server DoH Endpoint" data-fa="خروجی DoH سرور">Server DoH Endpoint</label>
-            <div style="display:flex; gap:6px; align-items:center;">
+            <label class="fl" style="font-size:0.95rem;"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Server DoH Endpoint" data-fa="خروجی DoH سرور">Server DoH Endpoint</span></label>
+            <div style="display:flex;flex-wrap:wrap; gap:6px; align-items:center;">
               <input class="fi" id="doh-endpoint-url" readonly style="flex:1; cursor:pointer;" onclick="this.select()" value="">
-              <button class="btn btn-outline btn-sm" onclick="copyDohEndpoint()" style="white-space:nowrap;" data-en="Copy" data-fa="کپی">Copy</button>
+              <button class="btn btn-outline btn-sm" onclick="copyDohEndpoint()" style="white-space:nowrap;"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></span><span data-en="Copy" data-fa="کپی">Copy</span></button>
             </div>
           </div>
         </div>
-        <div class="fg" style="margin-top:10px; padding:15px; background:rgba(251,191,36,0.05); border:1px solid rgba(251,191,36,0.3); border-radius:16px;">
-          <label class="fl" style="color:var(--warning);" data-en="Anti-Abuse & Stealth" data-fa="ضد ابیوز و استتار">Anti-Abuse & Stealth</label>
+        <div class="fg" style="margin-top:10px; padding:20px; background:rgba(251,191,36,0.05); border:1px solid rgba(251,191,36,0.3); border-radius:16px;">
+          <label class="fl" style="color:var(--warning);"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Anti-Abuse & Stealth" data-fa="ضد ابیوز و استتار">Anti-Abuse & Stealth</span></label>
           <div class="status-cards-grid" style="margin-bottom:10px;">
             <div class="status-card inactive" id="card-stealth" onclick="toggleSettingCard('card-stealth', 'set-stealth-mode')">
-              <span class="status-icon icon-stealth"></span><span data-en="Stealth Mode" data-fa="حالت استتار (مخفی‌سازی اسکنر)">Stealth Mode</span>
+              <span class="status-icon ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></span><span data-en="Stealth Mode" data-fa="حالت استتار (مخفی‌سازی اسکنر)">Stealth Mode</span>
               <input type="hidden" id="set-stealth-mode" value="0">
             </div>
           </div>
-          <label class="fl" style="font-size:0.7rem; margin-top:8px;" data-en="Landing Redirect (e.g. https://google.com)" data-fa="تغییر مسیر فرود (مثلاً https://google.com)">Landing Redirect (e.g. https://google.com)</label>
+          <label class="fl" style="font-size:0.95rem; margin-top:8px;"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Landing Redirect (e.g. https://google.com)" data-fa="تغییر مسیر فرود (مثلاً https://google.com)">Landing Redirect (e.g. https://google.com)</span></label>
           <input class="fi" id="set-landing-redirect" placeholder="Redirect unauthorized users" data-ph-en="Redirect unauthorized users" data-ph-fa="تغییر مسیر کاربران غیرمجاز">
-          <label class="fl" style="font-size:0.7rem; margin-top:8px;" data-en="Camouflage URL (Reverse Proxy)" data-fa="آدرس استتار (پروکسی معکوس)">Camouflage URL (Reverse Proxy)</label>
+          <label class="fl" style="font-size:0.95rem; margin-top:8px;"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Camouflage URL (Reverse Proxy)" data-fa="آدرس استتار (پروکسی معکوس)">Camouflage URL (Reverse Proxy)</span></label>
           <input class="fi" id="set-camouflage-url" placeholder="e.g. https://news.ycombinator.com">
-          <label class="fl" style="font-size:0.7rem; margin-top:8px;" data-en="Subscription Filename" data-fa="نام فایل اشتراک">Subscription Filename</label>
+          <label class="fl" style="font-size:0.95rem; margin-top:8px;"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Subscription Filename" data-fa="نام فایل اشتراک">Subscription Filename</span></label>
           <input class="fi" id="set-sub-filename" placeholder="e.g. update.txt" data-ph-en="e.g. update.txt" data-ph-fa="مثلاً update.txt">
-          <label class="fl" style="font-size:0.7rem; margin-top:8px;" data-en="Panel Prefix (Hidden Admin Path)" data-fa="پیشوند پنل (مسیر مخفی ادمین)">Panel Prefix (Hidden Admin Path)</label>
+          <label class="fl" style="font-size:0.95rem; margin-top:8px;"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Panel Prefix (Hidden Admin Path)" data-fa="پیشوند پنل (مسیر مخفی ادمین)">Panel Prefix (Hidden Admin Path)</span></label>
           <input class="fi" id="set-panel-prefix" placeholder="e.g. mypanel (leave empty for root)" data-ph-en="e.g. mypanel (leave empty for root)" data-ph-fa="مثلاً mypanel (برای ریشه خالی بگذارید)">
           <div class="fg" style="margin-top:12px;">
-            <label class="fl" data-en="Blocked Domains (one per line)" data-fa="دامنه‌های مسدود (هر خط یک)">Blocked Domains (one per line)</label>
+            <label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Blocked Domains (one per line)" data-fa="دامنه‌های مسدود (هر خط یک)">Blocked Domains (one per line)</span></label>
             <textarea class="fi" id="set-blocked-domains" rows="4" placeholder="example.com
 *.ads.com"></textarea>
-            <button class="btn btn-outline btn-sm" onclick="saveBlockedDomains()" data-en="Save" data-fa="ذخیره">Save</button>
+            <button class="btn btn-outline btn-sm" onclick="saveBlockedDomains()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg></span><span data-en="Save" data-fa="ذخیره">Save</span></button>
           </div>
         </div>
         <div class="fg" style="margin-top:20px;">
-          <label class="fl" data-en="System Toggles" data-fa="وضعیت تنظیمات">System Toggles</label>
+          <label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="System Toggles" data-fa="وضعیت تنظیمات">System Toggles</span></label>
           <div class="status-cards-grid">
             <div class="status-card active" id="card-log" onclick="toggleSettingCard('card-log', 'set-log-toggle')">
-              <span class="status-icon icon-logs"></span><span data-en="Logs" data-fa="لاگ سیستم">Logs</span>
+              <span class="status-icon ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg></span><span data-en="Logs" data-fa="لاگ سیستم">Logs</span>
               <input type="hidden" id="set-log-toggle" value="1">
             </div>
             <div class="status-card active" id="card-auto" onclick="toggleSettingCard('card-auto', 'set-auto-disable')">
-              <span class="status-icon icon-auto-disable"></span><span data-en="Auto Disable" data-fa="غیرفعال‌سازی">Auto Disable</span>
+              <span class="status-icon ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></svg></span><span data-en="Auto Disable" data-fa="غیرفعال‌سازی">Auto Disable</span>
               <input type="hidden" id="set-auto-disable" value="1">
             </div>
             <div class="status-card active" id="card-tgrep" onclick="toggleSettingCard('card-tgrep', 'set-tg-report')">
-              <span class="status-icon icon-tg-reports"></span><span data-en="TG Reports" data-fa="گزارش تلگرام">TG Reports</span>
+              <span class="status-icon ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/></svg></span><span data-en="TG Reports" data-fa="گزارش تلگرام">TG Reports</span>
               <input type="hidden" id="set-tg-report" value="1">
             </div>
             <div class="status-card active" id="card-tgnot" onclick="toggleSettingCard('card-tgnot', 'set-tg-notify')">
-              <span class="status-icon icon-tg-notify"></span><span data-en="TG Alerts" data-fa="اعلان تلگرام">TG Alerts</span>
+              <span class="status-icon ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg></span><span data-en="TG Alerts" data-fa="اعلان تلگرام">TG Alerts</span>
               <input type="hidden" id="set-tg-notify" value="1">
             </div>
           </div>
         </div>
         <hr style="border-color:var(--border);margin:14px 0;">
-        <div class="mo-title" data-en="Change Password" data-fa="تغییر رمز عبور" style="margin-bottom:14px;">Change Password</div>
-        <div class="fg"><label class="fl" data-en="Current Password" data-fa="رمز فعلی">Current Password</label><input class="fi" type="password" id="cpw"></div>
-        <div class="fg"><label class="fl" data-en="New Password" data-fa="رمز جدید">New Password</label><input class="fi" type="password" id="npw"></div>
-        <button class="btn btn-primary btn-sm" onclick="chgPw()" data-en="Update Password" data-fa="بروزرسانی رمز">Update Password</button>
+        <div class="mo-title" style="margin-bottom:14px;"><span class="ic" style="--ic:24px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="4.5"/><path d="M11 12L21 2M16 7l3 3"/></svg></span> <span data-en="Change Password" data-fa="تغییر رمز عبور">Change Password</span></div>
+        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Current Password" data-fa="رمز فعلی">Current Password</span></label><input class="fi" type="password" id="cpw"></div>
+        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="New Password" data-fa="رمز جدید">New Password</span></label><input class="fi" type="password" id="npw"></div>
+        <button class="btn btn-primary btn-sm" onclick="chgPw()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="4.5"/><path d="M11 12L21 2M16 7l3 3"/></svg></span><span data-en="Update Password" data-fa="بروزرسانی رمز">Update Password</span></button>
         <div style="margin-top:16px;">
-          <button class="btn btn-primary" onclick="saveGeneralSettings()" data-en="Save All Settings" data-fa="ذخیره همه تنظیمات" style="width:100%; justify-content:center; padding:12px;">Save All Settings</button>
+          <button class="btn btn-primary" onclick="saveGeneralSettings()" style="width:100%; justify-content:center; padding:16px;"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg></span><span data-en="Save All Settings" data-fa="ذخیره همه تنظیمات">Save All Settings</span></button>
         </div>
         <hr style="border-color:var(--border);margin:14px 0;">
-        <div style="display:flex;align-items:center;gap:10px;">
-          <button class="btn btn-danger" onclick="resetAllSettings()" data-en="Reset to Defaults" data-fa="بازنشانی به پیش‌فرض">Reset to Defaults</button>
-          <span style="font-size:0.8rem;color:var(--text-3);" data-en="Resets all settings except password." data-fa="همه تنظیمات به جز رمز عبور بازنشانی می‌شود."></span>
+        <div style="display:flex;flex-wrap:wrap;align-items:center;gap:10px;">
+          <button class="btn btn-danger" onclick="resetAllSettings()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg></span><span data-en="Reset to Defaults" data-fa="بازنشانی به پیش‌فرض">Reset to Defaults</span></button>
+          <span style="font-size:0.95rem;color:var(--text-3);" data-en="Resets all settings except password." data-fa="همه تنظیمات به جز رمز عبور بازنشانی می‌شود."></span>
         </div>
       </div>
+    </section>
+    <section class="page" id="page-about">
+      <div class="page-header"><div><div class="page-title" data-en="About SulgX" data-fa="درباره SulgX">About SulgX</div><div class="page-sub" data-en="Project introduction" data-fa="معرفی پروژه">Project introduction</div></div></div>
+      <div class="card" style="margin-bottom:16px;"><div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></span><span class="card-title" data-en="What is SulgX Panel" data-fa="پنل SulgX چیست">What is SulgX Panel</span></span></div><div style="color:var(--text-2);line-height:1.7;" data-en="SulgX Panel is a self-hosted web panel for managing VLESS, VMess, Trojan, Shadowsocks and Telegram proxy (WEB and MTProto) inbounds, users, traffic quotas and clean IPs from one place." data-fa="پنل SulgX یک پنل وب خودمیزبان برای مدیریت اینباندهای VLESS، VMess، Trojan، Shadowsocks و پروکسی تلگرام (WEB و MTProto)، کاربران، سقف مصرف و آی‌پی‌های تمیز از یک مکان است.">SulgX Panel is a self-hosted web panel for managing VLESS, VMess, Trojan, Shadowsocks and Telegram proxy (WEB and MTProto) inbounds, users, traffic quotas and clean IPs from one place.</div></div>
+      <div class="card" style="margin-bottom:16px;"><div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg></span><span class="card-title" data-en="Features" data-fa="ویژگی‌ها">Features</span></span></div><ul style="margin:0;padding-inline-start:20px;display:grid;gap:8px;color:var(--text-2);line-height:1.7;"><li data-en="Multi-protocol inbounds: VLESS, VMess, Trojan, Shadowsocks, HTTP, SOCKS5 and MTProto." data-fa="اینباندهای چندپروتکله: VLESS، VMess، Trojan، Shadowsocks، HTTP، SOCKS5 و MTProto.">Multi-protocol inbounds: VLESS, VMess, Trojan, Shadowsocks, HTTP, SOCKS5 and MTProto.</li><li data-en="Traffic, quota and expiry control per inbound, with live sessions and active users." data-fa="کنترل ترافیک، سقف مصرف و انقضا برای هر اینباند، با نشست‌های زنده و کاربران فعال.">Traffic, quota and expiry control per inbound, with live sessions and active users.</li><li data-en="Clean-IP profiles and an IP scanner for finding fast, working addresses." data-fa="پروفایل‌های آی‌پی تمیز و اسکنر آی‌پی برای یافتن آدرس‌های سریع و سالم.">Clean-IP profiles and an IP scanner for finding fast, working addresses.</li><li data-en="Telegram bot, notifications and Telegram proxy (WEB and MTProto) with subscription links." data-fa="ربات تلگرام، اعلان‌ها و پروکسی تلگرام (WEB و MTProto) با لینک اشتراک.">Telegram bot, notifications and Telegram proxy (WEB and MTProto) with subscription links.</li><li data-en="Subscription links for VLESS, Clash and Sing-box, plus QR codes and health checks." data-fa="لینک اشتراک VLESS، Clash و Sing-box، به‌همراه کد QR و بررسی سلامت.">Subscription links for VLESS, Clash and Sing-box, plus QR codes and health checks.</li><li data-en="Logs, login history and settings, all in Persian and English." data-fa="لاگ‌ها، تاریخچه ورود و تنظیمات، همه به فارسی و انگلیسی.">Logs, login history and settings, all in Persian and English.</li></ul></div>
+      <div class="card" style="margin-bottom:16px;"><div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></span><span class="card-title" data-en="How it works" data-fa="نحوه کار">How it works</span></span></div><ol style="margin:0;padding-inline-start:20px;display:grid;gap:8px;color:var(--text-2);line-height:1.7;"><li data-en="Create an inbound from the Inbounds page and set its traffic limit and expiry." data-fa="از صفحه اینباندها یک اینباند بسازید و سقف مصرف و انقضا را تعیین کنید.">Create an inbound from the Inbounds page and set its traffic limit and expiry.</li><li data-en="Copy its link, subscription or QR code and import it into your client app, such as v2rayNG." data-fa="لینک، اشتراک یا کد QR آن را کپی کنید و در برنامه کلاینت خود، مانند v2rayNG، وارد کنید.">Copy its link, subscription or QR code and import it into your client app, such as v2rayNG.</li><li data-en="Watch traffic, sessions and health from the Dashboard and Active Users pages." data-fa="ترافیک، نشست‌ها و سلامت را از صفحات داشبورد و کاربران فعال ببینید.">Watch traffic, sessions and health from the Dashboard and Active Users pages.</li><li data-en="For Telegram, create a WEB or MTProto proxy from the Telegram page and share its link." data-fa="برای تلگرام، از صفحه تلگرام یک پروکسی WEB یا MTProto بسازید و لینک آن را به اشتراک بگذارید.">For Telegram, create a WEB or MTProto proxy from the Telegram page and share its link.</li></ol></div>
+      <div class="card" style="margin-bottom:16px;"><div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg></span><span class="card-title" data-en="Links" data-fa="پیوندها">Links</span></span></div><div style="display:flex;gap:8px;flex-wrap:wrap;"><a class="btn btn-outline" href="https://t.me/SulgX" target="_blank" rel="noopener"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg></span><span data-en="Telegram @SulgX" data-fa="تلگرام @SulgX">Telegram @SulgX</span></a><a class="btn btn-outline" href="https://github.com/SulgX" target="_blank" rel="noopener"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z"/></svg></span><span data-en="Creator on GitHub" data-fa="سازنده در گیت‌هاب">Creator on GitHub</span></a><a class="btn btn-outline" href="https://github.com/SulgX/SulgX-Panel" target="_blank" rel="noopener"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg></span><span data-en="Project page" data-fa="صفحه پروژه">Project page</span></a></div></div>
     </section>
   </main>
   <nav class="mobile-nav">
@@ -18608,14 +18795,15 @@ example.com
       <div class="nav-item" data-page="logs" onclick="switchPage('logs')"><span class="icon icon-logs"></span><span data-en="Logs" data-fa="لاگ">Logs</span></div>
       <div class="nav-item" data-page="telegram" onclick="switchPage('telegram')"><span class="icon icon-telegram"></span><span data-en="Bot" data-fa="ربات">Bot</span></div>
       <div class="nav-item" data-page="settings" onclick="switchPage('settings')"><span class="icon icon-settings"></span><span data-en="Settings" data-fa="تنظیمات">Settings</span></div>
+      <div class="nav-item" data-page="about" onclick="switchPage('about')"><span class="ic" style="--ic:20px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg></span><span data-en="About" data-fa="درباره">About</span></div>
     </div>
   </nav>
   <footer class="footer">
     <div class="footer-inner">
       <span id="footer-dedication"></span>
-      <a href="https://t.me/SulgX" target="_blank" data-en="Telegram" data-fa="Telegram">Telegram</a>
-      <a href="https://github.com/SulgX" target="_blank">GitHub</a>
-      <a href="https://github.com/SulgX/SulgX-Panel" target="_blank" data-en="Project Repo" data-fa="مخزن پروژه">Project Repo</a>
+      <a href="https://t.me/SulgX" target="_blank" style="display:inline-flex;align-items:center;gap:6px;"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg></span><span data-en="Telegram" data-fa="Telegram">Telegram</span></a>
+      <a href="https://github.com/SulgX" target="_blank" style="display:inline-flex;align-items:center;gap:6px;"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z"/></svg></span>GitHub</a>
+      <a href="https://github.com/SulgX/SulgX-Panel" target="_blank" style="display:inline-flex;align-items:center;gap:6px;"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg></span><span data-en="Project Repo" data-fa="مخزن پروژه">Project Repo</span></a>
     </div>
   </footer>
 </div>
@@ -18623,9 +18811,9 @@ example.com
 <div class="mo" id="mo-add" onclick="if(event.target===this) this.classList.remove('show')">
   <div class="mo-box">
     <button class="mo-close" onclick="document.getElementById('mo-add').classList.remove('show')"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></span></button>
-    <div class="mo-title" data-en="Create Inbound" data-fa="ایجاد اینباند">Create Inbound</div>
-    <div class="fg"><label class="fl" data-en="Name" data-fa="نام">Name</label><input class="fi" id="nl" placeholder="Leave empty for random name" data-ph-en="Leave empty for random name" data-ph-fa="برای نام تصادفی خالی بگذارید" maxlength="60"></div>
-    <div class="fg"><label class="fl" data-en="Flag / Country" data-fa="پرچم / کشور">Flag / Country</label>
+    <div class="mo-title"><span class="ic" style="--ic:24px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></span> <span data-en="Create Inbound" data-fa="ایجاد اینباند">Create Inbound</span></div>
+    <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Name" data-fa="نام">Name</span></label><input class="fi" id="nl" placeholder="Leave empty for random name" data-ph-en="Leave empty for random name" data-ph-fa="برای نام تصادفی خالی بگذارید" maxlength="60"></div>
+    <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Flag / Country" data-fa="پرچم / کشور">Flag / Country</span></label>
       <select class="fs" id="flag-select-create" onchange="applyFlagCreate()">
         <option value="" data-en="None" data-fa="هیچ‌کدام">None</option>
         <option value="cn" data-en="CN China" data-fa="CN چین">CN China</option>
@@ -18646,16 +18834,16 @@ example.com
       <input type="hidden" id="flag-code-create" value="">
       <button class="btn btn-outline btn-sm" onclick="autoDetectFlagCreate()" style="margin-top:4px;"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></span><span data-en="Auto Detect" data-fa="تشخیص خودکار">Auto Detect</span></button>
     </div>
-    <div class="fg"><label class="fl" data-en="Protocol" data-fa="پروتکل">Protocol</label>
+    <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Protocol" data-fa="پروتکل">Protocol</span></label>
       <select class="fs" id="aprotocol" onchange="toggleProxyFields('create');onInboundProtocolChange('create')">
         <option value="vless-ws" data-en="VLESS + WS" data-fa="VLESS + WS">VLESS + WS</option>
         <option value="vmess-ws" data-en="VMess + WS (AEAD)" data-fa="VMess + WS (AEAD)">VMess + WS (AEAD)</option>
         <option value="trojan-ws" data-en="Trojan + WS" data-fa="Trojan + WS">Trojan + WS</option>
         <option value="ss-ws" data-en="Shadowsocks + WS (AEAD 2022)" data-fa="Shadowsocks + WS (AEAD 2022)">Shadowsocks + WS (AEAD 2022)</option>
-        <option value="xhttp-packet-up" data-en="XHTTP Packet-Up" data-fa="XHTTP Packet-Up">XHTTP Packet-Up</option>
-        <option value="xhttp-stream-up" data-en="XHTTP Stream-Up" data-fa="XHTTP Stream-Up">XHTTP Stream-Up</option>
-        <option value="xhttp-stream-one" data-en="XHTTP Stream-One" data-fa="XHTTP Stream-One">XHTTP Stream-One</option>
-        <option value="xhttp-auto" data-en="XHTTP Auto" data-fa="XHTTP Auto">XHTTP Auto</option>
+        <option value="xhttp-packet-up" data-en="XHTTP Packet-Up" data-fa="XHTTP پکت‌آپ">XHTTP Packet-Up</option>
+        <option value="xhttp-stream-up" data-en="XHTTP Stream-Up" data-fa="XHTTP استریم‌آپ">XHTTP Stream-Up</option>
+        <option value="xhttp-stream-one" data-en="XHTTP Stream-One" data-fa="XHTTP استریم‌وان">XHTTP Stream-One</option>
+        <option value="xhttp-auto" data-en="XHTTP Auto" data-fa="XHTTP خودکار">XHTTP Auto</option>
         <option value="socks5" data-en="SOCKS5" data-fa="SOCKS5">SOCKS5</option>
         <option value="mtproto" data-en="Telegram MTProto proxy" data-fa="پروکسی MTProto تلگرام">Telegram MTProto proxy</option>
         <option value="webproxy" data-en="Telegram WEB proxy" data-fa="پروکسی WEB تلگرام">Telegram WEB proxy</option>
@@ -18663,15 +18851,15 @@ example.com
       </select>
     </div>
     <div id="cred-fields-create">
-      <div class="fg" id="fg-auuid"><label class="fl" data-en="UUID" data-fa="UUID">UUID</label><div style="display:flex;gap:6px;"><input class="fi" id="auuid" placeholder="Leave empty for auto-generate" data-ph-en="Leave empty for auto-generate" data-ph-fa="برای تولید خودکار خالی بگذارید" style="flex:1;"><button class="btn btn-outline btn-sm" onclick="generateUUID('auuid')"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="15.5" cy="15.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="15.5" cy="8.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="8.5" cy="15.5" r="1.4" fill="currentColor" stroke="none"/></svg></span><span data-en="Generate" data-fa="تولید">Generate</span></button></div></div>
-      <div class="fg" id="fg-avmess-security"><label class="fl" data-en="VMess Security" data-fa="امنیت VMess">VMess Security</label>
+      <div class="fg" id="fg-auuid"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="UUID" data-fa="UUID">UUID</span></label><div style="display:flex;flex-wrap:wrap;gap:6px;"><input class="fi" id="auuid" placeholder="Leave empty for auto-generate" data-ph-en="Leave empty for auto-generate" data-ph-fa="برای تولید خودکار خالی بگذارید" style="flex:1;"><button class="btn btn-outline btn-sm" onclick="generateUUID('auuid')"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="15.5" cy="15.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="15.5" cy="8.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="8.5" cy="15.5" r="1.4" fill="currentColor" stroke="none"/></svg></span><span data-en="Generate" data-fa="تولید">Generate</span></button></div></div>
+      <div class="fg" id="fg-avmess-security"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="VMess Security" data-fa="امنیت VMess">VMess Security</span></label>
       <select class="fs" id="avmess-security">
       <option value="auto" data-en="auto (recommended)" data-fa="auto (پیشنهادی)">auto (recommended)</option>
       <option value="aes-128-gcm" data-en="aes-128-gcm" data-fa="aes-128-gcm">aes-128-gcm</option>
       <option value="chacha20-poly1305" data-en="chacha20-poly1305" data-fa="chacha20-poly1305">chacha20-poly1305</option>
       </select></div>
-      <div class="fg" id="fg-apassword"><label class="fl" data-en="Password" data-fa="گذرواژه">Password</label><div style="display:flex;gap:6px;"><input class="fi" id="apassword" placeholder="Leave empty for auto-generate" data-ph-en="Leave empty for auto-generate" data-ph-fa="برای تولید خودکار خالی بگذارید" style="flex:1;"><button class="btn btn-outline btn-sm" onclick="generateUUID('apassword')"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="15.5" cy="15.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="15.5" cy="8.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="8.5" cy="15.5" r="1.4" fill="currentColor" stroke="none"/></svg></span><span data-en="Generate" data-fa="تولید">Generate</span></button></div><div style="font-size:0.85rem;color:var(--text-3);">Trojan password. It must be a UUID.</div></div>
-      <div class="fg" id="fg-ass-method"><label class="fl" data-en="Shadowsocks Method" data-fa="روش Shadowsocks">Shadowsocks Method</label>
+      <div class="fg" id="fg-apassword"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Password" data-fa="گذرواژه">Password</span></label><div style="display:flex;flex-wrap:wrap;gap:6px;"><input class="fi" id="apassword" placeholder="Leave empty for auto-generate" data-ph-en="Leave empty for auto-generate" data-ph-fa="برای تولید خودکار خالی بگذارید" style="flex:1;"><button class="btn btn-outline btn-sm" onclick="generateUUID('apassword')"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="15.5" cy="15.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="15.5" cy="8.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="8.5" cy="15.5" r="1.4" fill="currentColor" stroke="none"/></svg></span><span data-en="Generate" data-fa="تولید">Generate</span></button></div><div style="font-size:0.85rem;color:var(--text-3);" data-en="Trojan password. It must be a UUID." data-fa="گذرواژه Trojan باید UUID باشد.">Trojan password. It must be a UUID.</div></div>
+      <div class="fg" id="fg-ass-method"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Shadowsocks Method" data-fa="روش Shadowsocks">Shadowsocks Method</span></label>
       <select class="fs" id="ass-method">
       <option value="2022-blake3-aes-256-gcm" data-en="2022-blake3-aes-256-gcm" data-fa="2022-blake3-aes-256-gcm">2022-blake3-aes-256-gcm</option>
       <option value="2022-blake3-aes-128-gcm" data-en="2022-blake3-aes-128-gcm" data-fa="2022-blake3-aes-128-gcm">2022-blake3-aes-128-gcm</option>
@@ -18681,42 +18869,42 @@ example.com
       <option value="chacha20-ietf-poly1305" data-en="chacha20-ietf-poly1305 (classic)" data-fa="chacha20-ietf-poly1305 (کلاسیک)">chacha20-ietf-poly1305 (classic)</option>
       </select>
       </div>
-      <div class="fg" id="fg-ass-password"><label class="fl" data-en="Password / Key" data-fa="گذرواژه / کلید">Password / Key</label><input class="fi" id="ass-password" placeholder="Leave empty for auto-generate" data-ph-en="Leave empty for auto-generate" data-ph-fa="برای تولید خودکار خالی بگذارید"><div style="font-size:0.85rem;color:var(--text-3);">For 2022 methods this must be a base64 key of the right length. For classic methods it is the password.</div></div>
-      <div class="fg" id="fg-aproxy-username"><label class="fl" data-en="Username" data-fa="نام کاربری">Username</label><input class="fi" id="aproxy-username" placeholder="Leave empty for auto-generate" data-ph-en="Leave empty for auto-generate" data-ph-fa="برای تولید خودکار خالی بگذارید"></div>
-      <div class="fg" id="fg-aproxy-password"><label class="fl" data-en="Password" data-fa="گذرواژه">Password</label><div style="display:flex;gap:6px;"><input class="fi" id="aproxy-password" placeholder="Leave empty for auto-generate" data-ph-en="Leave empty for auto-generate" data-ph-fa="برای تولید خودکار خالی بگذارید" style="flex:1;"><button class="btn btn-outline btn-sm" onclick="generateProxyAuth('create')"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="15.5" cy="15.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="15.5" cy="8.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="8.5" cy="15.5" r="1.4" fill="currentColor" stroke="none"/></svg></span><span data-en="Generate" data-fa="تولید">Generate</span></button></div><div style="font-size:0.85rem;color:var(--text-3);">Leave both empty for an auto-generated code, or type any username and password (username: no : @ / ? # or spaces; password: no spaces).</div></div>
-      <div class="fg" id="fg-aproxy-port"><label class="fl" data-en="Port" data-fa="پورت">Port</label><input class="fi" id="aproxy-port" type="number" min="1" max="65535" value="1080"><div style="font-size:0.85rem;color:var(--text-3);">One port serves every protocol: the multiplexer routes SOCKS5, HTTP and MTProto, and forwards panel, WebSocket and WEB traffic to the panel. Set the port to the published port (443 on a single-port host); the multiplexer serves each inbound on every port it binds. Defaults: SOCKS5 1080, HTTP 3128, MTProto 8443.</div></div>
-      <div class="fg" id="fg-amtproto-variant"><label class="fl" data-en="MTProto Variant" data-fa="نوع MTProto">MTProto Variant</label>
+      <div class="fg" id="fg-ass-password"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Password / Key" data-fa="گذرواژه / کلید">Password / Key</span></label><input class="fi" id="ass-password" placeholder="Leave empty for auto-generate" data-ph-en="Leave empty for auto-generate" data-ph-fa="برای تولید خودکار خالی بگذارید"><div style="font-size:0.85rem;color:var(--text-3);" data-en="For 2022 methods this must be a base64 key of the right length. For classic methods it is the password." data-fa="برای روش‌های 2022 این مقدار باید یک کلید base64 با طول درست باشد. برای روش‌های کلاسیک، همین مقدار گذرواژه است.">For 2022 methods this must be a base64 key of the right length. For classic methods it is the password.</div></div>
+      <div class="fg" id="fg-aproxy-username"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Username" data-fa="نام کاربری">Username</span></label><input class="fi" id="aproxy-username" placeholder="Leave empty for auto-generate" data-ph-en="Leave empty for auto-generate" data-ph-fa="برای تولید خودکار خالی بگذارید"></div>
+      <div class="fg" id="fg-aproxy-password"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Password" data-fa="گذرواژه">Password</span></label><div style="display:flex;flex-wrap:wrap;gap:6px;"><input class="fi" id="aproxy-password" placeholder="Leave empty for auto-generate" data-ph-en="Leave empty for auto-generate" data-ph-fa="برای تولید خودکار خالی بگذارید" style="flex:1;"><button class="btn btn-outline btn-sm" onclick="generateProxyAuth('create')"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="15.5" cy="15.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="15.5" cy="8.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="8.5" cy="15.5" r="1.4" fill="currentColor" stroke="none"/></svg></span><span data-en="Generate" data-fa="تولید">Generate</span></button></div><div style="font-size:0.85rem;color:var(--text-3);" data-en="Leave both empty for an auto-generated code, or type any username and password (username: no : @ / ? # or spaces; password: no spaces)." data-fa="هر دو را خالی بگذارید تا یک کد به‌صورت خودکار ساخته شود، یا هر نام کاربری و گذرواژه‌ای تایپ کنید (نام کاربری: بدون : @ / ? # یا فاصله؛ گذرواژه: بدون فاصله).">Leave both empty for an auto-generated code, or type any username and password (username: no : @ / ? # or spaces; password: no spaces).</div></div>
+      <div class="fg" id="fg-aproxy-port"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Port" data-fa="پورت">Port</span></label><input class="fi" id="aproxy-port" type="number" min="1" max="65535" value="1080"><div style="font-size:0.85rem;color:var(--text-3);" data-en="One port serves every protocol: the multiplexer routes SOCKS5, HTTP and MTProto, and forwards panel, WebSocket and WEB traffic to the panel. Set the port to the published port (443 on a single-port host); the multiplexer serves each inbound on every port it binds. Defaults: SOCKS5 1080, HTTP 3128, MTProto 8443." data-fa="یک پورت به همه پروتکل‌ها خدمت می‌دهد: مالتی‌پلکسر SOCKS5 و HTTP و MTProto را مسیریابی می‌کند و ترافیک پنل و WebSocket و WEB را به پنل می‌فرستد. پورت را همان پورتی بگذارید که منتشر شده است (روی هاست تک‌پورت: 443)؛ مالتی‌پلکسر هر اینباند را روی هر پورتی که به آن متصل است، خدمت می‌دهد. پیش‌فرض‌ها: SOCKS5 ‏1080، HTTP ‏3128، MTProto ‏8443.">One port serves every protocol: the multiplexer routes SOCKS5, HTTP and MTProto, and forwards panel, WebSocket and WEB traffic to the panel. Set the port to the published port (443 on a single-port host); the multiplexer serves each inbound on every port it binds. Defaults: SOCKS5 1080, HTTP 3128, MTProto 8443.</div></div>
+      <div class="fg" id="fg-amtproto-variant"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="MTProto Variant" data-fa="نوع MTProto">MTProto Variant</span></label>
       <select class="fs" id="amtproto-variant" onchange="toggleProxyFields('create')">
       <option value="dd" data-en="dd (recommended, obfuscated2)" data-fa="dd (پیشنهادی، obfuscated2)">dd (recommended, obfuscated2)</option>
       <option value="plain" data-en="Plain secret" data-fa="سکرت ساده">Plain secret</option>
       <option value="faketls" data-en="Fake-TLS (dd + domain)" data-fa="Fake-TLS (dd + دامنه)">Fake-TLS (dd + domain)</option>
       </select></div>
-      <div class="fg" id="fg-amtproto-domain"><label class="fl" data-en="Fake-TLS Domain" data-fa="دامنه Fake-TLS">Fake-TLS Domain</label><input class="fi" id="amtproto-domain" value="www.google.com" placeholder="www.google.com"></div>
-      <div class="fg" id="fg-amtproto-secret"><label class="fl" data-en="Secret" data-fa="سکرت">Secret</label><input class="fi" id="amtproto-secret" readonly placeholder="Derived per inbound after creation" data-ph-en="Derived per inbound after creation" data-ph-fa="پس از ایجاد، برای هر اینباند ساخته می‌شود"></div>
-      <div class="fg" id="fg-awebproxy-port"><label class="fl" data-en="WEB Proxy Port (shared 443, per-user link)" data-fa="پورت WEB Proxy (443 مشترک، لینک جدا برای هر کاربر)">WEB Proxy Port (shared 443, per-user link)</label>
+      <div class="fg" id="fg-amtproto-domain"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Fake-TLS Domain" data-fa="دامنه Fake-TLS">Fake-TLS Domain</span></label><input class="fi" id="amtproto-domain" value="www.google.com" placeholder="www.google.com"></div>
+      <div class="fg" id="fg-amtproto-secret"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Secret" data-fa="سکرت">Secret</span></label><input class="fi" id="amtproto-secret" readonly placeholder="Derived per inbound after creation" data-ph-en="Derived per inbound after creation" data-ph-fa="پس از ایجاد، برای هر اینباند ساخته می‌شود"></div>
+      <div class="fg" id="fg-awebproxy-port"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="WEB Proxy Port (shared 443, per-user link)" data-fa="پورت WEB Proxy (443 مشترک، لینک جدا برای هر کاربر)">WEB Proxy Port (shared 443, per-user link)</span></label>
       <input class="fi" id="awebproxy-port" type="number" min="1" max="65535" value="443">
       <div class="hint" style="color:var(--text-3);font-size:0.85rem;" data-en="Port 443 is shared — each user gets their own link with its own token and secret." data-fa="پورت 443 مشترک است — هر کاربر لینک جدا با توکن و سکرت خودش دارد.">Port 443 is shared — each user gets their own link with its own token and secret.</div></div>
-      <div class="fg" id="fg-awebproxy-secret"><label class="fl" data-en="Secret" data-fa="سکرت">Secret</label><div style="display:flex;gap:6px;"><input class="fi" id="awebproxy-secret" placeholder="Leave empty for auto-generate" data-ph-en="Leave empty for auto-generate" data-ph-fa="برای تولید خودکار خالی بگذارید" style="flex:1;"><button class="btn btn-outline btn-sm" onclick="generateWebproxySecret('create')"><span data-en="Generate" data-fa="تولید">Generate</span></button></div><div style="font-size:0.85rem;color:var(--text-3);">Leave empty for an auto-generated secret, or type 32 hex characters (optionally prefixed with dd).</div></div>
-      <div class="fg" id="fg-awebproxy-token"><label class="fl" data-en="Routing Token" data-fa="توکن مسیریابی">Routing Token</label><input class="fi" id="awebproxy-token" readonly placeholder="Assigned by token routing after creation" data-ph-en="Assigned by token routing after creation" data-ph-fa="پس از ایجاد، توسط مسیریابی توکن اختصاص می‌یابد"></div>
+      <div class="fg" id="fg-awebproxy-secret"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Secret" data-fa="سکرت">Secret</span></label><div style="display:flex;flex-wrap:wrap;gap:6px;"><input class="fi" id="awebproxy-secret" placeholder="Leave empty for auto-generate" data-ph-en="Leave empty for auto-generate" data-ph-fa="برای تولید خودکار خالی بگذارید" style="flex:1;"><button class="btn btn-outline btn-sm" onclick="generateWebproxySecret('create')"><span data-en="Generate" data-fa="تولید">Generate</span></button></div><div style="font-size:0.85rem;color:var(--text-3);" data-en="Leave empty for an auto-generated secret, or type 32 hex characters (optionally prefixed with dd)." data-fa="خالی بگذارید تا رمز به‌صورت خودکار ساخته شود، یا ۳۲ کاراکتر هگز تایپ کنید (با پیشوند اختیاری dd).">Leave empty for an auto-generated secret, or type 32 hex characters (optionally prefixed with dd).</div></div>
+      <div class="fg" id="fg-awebproxy-token"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Routing Token" data-fa="توکن مسیریابی">Routing Token</span></label><input class="fi" id="awebproxy-token" readonly placeholder="Assigned by token routing after creation" data-ph-en="Assigned by token routing after creation" data-ph-fa="پس از ایجاد، توسط مسیریابی توکن اختصاص می‌یابد"></div>
     </div>
     <div id="proxy-fields-create" style="display:none;">
-      <div class="fg"><label class="fl" data-en="Proxy Info" data-fa="اطلاعات پروکسی">Proxy Info</label><div class="hint" id="aproxy-hint" style="color:var(--text-3);font-size:0.85rem;"></div></div>
+      <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Proxy Info" data-fa="اطلاعات پروکسی">Proxy Info</span></label><div class="hint" id="aproxy-hint" style="color:var(--text-3);font-size:0.85rem;"></div></div>
     </div>
     <div class="fg" id="adv-toggle-row-create"><button class="adv-toggle" onclick="toggleAdv('adv-create')">▼ <span data-en="Advanced Options" data-fa="گزینه‌های پیشرفته">Advanced Options</span></button></div>
     <div class="hint" id="adv-hint-create" style="color:var(--text-3);font-size:0.85rem;" data-en="SNI, Host, Fingerprint, ALPN, ECH, SMUX, Xray DNS, Bypass rules and Fragment only change the generated client configs — they do not change how this server relays traffic." data-fa="SNI، Host، Fingerprint، ALPN، ECH، SMUX، Xray DNS، قوانین Bypass و Fragment فقط کانفیگ‌های ساخته‌شده کلاینت را تغییر می‌دهند و بر نحوه عبور ترافیک از این سرور تأثیری ندارند.">SNI, Host, Fingerprint, ALPN, ECH, SMUX, Xray DNS, Bypass rules and Fragment only change the generated client configs — they do not change how this server relays traffic.</div>
       <div id="adv-create" class="adv-section">
-        <div class="fg" data-adv="profile"><label class="fl" data-en="Profile" data-fa="پروفایل">Profile</label>
+        <div class="fg" data-adv="profile"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Profile" data-fa="پروفایل">Profile</span></label>
           <select class="fs" id="ares-profile" onchange="applyProfileCreate()"><option value="" data-en="Custom" data-fa="سفارشی">Custom</option><option value="default" selected data-en="Default" data-fa="پیش‌فرض">Default</option><option value="normal" data-en="Normal" data-fa="عادی">Normal</option><option value="relative" data-en="Relative restriction" data-fa="محدودیت نسبی">Relative restriction</option><option value="severe" data-en="Severe restriction" data-fa="محدودیت شدید">Severe restriction</option><option value="emergency" data-en="Emergency" data-fa="اضطراری">Emergency</option></select>
           <small style="color:var(--text-3);font-size:0.75rem;" data-en="Restriction level sets fragment, fingerprint, ALPN, ECH, path randomisation, TFO and UDP for the current filtering level. Custom leaves every parameter as you set it." data-fa="سطح محدودیت، فرگمنت، فینگرپرینت، ALPN، ECH، تصادفی‌سازی مسیر، TFO و UDP را برای سطح فیلترینگ فعلی تنظیم می‌کند. «سفارشی» همه پارامترها را همان‌طور که تنظیم کرده‌اید باقی می‌گذارد.">Restriction level sets fragment, fingerprint, ALPN, ECH, path randomisation, TFO and UDP for the current filtering level. Custom leaves every parameter as you set it.</small>
         </div>
         <div id="aeff-summary" style="color:var(--text-2);font-size:0.85rem;border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin-bottom:12px;white-space:pre-wrap;"></div>
-        <div class="fg" data-adv="path"><label class="fl" data-en="Path" data-fa="مسیر">Path</label><input class="fi" id="ap" placeholder="/ws/{uid}"></div>
-        <div class="fg" data-adv="sni"><label class="fl" data-en="SNI" data-fa="SNI">SNI</label><input class="fi" id="asni" placeholder="example.com"></div>
-        <div class="fg" data-adv="host"><label class="fl" data-en="Host" data-fa="هاست">Host</label><input class="fi" id="ahost" placeholder="example.com"></div>
-        <div class="fg" data-adv="fingerprint"><label class="fl" data-en="Fingerprint" data-fa="اثرانگشت">Fingerprint</label>
+        <div class="fg" data-adv="path"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Path" data-fa="مسیر">Path</span></label><input class="fi" id="ap" placeholder="/ws/{uid}"></div>
+        <div class="fg" data-adv="sni"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="SNI" data-fa="SNI">SNI</span></label><input class="fi" id="asni" placeholder="example.com"></div>
+        <div class="fg" data-adv="host"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Host" data-fa="هاست">Host</span></label><input class="fi" id="ahost" placeholder="example.com"></div>
+        <div class="fg" data-adv="fingerprint"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Fingerprint" data-fa="اثرانگشت">Fingerprint</span></label>
           <select class="fs" id="afingerprint-sel" onchange="toggleFingerprintCustom('create')">
-    <option value="none" selected data-en="None / Disable" data-fa="هیچ‌کدام / غیرفعال">None / Disable</option>
-    <option value="chrome" data-en="Chrome" data-fa="Chrome">Chrome</option>
+    <option value="none" data-en="None / Disable" data-fa="هیچ‌کدام / غیرفعال">None / Disable</option>
+    <option value="chrome" selected data-en="Chrome" data-fa="Chrome">Chrome</option>
     <option value="firefox" data-en="Firefox" data-fa="Firefox">Firefox</option>
     <option value="safari" data-en="Safari" data-fa="Safari">Safari</option>
     <option value="ios" data-en="iOS" data-fa="iOS">iOS</option>
@@ -18729,39 +18917,39 @@ example.com
     <option value="custom" data-en="Custom" data-fa="سفارشی">Custom</option>
 </select>
           <input class="fi" id="afingerprint-custom" placeholder="Enter custom fingerprint" data-ph-en="Enter custom fingerprint" data-ph-fa="اثرانگشت سفارشی را وارد کنید" style="display:none; margin-top:5px;">
-          <input type="hidden" id="afingerprint" value="">
+          <input type="hidden" id="afingerprint" value="chrome">
         </div>
-        <div class="fg" data-adv="fragment"><label class="fl" data-en="Fragment" data-fa="فرگمنت">Fragment</label>
+        <div class="fg" data-adv="fragment"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Fragment" data-fa="فرگمنت">Fragment</span></label>
           <select class="fs" id="afrag-mode" onchange="toggleFragmentFields('create')">
             <option value="off" data-en="Off" data-fa="خاموش">Off</option>
             <option value="tlshello" data-en="TLS Hello" data-fa="TLS Hello">TLS Hello</option>
             <option value="range" data-en="Range" data-fa="بازه">Range</option>
           </select>
           <div id="frag-create-range" style="display:none;">
-            <input class="fi" id="afrag-length" placeholder="Length (e.g. 100-200)" data-ph-en="Length (e.g. 100-200)" data-ph-fa="طول (مثلاً 100-200)" style="margin-top:5px;">
-            <input class="fi" id="afrag-interval" placeholder="Interval (e.g. 10-20)" data-ph-en="Interval (e.g. 10-20)" data-ph-fa="فاصله (مثلاً 10-20)" style="margin-top:5px;">
+            <input class="fi" id="afrag-length" value="100-200" placeholder="Length (e.g. 100-200)" data-ph-en="Length (e.g. 100-200)" data-ph-fa="طول (مثلاً 100-200)" style="margin-top:5px;">
+            <input class="fi" id="afrag-interval" value="10-20" placeholder="Interval (e.g. 10-20)" data-ph-en="Interval (e.g. 10-20)" data-ph-fa="فاصله (مثلاً 10-20)" style="margin-top:5px;">
           </div>
           <input type="hidden" id="afrag" value="">
         </div>
-        <div class="fg" data-adv="ip_profile"><label class="fl" data-en="IP Profile" data-fa="پروفایل آی‌پی">IP Profile</label><select class="fs" id="aip-profile"></select></div>
-        <div class="fg" data-adv="naming_mode"><label class="fl" data-en="Naming Mode" data-fa="شیوه نام‌گذاری">Naming Mode</label>
+        <div class="fg" data-adv="ip_profile"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="IP Profile" data-fa="پروفایل آی‌پی">IP Profile</span></label><select class="fs" id="aip-profile"></select></div>
+        <div class="fg" data-adv="naming_mode"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Naming Mode" data-fa="شیوه نام‌گذاری">Naming Mode</span></label>
           <select class="fs" id="anaming-mode">
             <option value="default" data-en="Default (SulgX-Name-Server1)" data-fa="پیش‌فرض (SulgX-Name-Server1)">Default (SulgX-Name-Server1)</option>
             <option value="short" data-en="Short (SXP 1, SXP 2, ...)" data-fa="کوتاه (SXP 1, SXP 2, ...)">Short (SXP 1, SXP 2, ...)</option>
           </select>
         </div>
-        <div class="fg" data-adv="tfo"><label class="fl" data-en="TCP Fast Open" data-fa="TCP Fast Open">TCP Fast Open</label><div class="toggle" id="tfo-create" onclick="this.classList.toggle('on')"></div></div>
-        <div class="fg" data-adv="ech"><label class="fl" data-en="ECH (Secure Hello)" data-fa="ECH (Secure Hello)">ECH (Secure Hello)</label><div class="toggle" id="ech-create" onclick="this.classList.toggle('on'); toggleEchFields('create')"></div></div>
+        <div class="fg" data-adv="tfo"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="TCP Fast Open" data-fa="باز کردن سریع TCP">TCP Fast Open</span></label><div class="toggle" id="tfo-create" onclick="this.classList.toggle('on')"></div></div>
+        <div class="fg" data-adv="ech"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="ECH (Secure Hello)" data-fa="ECH (سلام امن)">ECH (Secure Hello)</span></label><div class="toggle" id="ech-create" onclick="this.classList.toggle('on'); toggleEchFields('create')"></div></div>
         <div id="ech-create-fields" style="display:none;">
           <input class="fi" id="ech-sni-create" placeholder="ECH SNI (e.g. cloudflare.com)" data-ph-en="ECH SNI (e.g. cloudflare.com)" data-ph-fa="ECH SNI (مثلاً cloudflare.com)" style="margin-top:5px;">
           <input class="fi" id="ech-doh-create" placeholder="ECH DoH URL (optional)" data-ph-en="ECH DoH URL (optional)" data-ph-fa="آدرس ECH DoH (اختیاری)" style="margin-top:5px;">
           <select class="fs" id="ech-preset-create" onchange="applyEchPreset('create')" style="margin-top:5px;"><option value="custom" data-en="Custom (enter SNI below)" data-fa="سفارشی (SNI را زیر وارد کنید)">Custom (enter SNI below)</option><option value="cloudflare">Cloudflare (cloudflare.com)</option><option value="cloudflare-www">Cloudflare WWW (www.cloudflare.com)</option><option value="one-one-one-one">Cloudflare 1.1.1.1 (one.one.one.one)</option><option value="developers-cloudflare">Cloudflare Developers (developers.cloudflare.com)</option><option value="blog-cloudflare">Cloudflare Blog (blog.cloudflare.com)</option><option value="cdnjs">cdnjs (cdnjs.cloudflare.com)</option><option value="workers-cloudflare">Cloudflare Workers (workers.cloudflare.com)</option><option value="pages-cloudflare">Cloudflare Pages (pages.cloudflare.com)</option><option value="research-cloudflare">Cloudflare Research (research.cloudflare.com)</option><option value="tls-ech-dev" data-en="ECH test site (tls-ech.dev)" data-fa="سایت تست ECH (tls-ech.dev)">ECH test site (tls-ech.dev)</option></select>
         </div>
-        <div class="fg" data-adv="allow_insecure"><label class="fl" data-en="Allow Insecure" data-fa="اجازه اتصال ناامن">Allow Insecure</label><div class="toggle" id="insecure-create" onclick="this.classList.toggle('on')"></div></div>
-        <div class="fg" data-adv="random_path"><label class="fl" data-en="Random Path" data-fa="مسیر تصادفی">Random Path</label><div class="toggle" id="random-create" onclick="this.classList.toggle('on')"></div></div>
-        <div class="fg" data-adv="udp"><label class="fl" data-en="UDP" data-fa="UDP">UDP</label><div class="toggle on" id="udp-create" onclick="this.classList.toggle('on')"></div></div>
-        <div class="fg" data-adv="ipv6"><label class="fl" data-en="IPv6 targets" data-fa="مقصدهای IPv6">IPv6 targets</label><div class="toggle on" id="ipv6-create" onclick="this.classList.toggle('on')"></div></div>
-        <div class="fg" data-adv="outbound_mode"><label class="fl" data-en="Outbound Mode" data-fa="حالت خروجی">Outbound Mode</label>
+        <div class="fg" data-adv="allow_insecure"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Allow Insecure" data-fa="اجازه اتصال ناامن">Allow Insecure</span></label><div class="toggle" id="insecure-create" onclick="this.classList.toggle('on')"></div></div>
+        <div class="fg" data-adv="random_path"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Random Path" data-fa="مسیر تصادفی">Random Path</span></label><div class="toggle" id="random-create" onclick="this.classList.toggle('on')"></div></div>
+        <div class="fg" data-adv="udp"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="UDP" data-fa="UDP">UDP</span></label><div class="toggle on" id="udp-create" onclick="this.classList.toggle('on')"></div></div>
+        <div class="fg" data-adv="ipv6"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="IPv6 targets" data-fa="مقصدهای IPv6">IPv6 targets</span></label><div class="toggle on" id="ipv6-create" onclick="this.classList.toggle('on')"></div></div>
+        <div class="fg" data-adv="outbound_mode"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Outbound Mode" data-fa="حالت خروجی">Outbound Mode</span></label>
           <select class="fs" id="aoutbound-mode">
             <option value="auto" data-en="Auto (proxy line if set, else direct)" data-fa="خودکار (در صورت تنظیم خط پروکسی، وگرنه مستقیم)">Auto (proxy line if set, else direct)</option>
             <option value="direct" data-en="Direct" data-fa="مستقیم">Direct</option>
@@ -18769,7 +18957,7 @@ example.com
             <option value="block" data-en="Block" data-fa="مسدود">Block</option>
           </select>
         </div>
-        <div class="fg" data-adv="gaming_profile"><label class="fl" data-en="Gaming Profile" data-fa="پروفایل گیمینگ">Gaming Profile</label>
+        <div class="fg" data-adv="gaming_profile"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Gaming Profile" data-fa="پروفایل گیمینگ">Gaming Profile</span></label>
           <select class="fs" id="agaming-profile">
             <option value="off" data-en="Off (no gaming changes)" data-fa="خاموش (بدون تغییر گیمینگ)">Off (no gaming changes)</option>
             <option value="balanced" data-en="Balanced" data-fa="متعادل">Balanced</option>
@@ -18778,7 +18966,7 @@ example.com
             <option value="stealth" data-en="Stealth" data-fa="مخفی">Stealth</option>
           </select>
         </div>
-        <div class="fg" data-adv="alpn"><label class="fl" data-en="ALPN" data-fa="ALPN">ALPN</label>
+        <div class="fg" data-adv="alpn"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="ALPN" data-fa="ALPN">ALPN</span></label>
           <select class="fs" id="aalpn-sel" onchange="toggleAlpnCustom('create')">
     <option value="smart" selected data-en="Smart (recommended)" data-fa="هوشمند (پیشنهادی)">Smart (recommended)</option>
     <option value="http/1.1" data-en="http/1.1" data-fa="http/1.1">http/1.1</option>
@@ -18788,60 +18976,60 @@ example.com
     <option value="custom" data-en="Custom" data-fa="سفارشی">Custom</option>
 </select>
           <input class="fi" id="aalpn-custom" placeholder="e.g. h2,http/1.1" data-ph-en="e.g. h2,http/1.1" data-ph-fa="مثلاً h2,http/1.1" style="display:none; margin-top:5px;">
-          <input type="hidden" id="aalpn" value="">
+          <input type="hidden" id="aalpn" value="smart">
         </div>
-        <div class="fg" data-adv="port"><label class="fl">Port (shown in link — server listens on port <span id="port-note-create">…</span> only)</label><input class="fi" type="number" id="aport" min="1" max="65535" value="443"></div>
-        <div class="fg" data-adv="xray_dns_mode"><label class="fl" data-en="Xray DNS Mode" data-fa="حالت DNS در Xray">Xray DNS Mode</label>
+        <div class="fg" data-adv="port"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Port (shown in link — server listens on port" data-fa="پورت (در لینک نمایش داده می‌شود — سرور فقط روی پورت">Port (shown in link — server listens on port</span> <span id="port-note-create">…</span> <span data-en="only)" data-fa=") گوش می‌دهد">only)</span></label><input class="fi" type="number" id="aport" min="1" max="65535" value="443"></div>
+        <div class="fg" data-adv="xray_dns_mode"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Xray DNS Mode" data-fa="حالت DNS در Xray">Xray DNS Mode</span></label>
         <select class="fs" id="xray-dns-mode-create">
         <option value="direct" data-en="Direct (system)" data-fa="مستقیم (سیستم)">Direct (system)</option>
         <option value="doh" data-en="DoH (DNS over HTTPS)" data-fa="DoH (DNS روی HTTPS)">DoH (DNS over HTTPS)</option>
         <option value="fakedns" data-en="FakeDNS" data-fa="FakeDNS">FakeDNS</option>
         </select></div>
-        <div class="fg" data-adv="xray_doh_url"><label class="fl" data-en="DoH URL (if DoH selected)" data-fa="آدرس DoH (در صورت انتخاب DoH)">DoH URL (if DoH selected)</label><input class="fi" id="xray-doh-url-create" placeholder="https://cloudflare-dns.com/dns-query"></div>
-        <div class="fg" data-adv="xray_doh_url"><label class="fl" data-en="DoH upstream (shared with Settings)" data-fa="آپل‌استریم DoH (مشترک با تنظیمات)">DoH upstream (shared with Settings)</label><select class="fs" id="xray-doh-select-create" onchange="applyDohSelect('create')"><option value="">Panel default (first upstream)</option></select><button class="btn btn-outline btn-sm" style="margin-top:6px;" onclick="addDohUpstream('create')" data-en="Add the URL above to the shared list" data-fa="افزودن آدرس بالا به لیست مشترک">Add the URL above to the shared list</button></div>
-        <div class="fg" data-adv="xray_allowed_domains"><label class="fl" data-en="Allowed Domains (one per line)" data-fa="دامنه‌های مجاز (هر خط یک)">Allowed Domains (one per line)</label><textarea class="fi" id="xray-allowed-domains-create" rows="3" placeholder="example.com"></textarea></div>
-        <div class="fg" data-adv="xray_blocked_domains"><label class="fl" data-en="Blocked Domains (one per line)" data-fa="دامنه‌های مسدود (هر خط یک)">Blocked Domains (one per line)</label><textarea class="fi" id="xray-blocked-domains-create" rows="3" placeholder="example.com"></textarea></div>
-        <div class="fg" data-adv="bypass_iran"><label class="fl" data-en="Bypass Iran (Direct)" data-fa="دور زدن ایران (مستقیم)">Bypass Iran (Direct)</label><div class="toggle on" id="bypass-iran-create" onclick="this.classList.toggle('on')"></div></div>
-        <div class="fg" data-adv="bypass_china"><label class="fl" data-en="Bypass China (Direct)" data-fa="دور زدن چین (مستقیم)">Bypass China (Direct)</label><div class="toggle" id="bypass-china-create" onclick="this.classList.toggle('on')"></div></div>
-        <div class="fg" data-adv="bypass_russia"><label class="fl" data-en="Bypass Russia (Direct)" data-fa="دور زدن روسیه (مستقیم)">Bypass Russia (Direct)</label><div class="toggle" id="bypass-russia-create" onclick="this.classList.toggle('on')"></div></div>
+        <div class="fg" data-adv="xray_doh_url"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="DoH URL (if DoH selected)" data-fa="آدرس DoH (در صورت انتخاب DoH)">DoH URL (if DoH selected)</span></label><input class="fi" id="xray-doh-url-create" placeholder="https://cloudflare-dns.com/dns-query"></div>
+        <div class="fg" data-adv="xray_doh_url"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="DoH upstream (shared with Settings)" data-fa="آپل‌استریم DoH (مشترک با تنظیمات)">DoH upstream (shared with Settings)</span></label><select class="fs" id="xray-doh-select-create" onchange="applyDohSelect('create')"><option value="" data-en="Panel default (first upstream)" data-fa="پیش‌فرض پنل (نخستین آپ‌استریم)">Panel default (first upstream)</option></select><button class="btn btn-outline btn-sm" style="margin-top:6px;" onclick="addDohUpstream('create')"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></span><span data-en="Add the URL above to the shared list" data-fa="افزودن آدرس بالا به لیست مشترک">Add the URL above to the shared list</span></button></div>
+        <div class="fg" data-adv="xray_allowed_domains"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Allowed Domains (one per line)" data-fa="دامنه‌های مجاز (هر خط یک)">Allowed Domains (one per line)</span></label><textarea class="fi" id="xray-allowed-domains-create" rows="3" placeholder="example.com"></textarea></div>
+        <div class="fg" data-adv="xray_blocked_domains"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Blocked Domains (one per line)" data-fa="دامنه‌های مسدود (هر خط یک)">Blocked Domains (one per line)</span></label><textarea class="fi" id="xray-blocked-domains-create" rows="3" placeholder="example.com"></textarea></div>
+        <div class="fg" data-adv="bypass_iran"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Bypass Iran (Direct)" data-fa="دور زدن ایران (مستقیم)">Bypass Iran (Direct)</span></label><div class="toggle on" id="bypass-iran-create" onclick="this.classList.toggle('on')"></div></div>
+        <div class="fg" data-adv="bypass_china"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Bypass China (Direct)" data-fa="دور زدن چین (مستقیم)">Bypass China (Direct)</span></label><div class="toggle" id="bypass-china-create" onclick="this.classList.toggle('on')"></div></div>
+        <div class="fg" data-adv="bypass_russia"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Bypass Russia (Direct)" data-fa="دور زدن روسیه (مستقیم)">Bypass Russia (Direct)</span></label><div class="toggle" id="bypass-russia-create" onclick="this.classList.toggle('on')"></div></div>
       </div>
-        <div class="fg"><label class="fl" data-en="IP Limit" data-fa="محدودیت آی‌پی">IP Limit</label><input class="fi" type="number" id="aip-limit" min="0" value="0" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
-        <div class="fg"><label class="fl" data-en="Owner / Name" data-fa="مالک / نام">Owner / Name</label><input class="fi" id="aowner-name" placeholder="Owner name (optional)" data-ph-en="Owner name (optional)" data-ph-fa="نام مالک (اختیاری)" maxlength="60"></div>
-        <div class="fg"><label class="fl" data-en="Max Sessions (owner)" data-fa="حداکثر نشست‌ها (مالک)">Max Sessions (owner)</label><input class="fi" type="number" id="aowner-maxsess" min="0" value="0" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
-    <div class="fg"><label class="fl" data-en="Traffic Limit (GB)" data-fa="محدودیت ترافیک (گیگابایت)">Traffic Limit (GB)</label><input class="fi" type="number" id="nv" min="0" step="0.1" value="0" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
+        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="IP Limit" data-fa="محدودیت آی‌پی">IP Limit</span></label><input class="fi" type="number" id="aip-limit" min="0" value="0" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
+        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Owner / Name" data-fa="مالک / نام">Owner / Name</span></label><input class="fi" id="aowner-name" placeholder="Owner name (optional)" data-ph-en="Owner name (optional)" data-ph-fa="نام مالک (اختیاری)" maxlength="60"></div>
+        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Max Sessions (owner)" data-fa="حداکثر نشست‌ها (مالک)">Max Sessions (owner)</span></label><input class="fi" type="number" id="aowner-maxsess" min="0" value="0" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
+    <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Traffic Limit (GB)" data-fa="محدودیت ترافیک (گیگابایت)">Traffic Limit (GB)</span></label><input class="fi" type="number" id="nv" min="0" step="0.1" value="0" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
     <div class="hint" id="consumed-create" style="color:var(--text-3);font-size:0.85rem;margin-top:-18px;margin-bottom:20px;" data-en="Consumed: 0 B" data-fa="مصرف: 0 B">Consumed: 0 B</div>
-    <div class="fg"><label class="fl" data-en="Max Sessions" data-fa="حداکثر نشست‌ها">Max Sessions</label><input class="fi" type="number" id="nc" min="0" value="0" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
-    <div class="fg"><label class="fl" data-en="Validity (Days)" data-fa="اعتبار (روز)">Validity (Days)</label><input class="fi" type="number" id="nd" min="0" value="0" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود" oninput="updateExpiryPreview('create')"></div>
+    <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Max Sessions" data-fa="حداکثر نشست‌ها">Max Sessions</span></label><input class="fi" type="number" id="nc" min="0" value="0" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
+    <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Validity (Days)" data-fa="اعتبار (روز)">Validity (Days)</span></label><input class="fi" type="number" id="nd" min="0" value="0" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود" oninput="updateExpiryPreview('create')"></div>
     <div class="hint" id="expires-preview-create" style="color:var(--text-3);font-size:0.85rem;margin-top:-18px;margin-bottom:20px;"></div>
-    <div class="fg"><label class="fl" data-en="Color" data-fa="رنگ">Color</label><input type="color" id="alink-color" value="#3b82f6"></div>
+    <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Color" data-fa="رنگ">Color</span></label><input type="color" id="alink-color" value="#3b82f6"></div>
     <div class="fg" id="fg-outbound-proxy-create">
-      <label class="fl" data-en="Outbound Proxy" data-fa="پروکسی خروجی">Outbound Proxy</label>
+      <label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Outbound Proxy" data-fa="پروکسی خروجی">Outbound Proxy</span></label>
       <select class="fs" id="proxy-line-select-create">
         <option value="" data-en="None (Direct)" data-fa="هیچ‌کدام (مستقیم)">None (Direct)</option>
       </select>
       <input class="fi" id="proxy-line-text-create" placeholder="or type a SOCKS5 line: host:port or user:pass@host:port" data-ph-en="or type a SOCKS5 line: host:port or user:pass@host:port" data-ph-fa="یا یک خط SOCKS5 تایپ کنید: host:port یا user:pass@host:port" style="margin-top:6px;">
-      <div style="font-size:0.85rem;color:var(--text-3);margin-top:4px;" data-en="A typed line wins over the dropdown above. Blank means use the dropdown, or Direct when nothing is chosen." data-fa="خط تایپ‌شده بر منوی کشویی بالا اولویت دارد. خالی یعنی از منو استفاده شود، یا در صورت عدم انتخاب، Direct.">A typed line wins over the dropdown above. Blank means use the dropdown, or Direct when nothing is chosen.</div>
+      <div style="font-size:0.85rem;color:var(--text-3);margin-top:4px;" data-en="A typed line wins over the dropdown above. Blank means use the dropdown, or Direct when nothing is chosen." data-fa="خط تایپ‌شده بر منوی کشویی بالا اولویت دارد. خالی یعنی از منو استفاده شود، یا در صورت عدم انتخاب، «مستقیم».">A typed line wins over the dropdown above. Blank means use the dropdown, or Direct when nothing is chosen.</div>
       <button class="btn btn-outline btn-sm" onclick="refreshProxyFlagsAndOptions('create')" style="margin-top:6px;"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg></span><span data-en="Refresh Flags" data-fa="بروزرسانی پرچم‌ها">Refresh Flags</span></button>
     </div>
-    <div style="display:flex;gap:6px;margin-top:10px;"><button class="btn btn-primary" onclick="createLink()" style="flex:1;" data-en="Create" data-fa="ایجاد">Create</button><button class="btn btn-outline" onclick="document.getElementById('mo-add').classList.remove('show')" data-en="Cancel" data-fa="انصراف">Cancel</button></div>
+    <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:10px;"><button class="btn btn-primary" onclick="createLink()" style="flex:1;"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></span><span data-en="Create" data-fa="ایجاد">Create</span></button><button class="btn btn-outline" onclick="document.getElementById('mo-add').classList.remove('show')"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></span><span data-en="Cancel" data-fa="انصراف">Cancel</span></button></div>
   </div>
 </div>
 
 <div class="mo" id="mo-edit" onclick="if(event.target===this) this.classList.remove('show')">
   <div class="mo-box">
     <button class="mo-close" onclick="document.getElementById('mo-edit').classList.remove('show')"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></span></button>
-    <div class="mo-title" id="et" data-en="Edit Inbound" data-fa="ویرایش اینباند">Edit Inbound</div>
+    <div class="mo-title" id="et"><span class="ic" style="--ic:24px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5z"/></svg></span> <span data-en="Edit Inbound" data-fa="ویرایش اینباند">Edit Inbound</span></div>
     <input type="hidden" id="eu">
-    <div class="fg"><label class="fl" data-en="Protocol" data-fa="پروتکل">Protocol</label>
+    <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Protocol" data-fa="پروتکل">Protocol</span></label>
       <select class="fs" id="eprotocol" onchange="toggleProxyFields('edit');onInboundProtocolChange('edit')">
         <option value="vless-ws" data-en="VLESS + WS" data-fa="VLESS + WS">VLESS + WS</option>
         <option value="vmess-ws" data-en="VMess + WS (AEAD)" data-fa="VMess + WS (AEAD)">VMess + WS (AEAD)</option>
         <option value="trojan-ws" data-en="Trojan + WS" data-fa="Trojan + WS">Trojan + WS</option>
         <option value="ss-ws" data-en="Shadowsocks + WS (AEAD 2022)" data-fa="Shadowsocks + WS (AEAD 2022)">Shadowsocks + WS (AEAD 2022)</option>
-        <option value="xhttp-packet-up" data-en="XHTTP Packet-Up" data-fa="XHTTP Packet-Up">XHTTP Packet-Up</option>
-        <option value="xhttp-stream-up" data-en="XHTTP Stream-Up" data-fa="XHTTP Stream-Up">XHTTP Stream-Up</option>
-        <option value="xhttp-stream-one" data-en="XHTTP Stream-One" data-fa="XHTTP Stream-One">XHTTP Stream-One</option>
-        <option value="xhttp-auto" data-en="XHTTP Auto" data-fa="XHTTP Auto">XHTTP Auto</option>
+        <option value="xhttp-packet-up" data-en="XHTTP Packet-Up" data-fa="XHTTP پکت‌آپ">XHTTP Packet-Up</option>
+        <option value="xhttp-stream-up" data-en="XHTTP Stream-Up" data-fa="XHTTP استریم‌آپ">XHTTP Stream-Up</option>
+        <option value="xhttp-stream-one" data-en="XHTTP Stream-One" data-fa="XHTTP استریم‌وان">XHTTP Stream-One</option>
+        <option value="xhttp-auto" data-en="XHTTP Auto" data-fa="XHTTP خودکار">XHTTP Auto</option>
         <option value="socks5" data-en="SOCKS5" data-fa="SOCKS5">SOCKS5</option>
         <option value="mtproto" data-en="Telegram MTProto proxy" data-fa="پروکسی MTProto تلگرام">Telegram MTProto proxy</option>
         <option value="webproxy" data-en="Telegram WEB proxy" data-fa="پروکسی WEB تلگرام">Telegram WEB proxy</option>
@@ -18849,15 +19037,15 @@ example.com
       </select>
     </div>
     <div id="cred-fields-edit">
-      <div class="fg" id="fg-euuid"><label class="fl" data-en="UUID" data-fa="UUID">UUID</label><input class="fi" id="euuid" readonly></div>
-      <div class="fg" id="fg-evmess-security"><label class="fl" data-en="VMess Security" data-fa="امنیت VMess">VMess Security</label>
+      <div class="fg" id="fg-euuid"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="UUID" data-fa="UUID">UUID</span></label><input class="fi" id="euuid" readonly></div>
+      <div class="fg" id="fg-evmess-security"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="VMess Security" data-fa="امنیت VMess">VMess Security</span></label>
       <select class="fs" id="evmess-security">
       <option value="auto" data-en="auto (recommended)" data-fa="auto (پیشنهادی)">auto (recommended)</option>
       <option value="aes-128-gcm" data-en="aes-128-gcm" data-fa="aes-128-gcm">aes-128-gcm</option>
       <option value="chacha20-poly1305" data-en="chacha20-poly1305" data-fa="chacha20-poly1305">chacha20-poly1305</option>
       </select></div>
-      <div class="fg" id="fg-epassword"><label class="fl" data-en="Password" data-fa="گذرواژه">Password</label><input class="fi" id="epassword" readonly><div style="font-size:0.85rem;color:var(--text-3);">Trojan password is the UUID. Change it with Regenerate UUID.</div></div>
-      <div class="fg" id="fg-ess-method"><label class="fl" data-en="Shadowsocks Method" data-fa="روش Shadowsocks">Shadowsocks Method</label>
+      <div class="fg" id="fg-epassword"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Password" data-fa="گذرواژه">Password</span></label><input class="fi" id="epassword" readonly><div style="font-size:0.85rem;color:var(--text-3);" data-en="Trojan password is the UUID. Change it with Regenerate UUID." data-fa="گذرواژه Trojan همان UUID است. برای تغییر آن از «تازه‌سازی UUID» استفاده کنید.">Trojan password is the UUID. Change it with Regenerate UUID.</div></div>
+      <div class="fg" id="fg-ess-method"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Shadowsocks Method" data-fa="روش Shadowsocks">Shadowsocks Method</span></label>
       <select class="fs" id="ess-method">
       <option value="2022-blake3-aes-256-gcm" data-en="2022-blake3-aes-256-gcm" data-fa="2022-blake3-aes-256-gcm">2022-blake3-aes-256-gcm</option>
       <option value="2022-blake3-aes-128-gcm" data-en="2022-blake3-aes-128-gcm" data-fa="2022-blake3-aes-128-gcm">2022-blake3-aes-128-gcm</option>
@@ -18867,29 +19055,29 @@ example.com
       <option value="chacha20-ietf-poly1305" data-en="chacha20-ietf-poly1305 (classic)" data-fa="chacha20-ietf-poly1305 (کلاسیک)">chacha20-ietf-poly1305 (classic)</option>
       </select>
       </div>
-      <div class="fg" id="fg-ess-password"><label class="fl" data-en="Password / Key" data-fa="گذرواژه / کلید">Password / Key</label><input class="fi" id="ess-password" placeholder="Leave empty to keep the current key" data-ph-en="Leave empty to keep the current key" data-ph-fa="برای حفظ کلید فعلی خالی بگذارید"></div>
-      <div class="fg" id="fg-eproxy-username"><label class="fl" data-en="Username" data-fa="نام کاربری">Username</label><input class="fi" id="eproxy-username" readonly></div>
-      <div class="fg" id="fg-eproxy-password"><label class="fl" data-en="Password" data-fa="گذرواژه">Password</label><input class="fi" id="eproxy-password" readonly><div style="font-size:0.85rem;color:var(--text-3);">Per-inbound credentials: a generated code when left empty at create time, or the values typed at create time.</div></div>
-      <div class="fg" id="fg-eproxy-port"><label class="fl" data-en="Port" data-fa="پورت">Port</label><input class="fi" id="eproxy-port" type="number" min="1" max="65535" value="1080"><div style="font-size:0.85rem;color:var(--text-3);">One port serves every protocol: the multiplexer routes SOCKS5, HTTP and MTProto, and forwards panel, WebSocket and WEB traffic to the panel. Set the port to the published port (443 on a single-port host); the multiplexer serves each inbound on every port it binds. Defaults: SOCKS5 1080, HTTP 3128, MTProto 8443.</div></div>
-      <div class="fg" id="fg-emtproto-variant"><label class="fl" data-en="MTProto Variant" data-fa="نوع MTProto">MTProto Variant</label>
+      <div class="fg" id="fg-ess-password"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Password / Key" data-fa="گذرواژه / کلید">Password / Key</span></label><input class="fi" id="ess-password" placeholder="Leave empty to keep the current key" data-ph-en="Leave empty to keep the current key" data-ph-fa="برای حفظ کلید فعلی خالی بگذارید"></div>
+      <div class="fg" id="fg-eproxy-username"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Username" data-fa="نام کاربری">Username</span></label><input class="fi" id="eproxy-username" readonly></div>
+      <div class="fg" id="fg-eproxy-password"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Password" data-fa="گذرواژه">Password</span></label><input class="fi" id="eproxy-password" readonly><div style="font-size:0.85rem;color:var(--text-3);" data-en="Per-inbound credentials: a generated code when left empty at create time, or the values typed at create time." data-fa="اعتبار هر اینباند: اگر در زمان ساخت خالی مانده باشد، یک کد ساخته‌شده است؛ در غیر این صورت همان مقادیری است که در زمان ساخت تایپ شده‌اند.">Per-inbound credentials: a generated code when left empty at create time, or the values typed at create time.</div></div>
+      <div class="fg" id="fg-eproxy-port"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Port" data-fa="پورت">Port</span></label><input class="fi" id="eproxy-port" type="number" min="1" max="65535" value="1080"><div style="font-size:0.85rem;color:var(--text-3);" data-en="One port serves every protocol: the multiplexer routes SOCKS5, HTTP and MTProto, and forwards panel, WebSocket and WEB traffic to the panel. Set the port to the published port (443 on a single-port host); the multiplexer serves each inbound on every port it binds. Defaults: SOCKS5 1080, HTTP 3128, MTProto 8443." data-fa="یک پورت به همه پروتکل‌ها خدمت می‌دهد: مالتی‌پلکسر SOCKS5 و HTTP و MTProto را مسیریابی می‌کند و ترافیک پنل و WebSocket و WEB را به پنل می‌فرستد. پورت را همان پورتی بگذارید که منتشر شده است (روی هاست تک‌پورت: 443)؛ مالتی‌پلکسر هر اینباند را روی هر پورتی که به آن متصل است، خدمت می‌دهد. پیش‌فرض‌ها: SOCKS5 ‏1080، HTTP ‏3128، MTProto ‏8443.">One port serves every protocol: the multiplexer routes SOCKS5, HTTP and MTProto, and forwards panel, WebSocket and WEB traffic to the panel. Set the port to the published port (443 on a single-port host); the multiplexer serves each inbound on every port it binds. Defaults: SOCKS5 1080, HTTP 3128, MTProto 8443.</div></div>
+      <div class="fg" id="fg-emtproto-variant"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="MTProto Variant" data-fa="نوع MTProto">MTProto Variant</span></label>
       <select class="fs" id="emtproto-variant" onchange="toggleProxyFields('edit')">
       <option value="dd" data-en="dd (recommended, obfuscated2)" data-fa="dd (پیشنهادی، obfuscated2)">dd (recommended, obfuscated2)</option>
       <option value="plain" data-en="Plain secret" data-fa="سکرت ساده">Plain secret</option>
       <option value="faketls" data-en="Fake-TLS (dd + domain)" data-fa="Fake-TLS (dd + دامنه)">Fake-TLS (dd + domain)</option>
       </select></div>
-      <div class="fg" id="fg-emtproto-domain"><label class="fl" data-en="Fake-TLS Domain" data-fa="دامنه Fake-TLS">Fake-TLS Domain</label><input class="fi" id="emtproto-domain" value="www.google.com" placeholder="www.google.com"></div>
-      <div class="fg" id="fg-emtproto-secret"><label class="fl" data-en="Secret" data-fa="سکرت">Secret</label><input class="fi" id="emtproto-secret" readonly></div>
-      <div class="fg" id="fg-ewebproxy-port"><label class="fl" data-en="WEB Proxy Port (shared 443, per-user link)" data-fa="پورت WEB Proxy (443 مشترک، لینک جدا برای هر کاربر)">WEB Proxy Port (shared 443, per-user link)</label>
+      <div class="fg" id="fg-emtproto-domain"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Fake-TLS Domain" data-fa="دامنه Fake-TLS">Fake-TLS Domain</span></label><input class="fi" id="emtproto-domain" value="www.google.com" placeholder="www.google.com"></div>
+      <div class="fg" id="fg-emtproto-secret"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Secret" data-fa="سکرت">Secret</span></label><input class="fi" id="emtproto-secret" readonly></div>
+      <div class="fg" id="fg-ewebproxy-port"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="WEB Proxy Port (shared 443, per-user link)" data-fa="پورت WEB Proxy (443 مشترک، لینک جدا برای هر کاربر)">WEB Proxy Port (shared 443, per-user link)</span></label>
       <input class="fi" id="ewebproxy-port" type="number" min="1" max="65535" value="443">
       <div class="hint" style="color:var(--text-3);font-size:0.85rem;" data-en="Port 443 is shared — each user gets their own link with its own token and secret." data-fa="پورت 443 مشترک است — هر کاربر لینک جدا با توکن و سکرت خودش دارد.">Port 443 is shared — each user gets their own link with its own token and secret.</div></div>
-      <div class="fg" id="fg-ewebproxy-secret"><label class="fl" data-en="Secret" data-fa="سکرت">Secret</label><div style="display:flex;gap:6px;"><input class="fi" id="ewebproxy-secret" placeholder="Leave empty to keep the current secret" data-ph-en="Leave empty to keep the current secret" data-ph-fa="برای حفظ سکرت فعلی خالی بگذارید" style="flex:1;"><button class="btn btn-outline btn-sm" onclick="generateWebproxySecret('edit')"><span data-en="Generate" data-fa="تولید">Generate</span></button></div><div style="font-size:0.85rem;color:var(--text-3);">Current secret is shown above. Clear the field to keep it unchanged, or type a new one to rotate it: 32 hex characters (optionally prefixed with dd).</div></div>
-      <div class="fg" id="fg-ewebproxy-token"><label class="fl" data-en="Routing Token" data-fa="توکن مسیریابی">Routing Token</label><input class="fi" id="ewebproxy-token" readonly placeholder="Assigned by token routing" data-ph-en="Assigned by token routing" data-ph-fa="توسط مسیریابی توکن اختصاص می‌یابد"></div>
+      <div class="fg" id="fg-ewebproxy-secret"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Secret" data-fa="سکرت">Secret</span></label><div style="display:flex;flex-wrap:wrap;gap:6px;"><input class="fi" id="ewebproxy-secret" placeholder="Leave empty to keep the current secret" data-ph-en="Leave empty to keep the current secret" data-ph-fa="برای حفظ سکرت فعلی خالی بگذارید" style="flex:1;"><button class="btn btn-outline btn-sm" onclick="generateWebproxySecret('edit')"><span data-en="Generate" data-fa="تولید">Generate</span></button></div><div style="font-size:0.85rem;color:var(--text-3);" data-en="Current secret is shown above. Clear the field to keep it unchanged, or type a new one to rotate it: 32 hex characters (optionally prefixed with dd)." data-fa="رمز فعلی بالا نمایش داده شده است. برای اینکه بدون تغییر بماند، فیلد را خالی کنید؛ یا برای چرخش آن یک رمز جدید تایپ کنید: ۳۲ کاراکتر هگز (با پیشوند اختیاری dd).">Current secret is shown above. Clear the field to keep it unchanged, or type a new one to rotate it: 32 hex characters (optionally prefixed with dd).</div></div>
+      <div class="fg" id="fg-ewebproxy-token"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Routing Token" data-fa="توکن مسیریابی">Routing Token</span></label><input class="fi" id="ewebproxy-token" readonly placeholder="Assigned by token routing" data-ph-en="Assigned by token routing" data-ph-fa="توسط مسیریابی توکن اختصاص می‌یابد"></div>
     </div>
     <div id="proxy-fields-edit" style="display:none;">
-      <div class="fg"><label class="fl" data-en="Proxy Info" data-fa="اطلاعات پروکسی">Proxy Info</label><div class="hint" id="eproxy-hint" style="color:var(--text-3);font-size:0.85rem;"></div></div>
+      <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Proxy Info" data-fa="اطلاعات پروکسی">Proxy Info</span></label><div class="hint" id="eproxy-hint" style="color:var(--text-3);font-size:0.85rem;"></div></div>
     </div>
-    <div class="fg"><label class="fl" data-en="Name" data-fa="نام">Name</label><input class="fi" id="en2" maxlength="60"></div>
-    <div class="fg"><label class="fl" data-en="Flag / Country" data-fa="پرچم / کشور">Flag / Country</label>
+    <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Name" data-fa="نام">Name</span></label><input class="fi" id="en2" maxlength="60"></div>
+    <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Flag / Country" data-fa="پرچم / کشور">Flag / Country</span></label>
       <select class="fs" id="flag-select-edit" onchange="applyFlagEdit()">
         <option value="" data-en="None" data-fa="هیچ‌کدام">None</option>
         <option value="cn" data-en="CN China" data-fa="CN چین">CN China</option>
@@ -18913,18 +19101,18 @@ example.com
     <div class="fg" id="adv-toggle-row-edit"><button class="adv-toggle" onclick="toggleAdv('adv-edit')">▼ <span data-en="Advanced Options" data-fa="گزینه‌های پیشرفته">Advanced Options</span></button></div>
     <div class="hint" id="adv-hint-edit" style="color:var(--text-3);font-size:0.85rem;" data-en="SNI, Host, Fingerprint, ALPN, ECH, SMUX, Xray DNS, Bypass rules and Fragment only change the generated client configs — they do not change how this server relays traffic." data-fa="SNI، Host، Fingerprint، ALPN، ECH، SMUX، Xray DNS، قوانین Bypass و Fragment فقط کانفیگ‌های ساخته‌شده کلاینت را تغییر می‌دهند و بر نحوه عبور ترافیک از این سرور تأثیری ندارند.">SNI, Host, Fingerprint, ALPN, ECH, SMUX, Xray DNS, Bypass rules and Fragment only change the generated client configs — they do not change how this server relays traffic.</div>
       <div id="adv-edit" class="adv-section">
-        <div class="fg" data-adv="profile"><label class="fl" data-en="Profile" data-fa="پروفایل">Profile</label>
+        <div class="fg" data-adv="profile"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Profile" data-fa="پروفایل">Profile</span></label>
           <select class="fs" id="eres-profile" onchange="applyProfile()"><option value="" data-en="Custom" data-fa="سفارشی">Custom</option><option value="default" data-en="Default" data-fa="پیش‌فرض">Default</option><option value="normal" data-en="Normal" data-fa="عادی">Normal</option><option value="relative" data-en="Relative restriction" data-fa="محدودیت نسبی">Relative restriction</option><option value="severe" data-en="Severe restriction" data-fa="محدودیت شدید">Severe restriction</option><option value="emergency" data-en="Emergency" data-fa="اضطراری">Emergency</option></select>
           <small style="color:var(--text-3);font-size:0.75rem;" data-en="Restriction level sets fragment, fingerprint, ALPN, ECH, path randomisation, TFO and UDP for the current filtering level. Custom leaves every parameter as you set it." data-fa="سطح محدودیت، فرگمنت، فینگرپرینت، ALPN، ECH، تصادفی‌سازی مسیر، TFO و UDP را برای سطح فیلترینگ فعلی تنظیم می‌کند. «سفارشی» همه پارامترها را همان‌طور که تنظیم کرده‌اید باقی می‌گذارد.">Restriction level sets fragment, fingerprint, ALPN, ECH, path randomisation, TFO and UDP for the current filtering level. Custom leaves every parameter as you set it.</small>
         </div>
         <div id="eeff-summary" style="color:var(--text-2);font-size:0.85rem;border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin-bottom:12px;white-space:pre-wrap;"></div>
-        <div class="fg" data-adv="path"><label class="fl" data-en="Path" data-fa="مسیر">Path</label><input class="fi" id="ep"></div>
-        <div class="fg" data-adv="sni"><label class="fl" data-en="SNI" data-fa="SNI">SNI</label><input class="fi" id="esni"></div>
-        <div class="fg" data-adv="host"><label class="fl" data-en="Host" data-fa="هاست">Host</label><input class="fi" id="ehost"></div>
-        <div class="fg" data-adv="fingerprint"><label class="fl" data-en="Fingerprint" data-fa="اثرانگشت">Fingerprint</label>
+        <div class="fg" data-adv="path"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Path" data-fa="مسیر">Path</span></label><input class="fi" id="ep"></div>
+        <div class="fg" data-adv="sni"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="SNI" data-fa="SNI">SNI</span></label><input class="fi" id="esni"></div>
+        <div class="fg" data-adv="host"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Host" data-fa="هاست">Host</span></label><input class="fi" id="ehost"></div>
+        <div class="fg" data-adv="fingerprint"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Fingerprint" data-fa="اثرانگشت">Fingerprint</span></label>
           <select class="fs" id="efingerprint-sel" onchange="toggleFingerprintCustom('edit')">
     <option value="none" data-en="None / Disable" data-fa="هیچ‌کدام / غیرفعال">None / Disable</option>
-    <option value="chrome" data-en="Chrome" data-fa="Chrome">Chrome</option>
+    <option value="chrome" selected data-en="Chrome" data-fa="Chrome">Chrome</option>
     <option value="firefox" data-en="Firefox" data-fa="Firefox">Firefox</option>
     <option value="safari" data-en="Safari" data-fa="Safari">Safari</option>
     <option value="ios" data-en="iOS" data-fa="iOS">iOS</option>
@@ -18937,39 +19125,39 @@ example.com
     <option value="custom" data-en="Custom" data-fa="سفارشی">Custom</option>
 </select>
           <input class="fi" id="efingerprint-custom" placeholder="Enter custom fingerprint" data-ph-en="Enter custom fingerprint" data-ph-fa="اثرانگشت سفارشی را وارد کنید" style="display:none; margin-top:5px;">
-          <input type="hidden" id="efingerprint" value="">
+          <input type="hidden" id="efingerprint" value="chrome">
         </div>
-        <div class="fg" data-adv="fragment"><label class="fl" data-en="Fragment" data-fa="فرگمنت">Fragment</label>
+        <div class="fg" data-adv="fragment"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Fragment" data-fa="فرگمنت">Fragment</span></label>
           <select class="fs" id="efrag-mode" onchange="toggleFragmentFields('edit')">
             <option value="off" data-en="Off" data-fa="خاموش">Off</option>
             <option value="tlshello" data-en="TLS Hello" data-fa="TLS Hello">TLS Hello</option>
             <option value="range" data-en="Range" data-fa="بازه">Range</option>
           </select>
           <div id="frag-edit-range" style="display:none;">
-            <input class="fi" id="efrag-length" placeholder="Length (e.g. 100-200)" data-ph-en="Length (e.g. 100-200)" data-ph-fa="طول (مثلاً 100-200)" style="margin-top:5px;">
-            <input class="fi" id="efrag-interval" placeholder="Interval (e.g. 10-20)" data-ph-en="Interval (e.g. 10-20)" data-ph-fa="فاصله (مثلاً 10-20)" style="margin-top:5px;">
+            <input class="fi" id="efrag-length" value="100-200" placeholder="Length (e.g. 100-200)" data-ph-en="Length (e.g. 100-200)" data-ph-fa="طول (مثلاً 100-200)" style="margin-top:5px;">
+            <input class="fi" id="efrag-interval" value="10-20" placeholder="Interval (e.g. 10-20)" data-ph-en="Interval (e.g. 10-20)" data-ph-fa="فاصله (مثلاً 10-20)" style="margin-top:5px;">
           </div>
           <input type="hidden" id="efrag" value="">
         </div>
-        <div class="fg" data-adv="ip_profile"><label class="fl" data-en="IP Profile" data-fa="پروفایل آی‌پی">IP Profile</label><select class="fs" id="eip-profile"></select></div>
-        <div class="fg" data-adv="naming_mode"><label class="fl" data-en="Naming Mode" data-fa="شیوه نام‌گذاری">Naming Mode</label>
+        <div class="fg" data-adv="ip_profile"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="IP Profile" data-fa="پروفایل آی‌پی">IP Profile</span></label><select class="fs" id="eip-profile"></select></div>
+        <div class="fg" data-adv="naming_mode"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Naming Mode" data-fa="شیوه نام‌گذاری">Naming Mode</span></label>
           <select class="fs" id="enaming-mode">
             <option value="default" data-en="Default (SulgX-Name-Server1)" data-fa="پیش‌فرض (SulgX-Name-Server1)">Default (SulgX-Name-Server1)</option>
             <option value="short" data-en="Short (SXP 1, SXP 2, ...)" data-fa="کوتاه (SXP 1, SXP 2, ...)">Short (SXP 1, SXP 2, ...)</option>
           </select>
         </div>
-        <div class="fg" data-adv="tfo"><label class="fl" data-en="TCP Fast Open" data-fa="TCP Fast Open">TCP Fast Open</label><div class="toggle" id="tfo-edit" onclick="this.classList.toggle('on')"></div></div>
-        <div class="fg" data-adv="ech"><label class="fl" data-en="ECH (Secure Hello)" data-fa="ECH (Secure Hello)">ECH (Secure Hello)</label><div class="toggle" id="ech-edit" onclick="this.classList.toggle('on'); toggleEchFields('edit')"></div></div>
+        <div class="fg" data-adv="tfo"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="TCP Fast Open" data-fa="باز کردن سریع TCP">TCP Fast Open</span></label><div class="toggle" id="tfo-edit" onclick="this.classList.toggle('on')"></div></div>
+        <div class="fg" data-adv="ech"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="ECH (Secure Hello)" data-fa="ECH (سلام امن)">ECH (Secure Hello)</span></label><div class="toggle" id="ech-edit" onclick="this.classList.toggle('on'); toggleEchFields('edit')"></div></div>
         <div id="ech-edit-fields" style="display:none;">
           <input class="fi" id="ech-sni-edit" placeholder="ECH SNI (e.g. cloudflare.com)" data-ph-en="ECH SNI (e.g. cloudflare.com)" data-ph-fa="ECH SNI (مثلاً cloudflare.com)" style="margin-top:5px;">
           <input class="fi" id="ech-doh-edit" placeholder="ECH DoH URL (optional)" data-ph-en="ECH DoH URL (optional)" data-ph-fa="آدرس ECH DoH (اختیاری)" style="margin-top:5px;">
           <select class="fs" id="ech-preset-edit" onchange="applyEchPreset('edit')" style="margin-top:5px;"><option value="custom" data-en="Custom (enter SNI below)" data-fa="سفارشی (SNI را زیر وارد کنید)">Custom (enter SNI below)</option><option value="cloudflare">Cloudflare (cloudflare.com)</option><option value="cloudflare-www">Cloudflare WWW (www.cloudflare.com)</option><option value="one-one-one-one">Cloudflare 1.1.1.1 (one.one.one.one)</option><option value="developers-cloudflare">Cloudflare Developers (developers.cloudflare.com)</option><option value="blog-cloudflare">Cloudflare Blog (blog.cloudflare.com)</option><option value="cdnjs">cdnjs (cdnjs.cloudflare.com)</option><option value="workers-cloudflare">Cloudflare Workers (workers.cloudflare.com)</option><option value="pages-cloudflare">Cloudflare Pages (pages.cloudflare.com)</option><option value="research-cloudflare">Cloudflare Research (research.cloudflare.com)</option><option value="tls-ech-dev" data-en="ECH test site (tls-ech.dev)" data-fa="سایت تست ECH (tls-ech.dev)">ECH test site (tls-ech.dev)</option></select>
         </div>
-        <div class="fg" data-adv="allow_insecure"><label class="fl" data-en="Allow Insecure" data-fa="اجازه اتصال ناامن">Allow Insecure</label><div class="toggle" id="insecure-edit" onclick="this.classList.toggle('on')"></div></div>
-        <div class="fg" data-adv="random_path"><label class="fl" data-en="Random Path" data-fa="مسیر تصادفی">Random Path</label><div class="toggle" id="random-edit" onclick="this.classList.toggle('on')"></div></div>
-        <div class="fg" data-adv="udp"><label class="fl" data-en="UDP" data-fa="UDP">UDP</label><div class="toggle on" id="udp-edit" onclick="this.classList.toggle('on')"></div></div>
-        <div class="fg" data-adv="ipv6"><label class="fl" data-en="IPv6 targets" data-fa="مقصدهای IPv6">IPv6 targets</label><div class="toggle on" id="ipv6-edit" onclick="this.classList.toggle('on')"></div></div>
-        <div class="fg" data-adv="outbound_mode"><label class="fl" data-en="Outbound Mode" data-fa="حالت خروجی">Outbound Mode</label>
+        <div class="fg" data-adv="allow_insecure"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Allow Insecure" data-fa="اجازه اتصال ناامن">Allow Insecure</span></label><div class="toggle" id="insecure-edit" onclick="this.classList.toggle('on')"></div></div>
+        <div class="fg" data-adv="random_path"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Random Path" data-fa="مسیر تصادفی">Random Path</span></label><div class="toggle" id="random-edit" onclick="this.classList.toggle('on')"></div></div>
+        <div class="fg" data-adv="udp"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="UDP" data-fa="UDP">UDP</span></label><div class="toggle on" id="udp-edit" onclick="this.classList.toggle('on')"></div></div>
+        <div class="fg" data-adv="ipv6"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="IPv6 targets" data-fa="مقصدهای IPv6">IPv6 targets</span></label><div class="toggle on" id="ipv6-edit" onclick="this.classList.toggle('on')"></div></div>
+        <div class="fg" data-adv="outbound_mode"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Outbound Mode" data-fa="حالت خروجی">Outbound Mode</span></label>
           <select class="fs" id="eoutbound-mode">
             <option value="auto" data-en="Auto (proxy line if set, else direct)" data-fa="خودکار (در صورت تنظیم خط پروکسی، وگرنه مستقیم)">Auto (proxy line if set, else direct)</option>
             <option value="direct" data-en="Direct" data-fa="مستقیم">Direct</option>
@@ -18977,7 +19165,7 @@ example.com
             <option value="block" data-en="Block" data-fa="مسدود">Block</option>
           </select>
         </div>
-        <div class="fg" data-adv="gaming_profile"><label class="fl" data-en="Gaming Profile" data-fa="پروفایل گیمینگ">Gaming Profile</label>
+        <div class="fg" data-adv="gaming_profile"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Gaming Profile" data-fa="پروفایل گیمینگ">Gaming Profile</span></label>
           <select class="fs" id="egaming-profile">
             <option value="off" data-en="Off (no gaming changes)" data-fa="خاموش (بدون تغییر گیمینگ)">Off (no gaming changes)</option>
             <option value="balanced" data-en="Balanced" data-fa="متعادل">Balanced</option>
@@ -18986,7 +19174,7 @@ example.com
             <option value="stealth" data-en="Stealth" data-fa="مخفی">Stealth</option>
           </select>
         </div>
-        <div class="fg" data-adv="alpn"><label class="fl" data-en="ALPN" data-fa="ALPN">ALPN</label>
+        <div class="fg" data-adv="alpn"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="ALPN" data-fa="ALPN">ALPN</span></label>
           <select class="fs" id="ealpn-sel" onchange="toggleAlpnCustom('edit')">
     <option value="smart" data-en="Smart (recommended)" data-fa="هوشمند (پیشنهادی)">Smart (recommended)</option>
     <option value="http/1.1" data-en="http/1.1" data-fa="http/1.1">http/1.1</option>
@@ -18996,65 +19184,65 @@ example.com
     <option value="custom" data-en="Custom" data-fa="سفارشی">Custom</option>
 </select>
           <input class="fi" id="ealpn-custom" placeholder="e.g. h2,http/1.1" data-ph-en="e.g. h2,http/1.1" data-ph-fa="مثلاً h2,http/1.1" style="display:none; margin-top:5px;">
-          <input type="hidden" id="ealpn" value="">
+          <input type="hidden" id="ealpn" value="smart">
         </div>
-        <div class="fg" data-adv="port"><label class="fl">Port (shown in link — server listens on port <span id="port-note-edit">…</span> only)</label><input class="fi" type="number" id="eport" min="1" max="65535" value="443"></div>
-        <div class="fg" data-adv="xray_dns_mode"><label class="fl" data-en="Xray DNS Mode" data-fa="حالت DNS در Xray">Xray DNS Mode</label>
+        <div class="fg" data-adv="port"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Port (shown in link — server listens on port" data-fa="پورت (در لینک نمایش داده می‌شود — سرور فقط روی پورت">Port (shown in link — server listens on port</span> <span id="port-note-edit">…</span> <span data-en="only)" data-fa=") گوش می‌دهد">only)</span></label><input class="fi" type="number" id="eport" min="1" max="65535" value="443"></div>
+        <div class="fg" data-adv="xray_dns_mode"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Xray DNS Mode" data-fa="حالت DNS در Xray">Xray DNS Mode</span></label>
         <select class="fs" id="xray-dns-mode">
         <option value="direct" data-en="Direct (system)" data-fa="مستقیم (سیستم)">Direct (system)</option>
         <option value="doh" data-en="DoH (DNS over HTTPS)" data-fa="DoH (DNS روی HTTPS)">DoH (DNS over HTTPS)</option>
         <option value="fakedns" data-en="FakeDNS" data-fa="FakeDNS">FakeDNS</option>
         </select></div>
-        <div class="fg" data-adv="xray_doh_url"><label class="fl" data-en="DoH URL (if DoH selected)" data-fa="آدرس DoH (در صورت انتخاب DoH)">DoH URL (if DoH selected)</label><input class="fi" id="xray-doh-url" placeholder="https://cloudflare-dns.com/dns-query"></div>
-        <div class="fg" data-adv="xray_doh_url"><label class="fl" data-en="DoH upstream (shared with Settings)" data-fa="آپل‌استریم DoH (مشترک با تنظیمات)">DoH upstream (shared with Settings)</label><select class="fs" id="xray-doh-select" onchange="applyDohSelect('edit')"><option value="">Panel default (first upstream)</option></select><button class="btn btn-outline btn-sm" style="margin-top:6px;" onclick="addDohUpstream('edit')" data-en="Add the URL above to the shared list" data-fa="افزودن آدرس بالا به لیست مشترک">Add the URL above to the shared list</button></div>
-        <div class="fg" data-adv="xray_allowed_domains"><label class="fl" data-en="Allowed Domains (one per line)" data-fa="دامنه‌های مجاز (هر خط یک)">Allowed Domains (one per line)</label><textarea class="fi" id="xray-allowed-domains" rows="3" placeholder="example.com"></textarea></div>
-        <div class="fg" data-adv="xray_blocked_domains"><label class="fl" data-en="Blocked Domains (one per line)" data-fa="دامنه‌های مسدود (هر خط یک)">Blocked Domains (one per line)</label><textarea class="fi" id="xray-blocked-domains" rows="3" placeholder="example.com"></textarea></div>
-        <div class="fg" data-adv="bypass_iran"><label class="fl" data-en="Bypass Iran (Direct)" data-fa="دور زدن ایران (مستقیم)">Bypass Iran (Direct)</label><div class="toggle on" id="bypass-iran-edit" onclick="this.classList.toggle('on')"></div></div>
-        <div class="fg" data-adv="bypass_china"><label class="fl" data-en="Bypass China (Direct)" data-fa="دور زدن چین (مستقیم)">Bypass China (Direct)</label><div class="toggle" id="bypass-china-edit" onclick="this.classList.toggle('on')"></div></div>
-        <div class="fg" data-adv="bypass_russia"><label class="fl" data-en="Bypass Russia (Direct)" data-fa="دور زدن روسیه (مستقیم)">Bypass Russia (Direct)</label><div class="toggle" id="bypass-russia-edit" onclick="this.classList.toggle('on')"></div></div>
+        <div class="fg" data-adv="xray_doh_url"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="DoH URL (if DoH selected)" data-fa="آدرس DoH (در صورت انتخاب DoH)">DoH URL (if DoH selected)</span></label><input class="fi" id="xray-doh-url" placeholder="https://cloudflare-dns.com/dns-query"></div>
+        <div class="fg" data-adv="xray_doh_url"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="DoH upstream (shared with Settings)" data-fa="آپل‌استریم DoH (مشترک با تنظیمات)">DoH upstream (shared with Settings)</span></label><select class="fs" id="xray-doh-select" onchange="applyDohSelect('edit')"><option value="" data-en="Panel default (first upstream)" data-fa="پیش‌فرض پنل (نخستین آپ‌استریم)">Panel default (first upstream)</option></select><button class="btn btn-outline btn-sm" style="margin-top:6px;" onclick="addDohUpstream('edit')"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></span><span data-en="Add the URL above to the shared list" data-fa="افزودن آدرس بالا به لیست مشترک">Add the URL above to the shared list</span></button></div>
+        <div class="fg" data-adv="xray_allowed_domains"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Allowed Domains (one per line)" data-fa="دامنه‌های مجاز (هر خط یک)">Allowed Domains (one per line)</span></label><textarea class="fi" id="xray-allowed-domains" rows="3" placeholder="example.com"></textarea></div>
+        <div class="fg" data-adv="xray_blocked_domains"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Blocked Domains (one per line)" data-fa="دامنه‌های مسدود (هر خط یک)">Blocked Domains (one per line)</span></label><textarea class="fi" id="xray-blocked-domains" rows="3" placeholder="example.com"></textarea></div>
+        <div class="fg" data-adv="bypass_iran"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Bypass Iran (Direct)" data-fa="دور زدن ایران (مستقیم)">Bypass Iran (Direct)</span></label><div class="toggle on" id="bypass-iran-edit" onclick="this.classList.toggle('on')"></div></div>
+        <div class="fg" data-adv="bypass_china"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Bypass China (Direct)" data-fa="دور زدن چین (مستقیم)">Bypass China (Direct)</span></label><div class="toggle" id="bypass-china-edit" onclick="this.classList.toggle('on')"></div></div>
+        <div class="fg" data-adv="bypass_russia"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Bypass Russia (Direct)" data-fa="دور زدن روسیه (مستقیم)">Bypass Russia (Direct)</span></label><div class="toggle" id="bypass-russia-edit" onclick="this.classList.toggle('on')"></div></div>
       </div>
-        <div class="fg"><label class="fl" data-en="IP Limit" data-fa="محدودیت آی‌پی">IP Limit</label><input class="fi" type="number" id="eip-limit" min="0" value="0" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
-        <div class="fg"><label class="fl" data-en="Owner / Name" data-fa="مالک / نام">Owner / Name</label><input class="fi" id="eowner-name" placeholder="Owner name (optional)" data-ph-en="Owner name (optional)" data-ph-fa="نام مالک (اختیاری)" maxlength="60"></div>
-        <div class="fg"><label class="fl" data-en="Max Sessions (owner)" data-fa="حداکثر نشست‌ها (مالک)">Max Sessions (owner)</label><input class="fi" type="number" id="eowner-maxsess" min="0" value="0" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
-    <div class="fg"><label class="fl" data-en="Traffic Limit (GB)" data-fa="محدودیت ترافیک (گیگابایت)">Traffic Limit (GB)</label><input class="fi" type="number" id="el" min="0" step="0.1" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
-    <div class="fg"><label class="fl" data-en="Used / Limit / Remaining" data-fa="مصرف / سقف / باقی‌مانده">Used / Limit / Remaining</label><div class="hint" id="eusage" style="color:var(--text-2);font-size:0.9rem;"></div></div>
-    <div class="fg"><label class="fl" data-en="Max Connections" data-fa="حداکثر اتصالات">Max Connections</label><input class="fi" type="number" id="ec" min="0" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
-    <div class="fg"><label class="fl" data-en="Validity (Days)" data-fa="اعتبار (روز)">Validity (Days)</label><input class="fi" type="number" id="ed" min="0" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود" oninput="updateExpiryPreview('edit')"></div>
+        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="IP Limit" data-fa="محدودیت آی‌پی">IP Limit</span></label><input class="fi" type="number" id="eip-limit" min="0" value="0" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
+        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Owner / Name" data-fa="مالک / نام">Owner / Name</span></label><input class="fi" id="eowner-name" placeholder="Owner name (optional)" data-ph-en="Owner name (optional)" data-ph-fa="نام مالک (اختیاری)" maxlength="60"></div>
+        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Max Sessions (owner)" data-fa="حداکثر نشست‌ها (مالک)">Max Sessions (owner)</span></label><input class="fi" type="number" id="eowner-maxsess" min="0" value="0" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
+    <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Traffic Limit (GB)" data-fa="محدودیت ترافیک (گیگابایت)">Traffic Limit (GB)</span></label><input class="fi" type="number" id="el" min="0" step="0.1" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
+    <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Used / Limit / Remaining" data-fa="مصرف / سقف / باقی‌مانده">Used / Limit / Remaining</span></label><div class="hint" id="eusage" style="color:var(--text-2);font-size:0.9rem;"></div></div>
+    <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Max Connections" data-fa="حداکثر اتصالات">Max Connections</span></label><input class="fi" type="number" id="ec" min="0" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود"></div>
+    <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Validity (Days)" data-fa="اعتبار (روز)">Validity (Days)</span></label><input class="fi" type="number" id="ed" min="0" placeholder="0 = Unlimited" data-ph-en="0 = Unlimited" data-ph-fa="۰ = نامحدود" oninput="updateExpiryPreview('edit')"></div>
     <div class="hint" id="expires-preview-edit" style="color:var(--text-3);font-size:0.85rem;margin-top:-18px;margin-bottom:20px;"></div>
-    <div class="fg"><label class="fl" data-en="Consumed Volume" data-fa="حجم مصرف‌شده">Consumed Volume</label><div class="hint" id="eused-summary" style="color:var(--text-2);font-size:0.9rem;">–</div></div>
-    <div class="fg"><label class="fl" data-en="Color" data-fa="رنگ">Color</label><input type="color" id="e-color" value="#3b82f6"></div>
+    <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Consumed Volume" data-fa="حجم مصرف‌شده">Consumed Volume</span></label><div class="hint" id="eused-summary" style="color:var(--text-2);font-size:0.9rem;">–</div></div>
+    <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Color" data-fa="رنگ">Color</span></label><input type="color" id="e-color" value="#3b82f6"></div>
     <div class="fg" id="fg-outbound-proxy-edit">
-      <label class="fl" data-en="Outbound Proxy" data-fa="پروکسی خروجی">Outbound Proxy</label>
+      <label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Outbound Proxy" data-fa="پروکسی خروجی">Outbound Proxy</span></label>
       <select class="fs" id="proxy-line-select-edit">
         <option value="" data-en="None (Direct)" data-fa="هیچ‌کدام (مستقیم)">None (Direct)</option>
       </select>
       <input class="fi" id="proxy-line-text-edit" placeholder="or type a SOCKS5 line: host:port or user:pass@host:port" data-ph-en="or type a SOCKS5 line: host:port or user:pass@host:port" data-ph-fa="یا یک خط SOCKS5 تایپ کنید: host:port یا user:pass@host:port" style="margin-top:6px;">
-      <div style="font-size:0.85rem;color:var(--text-3);margin-top:4px;" data-en="A typed line wins over the dropdown above. Blank means use the dropdown, or Direct when nothing is chosen." data-fa="خط تایپ‌شده بر منوی کشویی بالا اولویت دارد. خالی یعنی از منو استفاده شود، یا در صورت عدم انتخاب، Direct.">A typed line wins over the dropdown above. Blank means use the dropdown, or Direct when nothing is chosen.</div>
+      <div style="font-size:0.85rem;color:var(--text-3);margin-top:4px;" data-en="A typed line wins over the dropdown above. Blank means use the dropdown, or Direct when nothing is chosen." data-fa="خط تایپ‌شده بر منوی کشویی بالا اولویت دارد. خالی یعنی از منو استفاده شود، یا در صورت عدم انتخاب، «مستقیم».">A typed line wins over the dropdown above. Blank means use the dropdown, or Direct when nothing is chosen.</div>
       <button class="btn btn-outline btn-sm" onclick="refreshProxyFlagsAndOptions('edit')" style="margin-top:6px;"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg></span><span data-en="Refresh Flags" data-fa="بروزرسانی پرچم‌ها">Refresh Flags</span></button>
     </div>
-    <div class="fg"><label class="fl" data-en="Link text" data-fa="متن لینک">Link text</label><div style="display:flex;gap:6px;"><input class="fi" id="edit-link-text" readonly style="direction:ltr;text-align:left;flex:1;min-width:0;"><button class="btn btn-outline btn-sm" onclick="copyToClipboard(document.getElementById('edit-link-text').value)" data-en="Copy" data-fa="کپی">Copy</button></div></div>
-    <div style="display:flex;gap:6px;margin-top:10px;flex-wrap:wrap;"><button class="btn btn-outline btn-sm" onclick="regenUuidFromEdit()" data-en="Regenerate UUID" data-fa="تولید دوباره UUID">Regenerate UUID</button><button class="btn btn-outline btn-sm" onclick="disconnectFromEdit()" data-en="Disconnect all" data-fa="قطع همه اتصال‌ها">Disconnect all</button><button class="btn btn-outline btn-sm" onclick="cloneLinkFromEdit()" data-en="Clone" data-fa="کلون">Clone</button></div>
-    <div style="display:flex;gap:6px;margin-top:10px;"><button class="btn btn-primary" onclick="saveEdit()" style="flex:1;" data-en="Save" data-fa="ذخیره">Save</button><button class="btn btn-danger btn-sm" onclick="resetTraf()" data-en="Reset Traffic" data-fa="بازنشانی ترافیک">Reset Traffic</button><button class="btn btn-outline" onclick="document.getElementById('mo-edit').classList.remove('show')" data-en="Cancel" data-fa="انصراف">Cancel</button></div>
+    <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Link text" data-fa="متن لینک">Link text</span></label><div style="display:flex;flex-wrap:wrap;gap:6px;"><input class="fi" id="edit-link-text" readonly style="direction:ltr;text-align:left;flex:1;min-width:0;"><button class="btn btn-outline btn-sm" onclick="copyToClipboard(document.getElementById('edit-link-text').value)"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></span><span data-en="Copy" data-fa="کپی">Copy</span></button></div></div>
+    <div style="display:flex;gap:6px;margin-top:10px;flex-wrap:wrap;"><button class="btn btn-outline btn-sm" onclick="regenUuidFromEdit()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="15.5" cy="15.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="15.5" cy="8.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="8.5" cy="15.5" r="1.4" fill="currentColor" stroke="none"/></svg></span><span data-en="Regenerate UUID" data-fa="تولید دوباره UUID">Regenerate UUID</span></button><button class="btn btn-outline btn-sm" onclick="disconnectFromEdit()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 7V3M15 7V3M7 7h10v4a5 5 0 0 1-10 0z"/><line x1="12" y1="16" x2="12" y2="21"/><line x1="4" y1="4" x2="20" y2="20"/></svg></span><span data-en="Disconnect all" data-fa="قطع همه اتصال‌ها">Disconnect all</span></button><button class="btn btn-outline btn-sm" onclick="cloneLinkFromEdit()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/><line x1="18" y1="2" x2="18" y2="6"/><line x1="16" y1="4" x2="20" y2="4"/></svg></span><span data-en="Clone" data-fa="کلون">Clone</span></button></div>
+    <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:10px;"><button class="btn btn-primary" onclick="saveEdit()" style="flex:1;"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg></span><span data-en="Save" data-fa="ذخیره">Save</span></button><button class="btn btn-danger btn-sm" onclick="resetTraf()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg></span><span data-en="Reset Traffic" data-fa="بازنشانی ترافیک">Reset Traffic</span></button><button class="btn btn-outline" onclick="document.getElementById('mo-edit').classList.remove('show')"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></span><span data-en="Cancel" data-fa="انصراف">Cancel</span></button></div>
   </div>
 </div>
 
 <div class="mo" id="mo-qr" onclick="if(event.target===this) this.classList.remove('show')">
   <div class="mo-box" style="max-width:360px;">
     <button class="mo-close" onclick="document.getElementById('mo-qr').classList.remove('show')"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></span></button>
-    <div class="mo-title" data-en="QR Code" data-fa="کد QR">QR Code</div>
+    <div class="mo-title"><span class="ic" style="--ic:24px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3z"/><path d="M21 14v3h-3M21 21h-7v-7"/></svg></span> <span data-en="QR Code" data-fa="کد QR">QR Code</span></div>
     <div class="qr-box"><canvas id="qr-canvas" width="280" height="280" role="img" aria-label="QR code" data-en-aria="QR code" data-fa-aria="کد QR"></canvas></div>
-    <button class="btn btn-primary" onclick="dlQR()" style="width:100%;margin-top:10px;justify-content:center;" data-en="Download" data-fa="دانلود">Download</button>
+    <button class="btn btn-primary" onclick="dlQR()" style="width:100%;margin-top:10px;justify-content:center;"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg></span><span data-en="Download" data-fa="دانلود">Download</span></button>
   </div>
 </div>
 
 <div class="mo" id="mo-confirm" onclick="if(event.target===this) _confirmDone(false)">
   <div class="mo-box" style="max-width:420px;">
     <button class="mo-close" onclick="_confirmDone(false)"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></span></button>
-    <div class="mo-title" data-en="Confirm" data-fa="تأیید">Confirm</div>
+    <div class="mo-title"><span class="ic" style="--ic:24px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></span> <span data-en="Confirm" data-fa="تأیید">Confirm</span></div>
     <div id="confirm-msg" style="color:var(--text-2);font-size:0.95rem;line-height:1.6;margin:8px 0 4px;"></div>
-    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px;">
-      <button class="btn btn-outline" onclick="_confirmDone(false)" data-en="Cancel" data-fa="انصراف">Cancel</button>
-      <button class="btn btn-danger" id="confirm-ok" onclick="_confirmDone(true)">Delete</button>
+    <div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end;margin-top:16px;">
+      <button class="btn btn-outline" onclick="_confirmDone(false)"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></span><span data-en="Cancel" data-fa="انصراف">Cancel</span></button>
+      <button class="btn btn-danger" id="confirm-ok" onclick="_confirmDone(true)"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg></span><span data-en="Delete" data-fa="حذف">Delete</span></button>
     </div>
   </div>
 </div>
@@ -19062,80 +19250,80 @@ example.com
 <div class="mo" id="mo-addr-edit" onclick="if(event.target===this) this.classList.remove('show')">
   <div class="mo-box">
     <button class="mo-close" onclick="document.getElementById('mo-addr-edit').classList.remove('show')"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></span></button>
-    <div class="mo-title" data-en="Edit Address" data-fa="ویرایش آدرس">Edit Address</div>
-    <div class="fg"><label class="fl" data-en="New Address" data-fa="آدرس جدید">New Address</label><input class="fi" id="edit-addr-input"></div>
-    <button class="btn btn-primary" onclick="saveAddrEdit()" style="width:100%;justify-content:center;margin-top:10px;" data-en="Save" data-fa="ذخیره">Save</button>
+    <div class="mo-title"><span class="ic" style="--ic:24px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5z"/></svg></span> <span data-en="Edit Address" data-fa="ویرایش آدرس">Edit Address</span></div>
+    <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="New Address" data-fa="آدرس جدید">New Address</span></label><input class="fi" id="edit-addr-input"></div>
+    <button class="btn btn-primary" onclick="saveAddrEdit()" style="width:100%;justify-content:center;margin-top:10px;"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg></span><span data-en="Save" data-fa="ذخیره">Save</span></button>
   </div>
 </div>
 
 <div class="mo" id="mo-quick-add" onclick="if(event.target===this) this.classList.remove('show')">
   <div class="mo-box">
     <button class="mo-close" onclick="document.getElementById('mo-quick-add').classList.remove('show')"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></span></button>
-    <div class="mo-title" data-en="Quick Add Inbound" data-fa="ساخت سریع اینباند">Quick Add Inbound</div>
-    <div class="fg"><label class="fl" data-en="Name" data-fa="نام">Name</label><input class="fi" id="quick-label"></div>
-    <div class="fg"><label class="fl" data-en="Protocol" data-fa="پروتکل">Protocol</label>
+    <div class="mo-title"><span class="ic" style="--ic:24px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg></span> <span data-en="Quick Add Inbound" data-fa="ساخت سریع اینباند">Quick Add Inbound</span></div>
+    <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Name" data-fa="نام">Name</span></label><input class="fi" id="quick-label"></div>
+    <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Protocol" data-fa="پروتکل">Protocol</span></label>
       <select class="fs" id="quick-protocol" onchange="toggleQuickFields()">
         <option value="vless-ws" data-en="VLESS + WS" data-fa="VLESS + WS">VLESS + WS</option>
         <option value="vmess-ws" data-en="VMess + WS (AEAD)" data-fa="VMess + WS (AEAD)">VMess + WS (AEAD)</option>
         <option value="trojan-ws" data-en="Trojan + WS" data-fa="Trojan + WS">Trojan + WS</option>
         <option value="ss-ws" data-en="Shadowsocks + WS (AEAD 2022)" data-fa="Shadowsocks + WS (AEAD 2022)">Shadowsocks + WS (AEAD 2022)</option>
-        <option value="xhttp-packet-up" data-en="XHTTP Packet-Up" data-fa="XHTTP Packet-Up">XHTTP Packet-Up</option>
-        <option value="xhttp-stream-up" data-en="XHTTP Stream-Up" data-fa="XHTTP Stream-Up">XHTTP Stream-Up</option>
-        <option value="xhttp-stream-one" data-en="XHTTP Stream-One" data-fa="XHTTP Stream-One">XHTTP Stream-One</option>
-        <option value="xhttp-auto" data-en="XHTTP Auto" data-fa="XHTTP Auto">XHTTP Auto</option>
+        <option value="xhttp-packet-up" data-en="XHTTP Packet-Up" data-fa="XHTTP پکت‌آپ">XHTTP Packet-Up</option>
+        <option value="xhttp-stream-up" data-en="XHTTP Stream-Up" data-fa="XHTTP استریم‌آپ">XHTTP Stream-Up</option>
+        <option value="xhttp-stream-one" data-en="XHTTP Stream-One" data-fa="XHTTP استریم‌وان">XHTTP Stream-One</option>
+        <option value="xhttp-auto" data-en="XHTTP Auto" data-fa="XHTTP خودکار">XHTTP Auto</option>
         <option value="socks5" data-en="SOCKS5" data-fa="SOCKS5">SOCKS5</option>
         <option value="mtproto" data-en="Telegram MTProto proxy" data-fa="پروکسی MTProto تلگرام">Telegram MTProto proxy</option>
         <option value="webproxy" data-en="Telegram WEB proxy" data-fa="پروکسی WEB تلگرام">Telegram WEB proxy</option>
         <option value="http-proxy" data-en="HTTP proxy (CONNECT)" data-fa="پروکسی HTTP (CONNECT)">HTTP proxy (CONNECT)</option>
       </select>
     </div>
-    <div class="fg" id="fg-quick-uuid" style="display:none;"><label class="fl" data-en="UUID" data-fa="UUID">UUID</label><input class="fi" id="quick-uuid" placeholder="Leave empty for auto-generate" data-ph-en="Leave empty for auto-generate" data-ph-fa="برای تولید خودکار خالی بگذارید"></div>
-    <div class="fg" id="fg-quick-vmess-security" style="display:none;"><label class="fl" data-en="VMess Security" data-fa="امنیت VMess">VMess Security</label>
+    <div class="fg" id="fg-quick-uuid" style="display:none;"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="UUID" data-fa="UUID">UUID</span></label><input class="fi" id="quick-uuid" placeholder="Leave empty for auto-generate" data-ph-en="Leave empty for auto-generate" data-ph-fa="برای تولید خودکار خالی بگذارید"></div>
+    <div class="fg" id="fg-quick-vmess-security" style="display:none;"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="VMess Security" data-fa="امنیت VMess">VMess Security</span></label>
       <select class="fs" id="quick-vmess-security">
       <option value="auto" data-en="auto (recommended)" data-fa="auto (پیشنهادی)">auto (recommended)</option>
       <option value="aes-128-gcm">aes-128-gcm</option>
       <option value="chacha20-poly1305">chacha20-poly1305</option>
       </select>
     </div>
-    <div class="fg" id="fg-quick-password" style="display:none;"><label class="fl" data-en="Password" data-fa="گذرواژه">Password</label><input class="fi" id="quick-password" placeholder="Leave empty for auto-generate" data-ph-en="Leave empty for auto-generate" data-ph-fa="برای تولید خودکار خالی بگذارید"><div style="font-size:0.85rem;color:var(--text-3);">Trojan password. It must be a UUID.</div></div>
-    <div class="fg" id="fg-quick-ss-method" style="display:none;"><label class="fl" data-en="Shadowsocks Method" data-fa="روش Shadowsocks">Shadowsocks Method</label>
+    <div class="fg" id="fg-quick-password" style="display:none;"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Password" data-fa="گذرواژه">Password</span></label><input class="fi" id="quick-password" placeholder="Leave empty for auto-generate" data-ph-en="Leave empty for auto-generate" data-ph-fa="برای تولید خودکار خالی بگذارید"><div style="font-size:0.85rem;color:var(--text-3);" data-en="Trojan password. It must be a UUID." data-fa="گذرواژه Trojan باید UUID باشد.">Trojan password. It must be a UUID.</div></div>
+    <div class="fg" id="fg-quick-ss-method" style="display:none;"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Shadowsocks Method" data-fa="روش Shadowsocks">Shadowsocks Method</span></label>
       <select class="fs" id="quick-ss-method">
       <option value="2022-blake3-aes-256-gcm">2022-blake3-aes-256-gcm</option>
       <option value="2022-blake3-aes-128-gcm">2022-blake3-aes-128-gcm</option>
       <option value="2022-blake3-chacha20-poly1305">2022-blake3-chacha20-poly1305</option>
-      <option value="aes-256-gcm">aes-256-gcm (classic)</option>
-      <option value="aes-128-gcm">aes-128-gcm (classic)</option>
-      <option value="chacha20-ietf-poly1305">chacha20-ietf-poly1305 (classic)</option>
+      <option value="aes-256-gcm" data-en="aes-256-gcm (classic)" data-fa="aes-256-gcm (کلاسیک)">aes-256-gcm (classic)</option>
+      <option value="aes-128-gcm" data-en="aes-128-gcm (classic)" data-fa="aes-128-gcm (کلاسیک)">aes-128-gcm (classic)</option>
+      <option value="chacha20-ietf-poly1305" data-en="chacha20-ietf-poly1305 (classic)" data-fa="chacha20-ietf-poly1305 (کلاسیک)">chacha20-ietf-poly1305 (classic)</option>
       </select>
     </div>
-    <div class="fg" id="fg-quick-ss-password" style="display:none;"><label class="fl" data-en="Password / Key" data-fa="گذرواژه / کلید">Password / Key</label><input class="fi" id="quick-ss-password" placeholder="Leave empty for auto-generate" data-ph-en="Leave empty for auto-generate" data-ph-fa="برای تولید خودکار خالی بگذارید"></div>
-    <div class="fg" id="fg-quick-mtproto-variant" style="display:none;"><label class="fl" data-en="MTProto Variant" data-fa="نوع MTProto">MTProto Variant</label>
+    <div class="fg" id="fg-quick-ss-password" style="display:none;"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Password / Key" data-fa="گذرواژه / کلید">Password / Key</span></label><input class="fi" id="quick-ss-password" placeholder="Leave empty for auto-generate" data-ph-en="Leave empty for auto-generate" data-ph-fa="برای تولید خودکار خالی بگذارید"></div>
+    <div class="fg" id="fg-quick-mtproto-variant" style="display:none;"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="MTProto Variant" data-fa="نوع MTProto">MTProto Variant</span></label>
       <select class="fs" id="quick-mtproto-variant" onchange="toggleQuickFields()">
       <option value="dd" data-en="dd (recommended, obfuscated2)" data-fa="dd (پیشنهادی، obfuscated2)">dd (recommended, obfuscated2)</option>
       <option value="plain" data-en="Plain secret" data-fa="سکرت ساده">Plain secret</option>
       <option value="faketls" data-en="Fake-TLS (dd + domain)" data-fa="Fake-TLS (dd + دامنه)">Fake-TLS (dd + domain)</option>
       </select></div>
-    <div class="fg" id="fg-quick-mtproto-domain" style="display:none;"><label class="fl" data-en="Fake-TLS Domain" data-fa="دامنه Fake-TLS">Fake-TLS Domain</label><input class="fi" id="quick-mtproto-domain" value="www.google.com" placeholder="www.google.com"></div>
-    <div class="fg" id="fg-quick-webproxy-port" style="display:none;"><label class="fl" data-en="WEB Proxy Port (shared 443, per-user link)" data-fa="پورت WEB Proxy (443 مشترک، لینک جدا برای هر کاربر)">WEB Proxy Port (shared 443, per-user link)</label>
+    <div class="fg" id="fg-quick-mtproto-domain" style="display:none;"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Fake-TLS Domain" data-fa="دامنه Fake-TLS">Fake-TLS Domain</span></label><input class="fi" id="quick-mtproto-domain" value="www.google.com" placeholder="www.google.com"></div>
+    <div class="fg" id="fg-quick-webproxy-port" style="display:none;"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="WEB Proxy Port (shared 443, per-user link)" data-fa="پورت WEB Proxy (443 مشترک، لینک جدا برای هر کاربر)">WEB Proxy Port (shared 443, per-user link)</span></label>
       <input class="fi" id="quick-webproxy-port" type="number" min="1" max="65535" value="443">
       <div class="hint" style="color:var(--text-3);font-size:0.85rem;" data-en="Port 443 is shared — each user gets their own link with its own token and secret." data-fa="پورت 443 مشترک است — هر کاربر لینک جدا با توکن و سکرت خودش دارد.">Port 443 is shared — each user gets their own link with its own token and secret.</div></div>
-    <div class="fg" id="fg-quick-webproxy-secret" style="display:none;"><label class="fl" data-en="Secret" data-fa="سکرت">Secret</label><div style="display:flex;gap:6px;"><input class="fi" id="quick-webproxy-secret" placeholder="Leave empty for auto-generate" data-ph-en="Leave empty for auto-generate" data-ph-fa="برای تولید خودکار خالی بگذارید" style="flex:1;"><button class="btn btn-outline btn-sm" onclick="generateWebproxySecret('quick')"><span data-en="Generate" data-fa="تولید">Generate</span></button></div></div>
-    <div class="fg" id="fg-quick-proxy-port" style="display:none;"><label class="fl" data-en="Port" data-fa="پورت">Port</label><input class="fi" id="quick-proxy-port" type="number" min="1" max="65535" value="1080"><div style="font-size:0.85rem;color:var(--text-3);">One port serves every protocol: the multiplexer routes SOCKS5, HTTP and MTProto, and forwards panel, WebSocket and WEB traffic to the panel. Set the port to the published port (443 on a single-port host); the multiplexer serves each inbound on every port it binds. Defaults: SOCKS5 1080, HTTP 3128, MTProto 8443.</div></div>
+    <div class="fg" id="fg-quick-webproxy-secret" style="display:none;"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Secret" data-fa="سکرت">Secret</span></label><div style="display:flex;flex-wrap:wrap;gap:6px;"><input class="fi" id="quick-webproxy-secret" placeholder="Leave empty for auto-generate" data-ph-en="Leave empty for auto-generate" data-ph-fa="برای تولید خودکار خالی بگذارید" style="flex:1;"><button class="btn btn-outline btn-sm" onclick="generateWebproxySecret('quick')"><span data-en="Generate" data-fa="تولید">Generate</span></button></div></div>
+    <div class="fg" id="fg-quick-proxy-port" style="display:none;"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Port" data-fa="پورت">Port</span></label><input class="fi" id="quick-proxy-port" type="number" min="1" max="65535" value="1080"><div style="font-size:0.85rem;color:var(--text-3);" data-en="One port serves every protocol: the multiplexer routes SOCKS5, HTTP and MTProto, and forwards panel, WebSocket and WEB traffic to the panel. Set the port to the published port (443 on a single-port host); the multiplexer serves each inbound on every port it binds. Defaults: SOCKS5 1080, HTTP 3128, MTProto 8443." data-fa="یک پورت به همه پروتکل‌ها خدمت می‌دهد: مالتی‌پلکسر SOCKS5 و HTTP و MTProto را مسیریابی می‌کند و ترافیک پنل و WebSocket و WEB را به پنل می‌فرستد. پورت را همان پورتی بگذارید که منتشر شده است (روی هاست تک‌پورت: 443)؛ مالتی‌پلکسر هر اینباند را روی هر پورتی که به آن متصل است، خدمت می‌دهد. پیش‌فرض‌ها: SOCKS5 ‏1080، HTTP ‏3128، MTProto ‏8443.">One port serves every protocol: the multiplexer routes SOCKS5, HTTP and MTProto, and forwards panel, WebSocket and WEB traffic to the panel. Set the port to the published port (443 on a single-port host); the multiplexer serves each inbound on every port it binds. Defaults: SOCKS5 1080, HTTP 3128, MTProto 8443.</div></div>
     <div class="fg" id="fg-quick-proxy-note" style="display:none;"><div class="hint" style="color:var(--text-3);font-size:0.85rem;" data-en="Username and password are auto-generated when left empty." data-fa="نام کاربری و گذرواژه در صورت خالی ماندن به‌صورت خودکار ساخته می‌شوند.">Username and password are auto-generated when left empty.</div></div>
     <div class="fg" id="fg-quick-secret-note" style="display:none;"><div class="hint" style="color:var(--text-3);font-size:0.85rem;" data-en="MTProto secret is derived per inbound after creation. WEB secret is auto-generated unless you type one in the Secret field." data-fa="سکرت MTProto پس از ایجاد برای هر اینباند ساخته می‌شود. سکرت WEB به‌صورت خودکار ساخته می‌شود مگر اینکه در فیلد سکرت بنویسید.">MTProto secret is derived per inbound after creation. WEB secret is auto-generated unless you type one in the Secret field.</div></div>
-    <div class="fg"><label class="fl" data-en="Traffic (GB)" data-fa="حجم (گیگ)">Traffic (GB)</label><input class="fi" type="number" id="quick-limit" value="0"></div>
-    <div class="fg"><label class="fl" data-en="Days" data-fa="روز">Days</label><input class="fi" type="number" id="quick-days" value="0"></div>
-    <button class="btn btn-primary" onclick="quickCreate()" style="width:100%;justify-content:center;" data-en="Create & Get Link" data-fa="ایجاد و دریافت لینک">Create & Get Link</button>
+    <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Traffic (GB)" data-fa="حجم (گیگ)">Traffic (GB)</span></label><input class="fi" type="number" id="quick-limit" value="0"></div>
+    <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Days" data-fa="روز">Days</span></label><input class="fi" type="number" id="quick-days" value="0"></div>
+    <button class="btn btn-primary" onclick="quickCreate()" style="width:100%;justify-content:center;"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></span><span data-en="Create & Get Link" data-fa="ایجاد و دریافت لینک">Create & Get Link</span></button>
   </div>
 </div>
 
 <div class="mo" id="mo-ip-profile" onclick="if(event.target===this) this.classList.remove('show')">
   <div class="mo-box">
     <button class="mo-close" onclick="document.getElementById('mo-ip-profile').classList.remove('show')"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></span></button>
-    <div class="mo-title" data-en="Manage IP Profile" data-fa="مدیریت پروفایل آی‌پی">Manage IP Profile</div>
-    <div class="fg"><label class="fl" data-en="Profile Name" data-fa="نام پروفایل">Profile Name</label><input class="fi" id="ip-profile-name"></div>
+    <div class="mo-title"><span class="ic" style="--ic:24px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/></svg></span> <span data-en="Manage IP Profile" data-fa="مدیریت پروفایل آی‌پی">Manage IP Profile</span></div>
+    <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Profile Name" data-fa="نام پروفایل">Profile Name</span></label><input class="fi" id="ip-profile-name"></div>
     <div class="fg">
-      <label class="fl" data-en="Addresses (one per line)" data-fa="آدرس‌ها (هر خط یک)">Addresses (one per line)</label>
+      <label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Addresses (one per line)" data-fa="آدرس‌ها (هر خط یک)">Addresses (one per line)</span></label>
       <textarea class="fi" id="ip-profile-addrs" rows="6" placeholder="1.1.1.1#MyServer+us+1
 8.8.8.8#Google+us
 example.com"></textarea>
@@ -19143,47 +19331,47 @@ example.com"></textarea>
     </div>
     <button class="btn btn-outline btn-sm" onclick="detectFlagsForProfile()" style="margin-top:6px;"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></span><span data-en="Auto-Detect Flags" data-fa="تشخیص خودکار پرچم‌ها">Auto-Detect Flags</span></button>
     <input type="hidden" id="ip-profile-id">
-    <button class="btn btn-primary" onclick="saveIpProfile()" style="width:100%;justify-content:center;margin-top:10px;" data-en="Save" data-fa="ذخیره">Save</button>
+    <button class="btn btn-primary" onclick="saveIpProfile()" style="width:100%;justify-content:center;margin-top:10px;"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg></span><span data-en="Save" data-fa="ذخیره">Save</span></button>
   </div>
 </div>
 
 <div class="mo" id="mo-scanner-profile" onclick="if(event.target===this) this.classList.remove('show')">
   <div class="mo-box">
     <button class="mo-close" onclick="document.getElementById('mo-scanner-profile').classList.remove('show')"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></span></button>
-    <div class="mo-title" data-en="Save as Profile" data-fa="ذخیره به‌عنوان پروفایل">Save as Profile</div>
-    <div class="fg"><label class="fl" data-en="Profile Name" data-fa="نام پروفایل">Profile Name</label><input class="fi" id="scanner-profile-name"></div>
-    <button class="btn btn-primary" onclick="saveScannerProfile()" style="width:100%;justify-content:center;margin-top:10px;" data-en="Save" data-fa="ذخیره">Save</button>
+    <div class="mo-title"><span class="ic" style="--ic:24px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg></span> <span data-en="Save as Profile" data-fa="ذخیره به‌عنوان پروفایل">Save as Profile</span></div>
+    <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Profile Name" data-fa="نام پروفایل">Profile Name</span></label><input class="fi" id="scanner-profile-name"></div>
+    <button class="btn btn-primary" onclick="saveScannerProfile()" style="width:100%;justify-content:center;margin-top:10px;"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg></span><span data-en="Save" data-fa="ذخیره">Save</span></button>
   </div>
 </div>
 <div class="mo" id="mo-proxy" onclick="if(event.target===this) this.classList.remove('show')">
   <div class="mo-box">
     <button class="mo-close" onclick="document.getElementById('mo-proxy').classList.remove('show')"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></span></button>
-    <div class="mo-title" data-en="Add/Edit Proxy" data-fa="افزودن/ویرایش پروکسی">Add/Edit Proxy</div>
+    <div class="mo-title"><span class="ic" style="--ic:24px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg></span> <span data-en="Add/Edit Proxy" data-fa="افزودن/ویرایش پروکسی">Add/Edit Proxy</span></div>
     <input type="hidden" id="proxy-id">
-    <div class="fg"><label class="fl" data-en="Name" data-fa="نام">Name</label><input class="fi" id="proxy-name"></div>
-    <div class="fg"><label class="fl" data-en="Type" data-fa="نوع">Type</label><select class="fs" id="proxy-type"><option value="socks5" data-en="SOCKS5" data-fa="SOCKS5">SOCKS5</option><option value="http" data-en="HTTP" data-fa="HTTP">HTTP</option></select></div>
-    <div class="fg"><label class="fl" data-en="Host" data-fa="هاست">Host</label><input class="fi" id="proxy-host"></div>
-    <div class="fg"><label class="fl" data-en="Port" data-fa="پورت">Port</label><input class="fi" type="number" id="proxy-port"></div>
-    <div class="fg"><label class="fl" data-en="Username" data-fa="نام کاربری">Username</label><input class="fi" id="proxy-username"></div>
-    <div class="fg"><label class="fl" data-en="Password" data-fa="رمز عبور">Password</label><input class="fi" type="password" id="proxy-password"></div>
-    <div class="fg"><label class="fl" data-en="Active" data-fa="فعال">Active</label><div class="toggle on" id="proxy-active" onclick="this.classList.toggle('on')"></div></div>
+    <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Name" data-fa="نام">Name</span></label><input class="fi" id="proxy-name"></div>
+    <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Type" data-fa="نوع">Type</span></label><select class="fs" id="proxy-type"><option value="socks5" data-en="SOCKS5" data-fa="SOCKS5">SOCKS5</option><option value="http" data-en="HTTP" data-fa="HTTP">HTTP</option></select></div>
+    <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Host" data-fa="هاست">Host</span></label><input class="fi" id="proxy-host"></div>
+    <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Port" data-fa="پورت">Port</span></label><input class="fi" type="number" id="proxy-port"></div>
+    <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Username" data-fa="نام کاربری">Username</span></label><input class="fi" id="proxy-username"></div>
+    <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Password" data-fa="رمز عبور">Password</span></label><input class="fi" type="password" id="proxy-password"></div>
+    <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Active" data-fa="فعال">Active</span></label><div class="toggle on" id="proxy-active" onclick="this.classList.toggle('on')"></div></div>
     <div class="fg">
-      <label class="fl" data-en="Bulk Import (one per line)" data-fa="افزودن گروهی (هر خط یک)">Bulk Import (one per line)</label>
+      <label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Bulk Import (one per line)" data-fa="افزودن گروهی (هر خط یک)">Bulk Import (one per line)</span></label>
       <textarea class="fi" id="proxy-bulk" rows="4" placeholder="ip:port@user:pass
 ip:port:user:pass
 ip:port
 host:port@user:pass"></textarea>
       <div class="fg" style="margin-top:6px;">
-        <label class="fl" data-en="Default Type (for lines without prefix)" data-fa="نوع پیش‌فرض (برای خطوط بدون پیشوند)">Default Type (for lines without prefix)</label>
+        <label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Default Type (for lines without prefix)" data-fa="نوع پیش‌فرض (برای خطوط بدون پیشوند)">Default Type (for lines without prefix)</span></label>
         <select class="fs" id="proxy-default-type">
           <option value="socks5" selected data-en="SOCKS5" data-fa="SOCKS5">SOCKS5</option>
           <option value="http" data-en="HTTP" data-fa="HTTP">HTTP</option>
         </select>
       </div>
-      <button class="btn btn-outline btn-sm" onclick="importProxiesBulk()" data-en="Add All" data-fa="افزودن همه">Add All</button>
+      <button class="btn btn-outline btn-sm" onclick="importProxiesBulk()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></span><span data-en="Add All" data-fa="افزودن همه">Add All</span></button>
     </div>
-    <button class="btn btn-primary" onclick="saveProxy()" style="width:100%; margin-top:10px;" data-en="Save" data-fa="ذخیره">Save</button>
-    <button class="btn btn-outline btn-sm" onclick="testProxyDirect(document.getElementById('proxy-id').value)" style="width:100%; margin-top:6px;" data-en="Test Connection" data-fa="تست اتصال">Test Connection</button>
+    <button class="btn btn-primary" onclick="saveProxy()" style="width:100%; margin-top:10px;"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg></span><span data-en="Save" data-fa="ذخیره">Save</span></button>
+    <button class="btn btn-outline btn-sm" onclick="testProxyDirect(document.getElementById('proxy-id').value)" style="width:100%; margin-top:6px;"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h6"/><path d="M10 3v6L4.5 19a2 2 0 0 0 1.8 3h11.4a2 2 0 0 0 1.8-3L14 9V3"/><path d="M7.5 14h9"/></svg></span><span data-en="Test Connection" data-fa="تست اتصال">Test Connection</span></button>
   </div>
 </div>
 <script>
@@ -19459,6 +19647,25 @@ const i18n = {
     addedProxies: 'Added {n} proxies',
     addedProxiesErrors: 'Added {n} proxies ({e} errors)',
     logSizeInfo: 'Log entries: {n}, Size: {size} KB',
+    remainingWord: 'Remaining',
+    copyLinkText: 'Copy link text',
+    activeCount: '{n} active',
+    ipsCount: '({n} IPs)',
+    diskFreeOf: '{free} GB free of {total} GB',
+    diskTitle: 'Disk: {path}',
+    notAvailable: 'N/A',
+    currentExpiry: 'Current expiry: {date}',
+    webSecretHex: 'WEB proxy secret must be 32 hex characters, optionally prefixed with dd',
+    proxyUserUsed: 'Proxy username "{user}" is already used by inbound "{label}"',
+    testLocalOnly: 'LOCAL ONLY',
+    testNotAvailable: 'NOT AVAILABLE',
+    testUnsupported: 'Unsupported',
+    dohDefault: 'Panel default (first upstream)',
+    usedOf: '{used} of {limit}',
+    sinceWord: 'Since',
+    dlLabel: 'DL',
+    ulLabel: 'UL',
+    'This Server is Free': 'This Server is Free',
     notUsableOnHost: '(not usable on this host)',
   },
   fa:{
@@ -19660,6 +19867,25 @@ const i18n = {
     addedProxies: '{n} پروکسی اضافه شد',
     addedProxiesErrors: '{n} پروکسی اضافه شد ({e} خطا)',
     logSizeInfo: 'ورودی‌های گزارش: {n}، حجم: {size} کیلوبایت',
+    remainingWord: 'باقی‌مانده',
+    copyLinkText: 'کپی متن لینک',
+    activeCount: '{n} فعال',
+    ipsCount: '({n} آی‌پی)',
+    diskFreeOf: '{free} گیگابایت آزاد از {total} گیگابایت',
+    diskTitle: 'دیسک: {path}',
+    notAvailable: 'ناموجود',
+    currentExpiry: 'انقضای فعلی: {date}',
+    webSecretHex: 'رمز پروکسی WEB باید ۳۲ کاراکتر هگز باشد، با پیشوند اختیاری dd',
+    proxyUserUsed: 'نام کاربری پروکسی «{user}» قبلاً توسط اینباند «{label}» استفاده شده است',
+    testLocalOnly: 'فقط داخلی',
+    testNotAvailable: 'در دسترس نیست',
+    testUnsupported: 'پشتیبانی نمی‌شود',
+    dohDefault: 'پیش‌فرض پنل (نخستین آپ‌استریم)',
+    usedOf: '{used} از {limit}',
+    sinceWord: 'از',
+    dlLabel: 'دانلود',
+    ulLabel: 'آپلود',
+    'This Server is Free': 'این سرور رایگان است',
     notUsableOnHost: '(در این هاست قابل استفاده نیست)',
   }
 };
@@ -20082,6 +20308,25 @@ const detailFa = {
   'telemt WEB child is not running for this inbound': 'فرزند WEB مربوط به telemt برای این اینباند در حال اجرا نیست',
   'upstream WEB proxy timed out': 'زمان پروکسی WEB upstream تمام شد',
   'user not active': 'کاربر فعال نیست',
+  'blocked by admin': 'توسط مدیر مسدود شده است',
+  'restricted by admin': 'توسط مدیر محدود شده است',
+  'session is not blocked': 'نشست مسدود نیست',
+  'upstreams must be a list': 'upstreamها باید فهرست باشند',
+  'invalid JSON body': 'بدنه JSON نامعتبر است',
+  'Invalid JSON body': 'بدنه JSON نامعتبر است',
+  'Invalid IP address': 'آدرس IP نامعتبر است',
+  'Invalid port': 'پورت نامعتبر است',
+  'Invalid port: must be 1 to 65535': 'پورت نامعتبر است: باید بین ۱ تا ۶۵۵۳۵ باشد',
+  'Invalid alpn: use smart, none, h2, http/1.1 or h3': 'alpn نامعتبر است: از smart یا none یا h2 یا http/1.1 یا h3 استفاده کنید',
+  'Invalid fingerprint: use chrome, firefox, safari, ios, android, edge, 360, qq, random, randomized or none': 'فینگرپرینت نامعتبر است: از chrome یا firefox یا safari یا ios یا android یا edge یا 360 یا qq یا random یا randomized یا none استفاده کنید',
+  'Invalid fragment: use tlshello or a range like 1-3': 'فرگمنت نامعتبر است: از tlshello یا بازه‌ای مثل 1-3 استفاده کنید',
+  'Invalid fragment_mode: use off or tlshello': 'fragment_mode نامعتبر است: از off یا tlshello استفاده کنید',
+  'Invalid path: must start with / and contain no spaces, ? or #': 'مسیر نامعتبر است: باید با / شروع شود و شامل فاصله یا ? یا # نباشد',
+  'Proxy port must be an integer between 1 and 65535': 'پورت پروکسی باید عددی صحیح بین ۱ تا ۶۵۵۳۵ باشد',
+  'Sing-box has no XHTTP transport in any upstream version, use the vless:// link, the Clash subscription (mihomo 1.19.22 or newer) or the Xray config instead': 'Sing-box در هیچ نسخه‌ای XHTTP ندارد؛ به‌جای آن از لینک vless:// یا اشتراک Clash (mihomo نسخه 1.19.22 یا جدیدتر) یا کانفیگ Xray استفاده کنید',
+  'WEB proxy secret must be 32 hex characters, optionally prefixed with dd': 'رمز پروکسی WEB باید ۳۲ کاراکتر هگز باشد، با پیشوند اختیاری dd',
+  'Default path must contain {uid} so the server can route each WebSocket inbound to its own link': 'مسیر پیش‌فرض باید شامل {uid} باشد تا سرور بتواند هر اینباند WebSocket را به لینک خودش هدایت کند',
+  'Invalid DoH URL: must be an https:// URL with a valid host': 'URL DoH نامعتبر است: باید یک URL با https:// و هاست معتبر باشد',
 };
 const detailFaPrefixes = [
   ['handshake accepted, upstream 127.0.0.1:9 refused as expected (close ', 'handshake پذیرفته شد، upstream 127.0.0.1:9 طبق انتظار رد شد (close '],
@@ -20135,6 +20380,14 @@ const detailFaPrefixes = [
   ['WEB proxy port ', 'پورت پروکسی WEB '],
   ['cannot reach ', 'دسترسی به '],
   ['Proxy error: ', 'خطای پروکسی: '],
+  ['Invalid DoH upstream URL: ', 'URL upstream DoH نامعتبر است: '],
+  ['Invalid ECH DoH URL: ', 'URL DoH برای ECH نامعتبر است: '],
+  ['Invalid host name for ', 'نام هاست نامعتبر برای '],
+  ["Custom path '", "مسیر سفارشی '"],
+  ["WebSocket path '", "مسیر WebSocket '"],
+  ["Default WebSocket path '", "مسیر پیش‌فرض WebSocket '"],
+  ['Backup cannot be restored: ', 'بازیابی پشتیبان ممکن نیست: '],
+  ['TG_WEB_SECRET for uid ', 'TG_WEB_SECRET برای uid '],
 ];
 const detailFaSuffix = [' Use the WEB proxy instead: create a Telegram WEB proxy inbound on port 443, it rides the panel HTTPS port and works on this host.', ' به‌جای آن از پروکسی WEB استفاده کنید: یک اینباند پروکسی WEB تلگرام روی پورت 443 بسازید؛ روی پورت HTTPS پنل سوار می‌شود و در این هاست کار می‌کند.'];
 function trDetail(s){
@@ -20230,7 +20483,14 @@ const ICONS={
   'tg-notify':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>',
   'tg-reports':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/></svg>',
   'telegram-link':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>',
-  'logging':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>'
+  'logging':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>',
+  'about':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>',
+  'fork':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><path d="M18 9v2c0 .6-.4 1-1 1H7c-.6 0-1-.4-1-1V9"/><path d="M12 12v3"/></svg>',
+  'github':'<svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z"/></svg>',
+  'cpu':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg>',
+  'memory':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="20" height="12" rx="2"/><line x1="6" y1="19" x2="6" y2="22"/><line x1="10" y1="19" x2="10" y2="22"/><line x1="14" y1="19" x2="14" y2="22"/><line x1="18" y1="19" x2="18" y2="22"/><line x1="6" y1="7" x2="6" y2="4"/><line x1="10" y1="7" x2="10" y2="4"/><line x1="14" y1="7" x2="14" y2="4"/><line x1="18" y1="7" x2="18" y2="4"/></svg>',
+  'chart':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>',
+  'label':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>'
 };
 function icon(name,size){return '<span class="ic" style="--ic:'+(size||18)+'px" aria-hidden="true">'+(ICONS[name]||ICONS.info)+'</span>';}
 function cssVar(n){return getComputedStyle(document.documentElement).getPropertyValue(n).trim();}
@@ -20590,6 +20850,8 @@ function applyRestrictionToForm(context, pr) {
   const pre = context === 'edit' ? 'e' : 'a';
   const fragMode = $m(pre + 'frag-mode');
   if (fragMode) { fragMode.value = pr.fragment_mode; toggleFragmentFields(context); }
+  const fragHidden = $m(pre + 'frag');
+  if (fragHidden) fragHidden.value = pr.fragment_mode === 'tlshello' ? 'tlshello' : '';
   const fragLen = $m(pre + 'frag-length');
   if (fragLen) fragLen.value = pr.fragment_length;
   const fragInt = $m(pre + 'frag-interval');
@@ -20712,12 +20974,12 @@ function renderEffectiveParams(context) {
   if (!box) return;
   const pre = context === 'edit' ? 'e' : 'a';
   const profileSel = $m(pre + 'res-profile');
-  const profile = profileSel ? (profileSel.value || 'default') : 'default';
+  const profile = profileSel ? (profileSel.value || 'custom') : 'default';
   const fragModeEl = $m(pre + 'frag-mode');
   const fragMode = fragModeEl ? fragModeEl.value : 'off';
   const fragLen = ($m(pre + 'frag-length')?.value || '100-200').trim() || '100-200';
   const fragInt = ($m(pre + 'frag-interval')?.value || '10-20').trim() || '10-20';
-  let fragText = 'off';
+  let fragText = t('off');
   if (fragMode === 'tlshello') fragText = 'tlshello, ' + fragLen + ', ' + fragInt;
   else if (fragMode === 'range') fragText = '1-3, ' + fragLen + ', ' + fragInt;
   const fpSel = $m(pre + 'fingerprint-sel');
@@ -20727,16 +20989,16 @@ function renderEffectiveParams(context) {
   let alpnText = '';
   if (alpnSel) alpnText = alpnSel.value === 'custom' ? (($m(pre + 'alpn-custom')?.value || '').trim() || 'custom') : (alpnSel.value || '');
   const echOn = $m('ech-' + context)?.classList.contains('on');
-  let echText = 'off';
+  let echText = t('off');
   if (echOn) {
     const echSni = ($m('ech-sni-' + context)?.value || '').trim();
     const echDoh = ($m('ech-doh-' + context)?.value || '').trim();
-    echText = 'on' + (echSni ? ' (' + echSni + ')' : '') + (echDoh ? ' + ' + echDoh : '');
+    echText = t('on') + (echSni ? ' (' + echSni + ')' : '') + (echDoh ? ' + ' + echDoh : '');
   }
-  const onOff = (id) => ($m(id)?.classList.contains('on') ? 'on' : 'off');
+  const onOff = (id) => ($m(id)?.classList.contains('on') ? t('on') : t('off'));
   const dnsSel = $m(context === 'edit' ? 'xray-dns-mode' : 'xray-dns-mode-create');
   const dnsMode = dnsSel ? dnsSel.value : 'direct';
-  let dnsText = 'Direct (1.1.1.1, 8.8.8.8)';
+  let dnsText = lang === 'fa' ? 'مستقیم (1.1.1.1, 8.8.8.8)' : 'Direct (1.1.1.1, 8.8.8.8)';
   if (dnsMode === 'doh') {
     const dohInput = ($m(context === 'edit' ? 'xray-doh-url' : 'xray-doh-url-create')?.value || '').trim();
     const dohResolved = dohInput || (_dohUpstreamCache[0] || 'https://cloudflare-dns.com/dns-query');
@@ -20744,12 +21006,16 @@ function renderEffectiveParams(context) {
   } else if (dnsMode === 'fakedns') {
     dnsText = 'FakeDNS (198.18.0.0/15)';
   }
+  const profileFa = {'': 'سفارشی', 'default': 'پیش‌فرض', 'normal': 'عادی', 'relative': 'محدودیت نسبی', 'severe': 'محدودیت شدید', 'emergency': 'اضطراری'}[profile] || profile;
+  const fpFa = fpText === 'none' ? 'هیچ‌کدام' : fpText === 'random' ? 'تصادفی' : fpText === 'randomized' ? 'تصادفی‌سازی‌شده' : fpText === 'custom' ? 'سفارشی' : fpText;
+  const alpnFa = alpnText === 'smart' ? 'هوشمند' : alpnText === 'none' ? 'هیچ‌کدام' : alpnText === 'custom' ? 'سفارشی' : alpnText;
+  const profileNote = profile === 'default' ? (lang === 'fa' ? ' (تنظیمات یکسان با Normal)' : ' (same settings as Normal)') : profile === 'normal' ? (lang === 'fa' ? ' (تنظیمات یکسان با Default)' : ' (same settings as Default)') : '';
   const lines = [
-    'Profile: ' + profile,
-    'Fragment: ' + fragText,
-    'Fingerprint: ' + (fpText || 'chrome') + ' · ALPN: ' + (alpnText || 'smart'),
+    (lang === 'fa' ? 'پروفایل: ' : 'Profile: ') + (lang === 'fa' ? profileFa : profile) + profileNote,
+    (lang === 'fa' ? 'فرگمنت: ' : 'Fragment: ') + fragText,
+    (lang === 'fa' ? 'فینگرپرینت: ' : 'Fingerprint: ') + ((lang === 'fa' ? fpFa : fpText) || 'chrome') + ' · ALPN: ' + ((lang === 'fa' ? alpnFa : alpnText) || 'smart'),
     'ECH: ' + echText,
-    'Random path: ' + onOff('random-' + context) + ' · TFO: ' + onOff('tfo-' + context) + ' · UDP: ' + onOff('udp-' + context) + ' · IPv6: ' + onOff('ipv6-' + context),
+    (lang === 'fa' ? 'مسیر تصادفی: ' : 'Random path: ') + onOff('random-' + context) + ' · TFO: ' + onOff('tfo-' + context) + ' · UDP: ' + onOff('udp-' + context) + ' · IPv6: ' + onOff('ipv6-' + context),
     'DNS: ' + dnsText
   ];
   box.textContent = lines.join('\n');
@@ -20783,7 +21049,7 @@ async function loadDohUpstreamsForSelect(context, currentUrl) {
   sel.innerHTML = '';
   const defOpt = document.createElement('option');
   defOpt.value = '';
-  defOpt.textContent = 'Panel default (first upstream)';
+  defOpt.textContent = t('dohDefault');
   sel.appendChild(defOpt);
   _dohUpstreamCache.forEach(u => {
     const opt = document.createElement('option');
@@ -21171,6 +21437,11 @@ function setLang(l){
     renderAddrs();
     filterLinks();
     if ($m('page-inbounds') && $m('page-inbounds').classList.contains('active') && $m('inb-out-body') && $m('inb-out-body').getAttribute('data-loaded') === '1') { loadInbOutCard(); }
+    safeCall(loadTelegramSettings);
+    safeCall(loadStats);
+    try { if (speedChart) { speedChart.data.datasets[0].label = t('dlLabel'); speedChart.data.datasets[1].label = t('ulLabel'); speedChart.update(); } } catch(e) {}
+    if ($m('mo-add') && $m('mo-add').classList.contains('show')) { renderEffectiveParams('create'); loadDohUpstreamsForSelect('create', $m('xray-doh-url-create') ? $m('xray-doh-url-create').value : ''); updateExpiryPreview('create'); }
+    if ($m('mo-edit') && $m('mo-edit').classList.contains('show')) { renderEffectiveParams('edit'); loadDohUpstreamsForSelect('edit', $m('xray-doh-url') ? $m('xray-doh-url').value : ''); const _eu = $m('eu') ? $m('eu').value : ''; const _el = _eu ? allLinks.find(x => x.uuid === _eu) : null; if (_el) { const _ce = $m('consumed-edit'); if (_ce) _ce.textContent = _el.limit_bytes > 0 ? t('consumedLine', {used: fmtB(_el.used_bytes || 0), limit: fmtB(_el.limit_bytes), pct: Math.min(100, Math.round((_el.used_bytes || 0) / _el.limit_bytes * 100))}) : t('consumedLineNoLimit', {used: fmtB(_el.used_bytes || 0)}); const _ep = $m('expires-preview-edit'); if (_ep) _ep.textContent = _el.expires_at ? t('currentExpiry', {date: new Date(_el.expires_at).toLocaleDateString(lang === 'fa' ? 'fa-IR' : 'en-CA') + ' ' + new Date(_el.expires_at).toLocaleTimeString('en-GB', {hour:'2-digit', minute:'2-digit'})}) : ''; } }
   }
   const footer = $m('footer-dedication');
   if (footer) footer.innerHTML = footerTexts[l] || footerTexts['en'];
@@ -21431,6 +21702,25 @@ async function showDashboard(){
 
 }
 
+function loadGhCounts(){
+  var starsEl=document.getElementById('gh-stars');
+  var forksEl=document.getElementById('gh-forks');
+  if(!starsEl||!forksEl) return;
+  var cached=null;
+  try{ cached=JSON.parse(localStorage.getItem('sulgx-gh-counts')||'null'); }catch(e){ cached=null; }
+  function showCounts(c){
+    if(!c) return;
+    if(typeof c.stars==='number') starsEl.textContent=c.stars.toLocaleString('en-US');
+    if(typeof c.forks==='number') forksEl.textContent=c.forks.toLocaleString('en-US');
+  }
+  showCounts(cached);
+  fetch('https://api.github.com/repos/SulgX/SulgX-Panel').then(function(r){ if(!r.ok) throw new Error('gh'); return r.json(); }).then(function(d){
+    var counts={stars:d.stargazers_count,forks:d.forks_count};
+    if(typeof counts.stars!=='number'||typeof counts.forks!=='number') return;
+    showCounts(counts);
+    try{ localStorage.setItem('sulgx-gh-counts',JSON.stringify(counts)); }catch(e){}
+  }).catch(function(){});
+}
 function startPanelClock() {
   setInterval(() => {
     const d = new Date();
@@ -21510,7 +21800,7 @@ function inbOutCardHtml(c){
   let h='<div style="border:1px solid var(--border);border-radius:12px;padding:12px;background:var(--surface);min-width:0;">'
     +'<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">'
     +'<span style="width:8px;height:8px;border-radius:50%;background:'+dot+';flex:none;"></span>'
-    +'<b>'+esc(c.name||'')+'</b>'
+    +'<b>'+esc(lang==='fa'?(c.name==='HTTP proxy'?'پروکسی HTTP':c.name==='WEB proxy'?'پروکسی WEB':(c.name||'')):(c.name||''))+'</b>'
     +'<span class="tag '+tagCls+'">'+lbl+'</span>'
     +'<span style="margin-inline-start:auto;color:var(--text-3);font-size:0.85rem;">'+portLbl+': <span style="direction:ltr;display:inline-block;">'+esc(String(c.port||'—'))+'</span></span>'
     +'</div>';
@@ -21528,7 +21818,7 @@ async function loadInbOutCard(){
     const cards=di.listener_cards.map(c=>inbOutCardHtml(c)).join('');
     const headIn=(lang==='fa'?'اینباندها (WS/XHTTP روی پورت ':'Inbounds (WS/XHTTP on port ')+esc(String(pubPort))+')';
     const headOut=lang==='fa'?'خروجی‌ها (پروکسی لاین‌ها)':'Outbounds (proxy lines)';
-    const out=(dout.proxy_lines||[]).map(x=>'<div style="padding:6px 0;border-bottom:1px solid var(--border);"><b>'+esc(x.host||'')+':'+esc(String(x.port||''))+'</b> <span class="tag">'+esc(x.protocol||'')+'</span><div style="color:var(--text-3);font-size:0.85rem;">'+(x.flag?'<span class="cc">'+esc(x.flag)+'</span> ':'')+(x.last_test_status?esc(x.last_test_status)+' '+esc(String(x.last_latency_ms||0))+'ms':'')+'</div></div>').join('')||'<div>'+t('noProxyLines')+'</div>';
+    const out=(dout.proxy_lines||[]).map(x=>'<div style="padding:6px 0;border-bottom:1px solid var(--border);"><b>'+esc(x.host||'')+':'+esc(String(x.port||''))+'</b> <span class="tag">'+esc(x.protocol||'')+'</span><div style="color:var(--text-3);font-size:0.85rem;">'+(x.flag?'<span class="cc">'+esc(x.flag)+'</span> ':'')+(x.last_test_status?esc(x.last_test_status==='error'?t('failed'):x.last_test_status==='unsupported'?t('testUnsupported'):x.last_test_status)+' '+esc(String(x.last_latency_ms||0))+'ms':'')+'</div></div>').join('')||'<div>'+t('noProxyLines')+'</div>';
     if(body){body.innerHTML='<div style="min-width:0;grid-column:1/-1;"><div class="card-title" style="margin-bottom:6px;">'+headIn+'</div></div>'+cards+'<div style="min-width:0;grid-column:1/-1;"><div class="card-title" style="margin-bottom:6px;">'+headOut+'</div>'+out+'</div>';body.setAttribute('data-loaded','1');}
     return true;
   }catch(e){ const b=$m('inb-out-body'); if(b)b.innerHTML='<div style="color:var(--danger);font-size:0.9rem;">'+(lang==='fa'?'بارگذاری ورودی‌ها و خروجی‌ها ناموفق بود: ':'Failed to load Inbounds and Outbounds: ')+esc(String(e&&e.message?e.message:e))+'</div><button class="btn btn-outline btn-sm" style="margin-top:8px;" onclick="loadInbOutCard()">'+(lang==='fa'?'تلاش دوباره':'Retry')+'</button>'; return false; }
@@ -21588,7 +21878,7 @@ async function loadTgProxyCard(){
   }catch(e){ if(body) body.innerHTML = '<div>'+(lang==='fa'?'بارگذاری وضعیت پروکسی تلگرام ناموفق بود.':'Failed to load Telegram proxy status.')+'</div>'; toast(lang==='fa'?'بارگذاری وضعیت پروکسی تلگرام ناموفق بود':'Failed to load Telegram proxy status', true); return false; }
   finally{ if(btn){ btn.disabled = false; btn.textContent = btn.getAttribute('data-' + (document.body.dir === 'rtl' ? 'fa' : 'en')) || 'Refresh'; } }
 }
-var SXPAGES=['dashboard','inbounds','active-users','addresses','ipscanner','logs','telegram','settings'];
+var SXPAGES=['dashboard','inbounds','active-users','addresses','ipscanner','logs','telegram','settings','about'];
 function pageFromLocation(){
   var h='';
   try{ h=(window.location.hash||'').replace(/^#\/?/,''); }catch(e){ h=''; }
@@ -21664,10 +21954,10 @@ function fmtExp(ea) {
     const d = new Date(ea) - new Date();
     if (d <= 0) return t('expired');
     const days = Math.floor(d / 86400000);
-    if (days > 0) return days + 'd';
+    if (days > 0) return lang === 'fa' ? days + ' روز' : days + 'd';
     const hours = Math.floor(d / 3600000);
-    if (hours > 0) return hours + 'h';
-    return Math.floor(d / 60000) + 'm';
+    if (hours > 0) return lang === 'fa' ? hours + ' ساعت' : hours + 'h';
+    return lang === 'fa' ? Math.floor(d / 60000) + ' دقیقه' : Math.floor(d / 60000) + 'm';
 }
 
 function setFilter(f, el) {
@@ -21689,7 +21979,7 @@ function filterLinks() {
     updDoughnutChart();
 }
 function numUsed(l){const v=Number(l&&l.used_bytes)||0;return v>0?v:0;}
-function linkDisplayLabel(l){const f=l&&l.flag?codeText(l.flag):'';return (f?f+' ':'')+(l&&l.label?l.label:'');}
+function linkDisplayLabel(l){const f=l&&l.flag?codeText(l.flag):'';const lbl=(l&&l.label==='This Server is Free')?t('This Server is Free'):(l&&l.label?l.label:'');return (f?f+' ':'')+lbl;}
 function usageRows(){return usageViewReady?lastVisibleLinks:allLinks;}
 function usageTotal(rows){return (rows||[]).reduce((s,l)=>s+numUsed(l),0);}
 
@@ -21703,7 +21993,7 @@ function testCellHtml(l){
   if(!v) return '<span style="color:var(--text-3);font-size:0.8rem;">–</span>';
   const ms = (l.last_test_ms !== undefined && l.last_test_ms !== null) ? l.last_test_ms + 'ms' : '';
   const col = v === 'pass' ? 'var(--success)' : v === 'fail' ? 'var(--danger)' : v === 'local_only' ? 'var(--warning)' : 'var(--text-3)';
-  const label = v === 'pass' ? 'OK' : v === 'fail' ? 'FAIL' : v === 'local_only' ? 'LOCAL ONLY' : 'N/A';
+  const label = v === 'pass' ? 'OK' : v === 'fail' ? 'FAIL' : v === 'local_only' ? t('testLocalOnly') : 'N/A';
   const tgt = l.last_test_target ? '<div style="font-size:0.75rem;color:var(--text-3);direction:ltr;text-align:left;word-break:break-all;">' + esc(l.last_test_target) + '</div>' : '';
   return '<span title="' + esc(trDetail(l.last_test_detail) || '') + '" style="color:' + col + ';font-weight:700;font-size:0.85rem;white-space:nowrap;">' + label + ' ' + ms + '</span>' + tgt;
 }
@@ -21754,15 +22044,15 @@ function renderLinks(links) {
               udpEnabled = l.udp_enabled !== undefined ? l.udp_enabled : true,
               isProxy = ['socks5', 'mtproto', 'webproxy', 'http-proxy'].includes(l.protocol),
               nativeLink = l.vless_link || (l.proxy && l.proxy.protocol_link) || '';
-        const linkTextHtml = nativeLink ? `<div class="row-link-text" style="display:none;padding:4px 0 8px;"><input readonly value="${esc(nativeLink)}" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--surface-3);color:var(--text);font-size:0.85rem;direction:ltr;text-align:left;"><button class="btn btn-outline btn-sm" style="margin-top:4px;" onclick="copyToClipboard(this.previousElementSibling.value)">Copy link text</button></div>` : `<div class="row-link-text" style="display:none;padding:4px 0 8px;color:var(--danger);font-size:0.85rem;">listener disabled — no working link</div>`;
+        const linkTextHtml = nativeLink ? `<div class="row-link-text" style="display:none;padding:4px 0 8px;"><input readonly value="${esc(nativeLink)}" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--surface-3);color:var(--text);font-size:0.85rem;direction:ltr;text-align:left;"><button class="btn btn-outline btn-sm" style="margin-top:4px;" onclick="copyToClipboard(this.previousElementSibling.value)">${t('copyLinkText')}</button></div>` : `<div class="row-link-text" style="display:none;padding:4px 0 8px;color:var(--danger);font-size:0.85rem;">${t('listenerDisabledNote')}</div>`;
         const actGrid = rowActGrid(l, nativeLink, isProxy);
 
         tableBuffer += `<tr>
           <td><input type="checkbox" value="${esc(l.uuid)}" ${check} onchange="toggleSelectUid('${esc(l.uuid)}')"></td>
-          <td data-label="Name" dir="auto" style="font-weight:600">${labelDisplay}</td>
-          <td data-label="Owner" dir="auto">${esc(l.owner_name || '')}</td>
+          <td data-label="Name" dir="auto" style="font-weight:600" title="${esc(linkDisplayLabel(l))}">${labelDisplay}</td>
+          <td data-label="Owner" dir="auto" title="${esc(l.owner_name || '')}">${esc(l.owner_name || '')}</td>
           <td data-label="Type"><span class="tag tag-vless">${esc(protoShort(l.protocol))}</span></td>
-          <td data-label="Usage" style="white-space:nowrap"><div class="pill"><span class="pill-used num">${fmtB(u)}</span><div class="pill-bar"><div class="pill-fill" style="width:${pct}%;background:${col}"></div></div><span class="num">${fmtLim(lim)}</span></div><div style="font-size:0.8rem;color:var(--text-2)">Remaining ${lim ? fmtB(Math.max(0, lim - u)) : '∞'}</div></td>
+          <td data-label="Usage" style="white-space:nowrap"><div class="pill"><span class="pill-used num">${fmtB(u)}</span><div class="pill-bar"><div class="pill-fill" style="width:${pct}%;background:${col}"></div></div><span class="num">${fmtLim(lim)}</span></div><div style="font-size:0.8rem;color:var(--text-2)">${t('remainingWord')} ${lim ? fmtB(Math.max(0, lim - u)) : '∞'}</div></td>
           <td data-label="Conns">${cc}/${mc2 || '∞'}</td>
           <td data-label="Expiry" style="color:${ec}">${ex}</td>
           <td data-label="Status"><span class="tag ${l.active ? 'tag-on' : 'tag-off'}">${l.active ? t('on') : t('off')}</span></td>
@@ -21770,7 +22060,7 @@ function renderLinks(links) {
           <td data-label="Actions" style="min-width:224px;">
             <div class="row-act-wrap">
               <div class="row-act-top">
-                <button class="toggle ${l.active ? 'on' : ''}" data-uid="${esc(l.uuid)}" onclick="togLink(this)" title="On / Off"></button>
+                <button class="toggle ${l.active ? 'on' : ''}" data-uid="${esc(l.uuid)}" onclick="togLink(this)" title="${t('on')} / ${t('off')}"></button>
               </div>
               ${actGrid}
             </div>
@@ -21819,7 +22109,7 @@ async function testInbound(uid, btn){
     const l=allLinks.find(x=>x.uuid===uid);
     if(l){l.last_test_ok=d.ok?1:0;l.last_test_ms=d.latency_ms;l.last_test_detail=d.detail;l.last_test_target=d.target;l.last_test_verdict=d.verdict;filterLinks();}
     const v=d.verdict||(d.ok?'pass':'fail');
-    const vlabel=v==='pass'?'OK':v==='local_only'?'LOCAL ONLY':v==='not_available'?'NOT AVAILABLE':'FAIL';
+    const vlabel=v==='pass'?'OK':v==='local_only'?t('testLocalOnly'):v==='not_available'?t('testNotAvailable'):'FAIL';
     toast(vlabel+' ('+d.protocol+', '+d.latency_ms+'ms) '+(d.target||'')+': '+trDetail(d.detail), v==='fail');
   }catch(e){
     if (testCell) testCell.innerHTML = prevCellHtml;
@@ -21889,7 +22179,7 @@ async function quickCreate(){
   if(protocol==='trojan-ws'){ const pw=($m('quick-password').value||'').trim(); if(pw){ if(!uuidRe.test(pw)){ toast(t('trojanPasswordUuid'), true); return; } body.password=pw; } }
   else if(protocol==='ss-ws'){ body.ss_method=$m('quick-ss-method').value||'2022-blake3-aes-256-gcm'; const sp=($m('quick-ss-password').value||'').trim(); if(sp) body.ss_password=sp; }
   else if(protocol==='mtproto'){ body.mtproto_variant=$m('quick-mtproto-variant').value||'dd'; if(body.mtproto_variant==='faketls') body.mtproto_domain=($m('quick-mtproto-domain').value||'').trim()||'www.google.com'; }
-  else if(protocol==='webproxy'){ body.port=parseInt($m('quick-webproxy-port').value)||443; const qs=($m('quick-webproxy-secret').value||'').trim(); if(qs){ if(!/^(dd)?[0-9a-fA-F]{32}$/.test(qs)){ toast('WEB proxy secret must be 32 hex characters, optionally prefixed with dd', true); return; } body.webproxy_secret=qs; } }
+  else if(protocol==='webproxy'){ body.port=parseInt($m('quick-webproxy-port').value)||443; const qs=($m('quick-webproxy-secret').value||'').trim(); if(qs){ if(!/^(dd)?[0-9a-fA-F]{32}$/.test(qs)){ toast(t('webSecretHex'), true); return; } body.webproxy_secret=qs; } }
   else if(protocol==='socks5'||protocol==='http-proxy'||protocol==='mtproto'){ const qp=parseInt($m('quick-proxy-port').value)||0; if(qp) body.port=qp; }
   else { const u=($m('quick-uuid').value||'').trim(); if(u){ if(!uuidRe.test(u)){ toast(t('invalidUuid'), true); return; } body.uuid=u; } }
   try{const r=await authenticatedFetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!r.ok)throw new Error(trDetail((await r.json()).detail));const data=await r.json();$m('mo-quick-add').classList.remove('show');const userUrl='https://'+location.host+'/user/'+data.uuid;toast(t('createdPrefix')+userUrl);loadLinks();loadStats();}catch(e){toast(t('errorPrefix')+e.message,true);}}
@@ -21905,6 +22195,7 @@ function showAddMo(){
   prefillInboundDefaults('create', {});
   loadDohUpstreamsForSelect('create', '');
   bindEffectiveParams('create');
+  applyProfileCreate();
   renderEffectiveParams('create');
 }
 function protoShort(p){
@@ -21925,7 +22216,7 @@ function renderActiveUsers(sessions){
   const box = $m('active-users-cards');
   if(!box) return;
   const sum = $m('active-users-summary');
-  if(sum) sum.textContent = (sessions||[]).length + ' active';
+  if(sum) sum.textContent = t('activeCount', {n: (sessions||[]).length});
   if(!sessions || !sessions.length){ box.innerHTML = '<div style="color:var(--text-2);">' + t('noActiveUsers') + '</div>'; return; }
   box.innerHTML = sessions.map((s, idx) => {
     const dests = s.destinations || [];
@@ -21940,7 +22231,7 @@ function renderActiveUsers(sessions){
     + '<div style="font-size:0.85rem;color:var(--text-2);margin-top:6px;">' + esc(s.user || '') + ' · ' + esc(s.inbound_tag || '') + (s.outbound_proxy ? ' · ' + esc(s.outbound_proxy) : '') + ' · ' + esc(s.outbound_mode || '') + '</div>'
     + '<div style="font-size:0.85rem;margin-top:6px;">↑ ' + fmtBps(s.up_bps) + ' &nbsp; ↓ ' + fmtBps(s.down_bps) + '</div>'
     + '<div style="font-size:0.85rem;">' + t('totalWord') + ' ↑ <span class="num">' + fmtB(s.bytes_up) + '</span> &nbsp; ↓ <span class="num">' + fmtB(s.bytes_down) + '</span></div>'
-    + '<div style="font-size:0.85rem;color:var(--text-2);">' + esc(s.subnet || ips.join(', ') || '') + ' · Since ' + esc(s.started_at || '') + '</div>'
+    + '<div style="font-size:0.85rem;color:var(--text-2);">' + esc(s.subnet || ips.join(', ') || '') + ' · ' + t('sinceWord') + ' ' + esc(s.started_at || '') + '</div>'
     + (ipRows || '')
     + '<div style="font-size:0.85rem;">' + t('quotaLeft') + ' ' + (s.quota_remaining === null || s.quota_remaining === undefined ? '∞' : '<span class="num">' + fmtB(s.quota_remaining) + '</span>') + ' · ' + t('sessionsOnLink') + ' ' + (s.session_count || s.link_sessions || 0) + '/' + (s.max_connections || '∞') + '</div>'
     + '<div style="display:flex;gap:8px;margin-top:8px;"><button class="btn btn-outline btn-sm" id="aud-btn-' + idx + '" onclick="toggleActiveUserDetails(' + idx + ', \'' + esc(s.conn_id) + '\')">' + t('detailsBtn') + '</button>'
@@ -21990,7 +22281,7 @@ async function loadBlockedUsers(){
     const d = await r.json();
     const rows = d.blocked || [];
     if(!rows.length){ box.innerHTML = '<div style="color:var(--text-2);">' + t('noBlockedUsers') + '</div>'; return; }
-    box.innerHTML = rows.map(row => '<div style="display:flex;justify-content:space-between;gap:8px;align-items:center;font-size:0.85rem;padding:8px 0;border-top:1px solid var(--border);"><span><b>' + esc(row.label || row.uid || '') + '</b> · ' + esc(row.protocol || '') + '<br><span style="color:var(--text-2);">IP ' + esc(row.ip || '') + ' · ' + esc(row.created_at || '') + (row.reason ? ' · ' + esc(row.reason) : '') + '</span></span><button class="btn btn-outline btn-sm" onclick="unblockSession(\'' + esc(row.uid) + '\', \'' + esc(row.ip) + '\')">' + t('unblockBtn') + '</button></div>').join('');
+    box.innerHTML = rows.map(row => '<div style="display:flex;justify-content:space-between;gap:8px;align-items:center;font-size:0.85rem;padding:8px 0;border-top:1px solid var(--border);"><span><b>' + esc(row.label || row.uid || '') + '</b> · ' + esc(row.protocol || '') + '<br><span style="color:var(--text-2);">IP ' + esc(row.ip || '') + ' · ' + esc(row.created_at || '') + (row.reason ? ' · ' + esc(trDetail(row.reason || '')) : '') + '</span></span><button class="btn btn-outline btn-sm" onclick="unblockSession(\'' + esc(row.uid) + '\', \'' + esc(row.ip) + '\')">' + t('unblockBtn') + '</button></div>').join('');
   }catch(e){ box.innerHTML = '<div style="color:var(--text-2);">' + t('Error') + '</div>'; }
 }
 async function unblockSession(uid, ip){
@@ -22026,13 +22317,16 @@ function proxyInfoText(proto, info){
   const st = (info && info.proxy_status) || {};
   const on = (k) => { const key = k === 'mtproto' ? 'mtproxy' : k; return st[key] && st[key].enabled; };
   const single = !!(info && info.single_port_host);
-  const deadNote = single ? ' (cannot work on this host - a single HTTPS port cannot publish raw TCP listeners, so this inbound cannot work here. Use the WEB proxy instead: create a Telegram WEB proxy inbound on port 443)' : ' (DISABLED on this host - raw TCP listener is not running)';
-  if(proto === 'socks5') return 'SOCKS5 listens on the port you choose for this inbound (default 1080)' + (on('socks') ? ' (multiplexer running)' : deadNote) + '. Auth is the link UUID for user and password. Destinations restricted, TCP CONNECT, no UDP.';
-  if(proto === 'mtproto') return 'MTProto listens on the port you choose for this inbound (default 8443)' + (on('mtproto') ? ' (multiplexer running)' : deadNote) + '. Each inbound has its own derived secret, so quota and the 1-user limit apply per inbound.';
-  if(proto === 'webproxy') return 'WEB proxy rides the panel HTTPS port, so it works on Cloady, Render and Railway. Port 443 is shared: each user gets their own link with its own token and secret in the tg://webproxy link.' + (single ? ' On this single-port host only port 443 works - other WEB ports are not published here.' : ' Other ports serve the same token-routed bridge on the port you choose.');
-  if(proto === 'http-proxy') return 'HTTP proxy listens on the port you choose for this inbound (default 3128)' + (on('http') ? ' (multiplexer running)' : deadNote) + '. CONNECT only, Basic auth is the link UUID, destinations restricted, not an open web proxy.';
+  const fa = lang === 'fa';
+  const deadNote = single ? (fa ? ' (روی این هاست کار نمی‌کند — یک پورت HTTPS نمی‌تواند شنونده TCP خام منتشر کند، پس این اینباند اینجا کار نمی‌کند. به‌جای آن از پروکسی WEB استفاده کنید: یک اینباند پروکسی WEB تلگرام روی پورت 443 بسازید)' : ' (cannot work on this host - a single HTTPS port cannot publish raw TCP listeners, so this inbound cannot work here. Use the WEB proxy instead: create a Telegram WEB proxy inbound on port 443)') : (fa ? ' (روی این هاست غیرفعال است — شنونده TCP خام در حال اجرا نیست)' : ' (DISABLED on this host - raw TCP listener is not running)');
+  const runningNote = fa ? ' (مالتی‌پلکسر در حال اجراست)' : ' (multiplexer running)';
+  if(proto === 'socks5') return (fa ? 'SOCKS5 روی پورتی که برای این اینباند انتخاب می‌کنید گوش می‌دهد (پیش‌فرض 1080)' : 'SOCKS5 listens on the port you choose for this inbound (default 1080)') + (on('socks') ? runningNote : deadNote) + (fa ? '. احراز هویت همان UUID لینک است برای نام کاربری و گذرواژه. مقصدها محدود شده‌اند، فقط TCP CONNECT، بدون UDP.' : '. Auth is the link UUID for user and password. Destinations restricted, TCP CONNECT, no UDP.');
+  if(proto === 'mtproto') return (fa ? 'MTProto روی پورتی که برای این اینباند انتخاب می‌کنید گوش می‌دهد (پیش‌فرض 8443)' : 'MTProto listens on the port you choose for this inbound (default 8443)') + (on('mtproto') ? runningNote : deadNote) + (fa ? '. هر اینباند رمز مشتق‌شده خودش را دارد، پس سهمیه و محدودیت یک کاربر برای هر اینباند جداگانه اعمال می‌شود.' : '. Each inbound has its own derived secret, so quota and the 1-user limit apply per inbound.');
+  if(proto === 'webproxy') return (fa ? 'پروکسی WEB روی پورت HTTPS پنل سوار می‌شود، پس روی Cloady و Render و Railway کار می‌کند. پورت 443 مشترک است: هر کاربر لینک خودش را با توکن و رمز خودش در لینک tg://webproxy می‌گیرد.' : 'WEB proxy rides the panel HTTPS port, so it works on Cloady, Render and Railway. Port 443 is shared: each user gets their own link with its own token and secret in the tg://webproxy link.') + (single ? (fa ? ' روی این هاست تک‌پورت فقط پورت 443 کار می‌کند — بقیه پورت‌های WEB اینجا منتشر نمی‌شوند.' : ' On this single-port host only port 443 works - other WEB ports are not published here.') : (fa ? ' بقیه پورت‌ها همان بریج مسیریابی‌شده با توکن را روی پورتی که انتخاب می‌کنید، ارائه می‌دهند.' : ' Other ports serve the same token-routed bridge on the port you choose.'));
+  if(proto === 'http-proxy') return (fa ? 'پروکسی HTTP روی پورتی که برای این اینباند انتخاب می‌کنید گوش می‌دهد (پیش‌فرض 3128)' : 'HTTP proxy listens on the port you choose for this inbound (default 3128)') + (on('http') ? runningNote : deadNote) + (fa ? '. فقط CONNECT، احراز هویت Basic همان UUID لینک است، مقصدها محدود شده‌اند، یک پروکسی وب باز نیست.' : '. CONNECT only, Basic auth is the link UUID, destinations restricted, not an open web proxy.');
   return '';
 }
+
 function syncWebproxyPortOptions(info, keepCurrent){
   const single = !!(info && info.single_port_host);
   [['awebproxy-port', false], ['ewebproxy-port', !!keepCurrent], ['quick-webproxy-port', false]].forEach(pair => {
@@ -22178,13 +22472,13 @@ async function createLink(){
   const proxyPort=$m('aproxy-port') ? parseInt($m('aproxy-port').value)||0 : 0;
   const webproxySecret=$m('awebproxy-secret') ? $m('awebproxy-secret').value.trim() : '';
   const uuidRe=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-  if(protocol==='webproxy' && webproxySecret && !/^(dd)?[0-9a-fA-F]{32}$/.test(webproxySecret)){ toast('WEB proxy secret must be 32 hex characters, optionally prefixed with dd', true); return; }
+  if(protocol==='webproxy' && webproxySecret && !/^(dd)?[0-9a-fA-F]{32}$/.test(webproxySecret)){ toast(t('webSecretHex'), true); return; }
   if(protocol==='trojan-ws' && credPassword && !uuidRe.test(credPassword)){ toast(t('trojanPasswordUuid'), true); return; }
   if((protocol==='socks5' || protocol==='http-proxy') && (credProxyUser || credProxyPass) && (!credProxyUser || !credProxyPass)){ toast(t('proxyUserPassBoth'), true); return; }
   if((protocol==='socks5' || protocol==='http-proxy') && credProxyUser && /[:@\/?#\s]/.test(credProxyUser)){ toast(t('proxyUserChars'), true); return; }
   if((protocol==='socks5' || protocol==='http-proxy') && credProxyUser){
     const userClash = (allLinks||[]).find(l => (l.proxy_username||'')===credProxyUser || (l.uuid||l.uid||'')===credProxyUser);
-    if(userClash){ toast('Proxy username "' + credProxyUser + '" is already used by inbound "' + (userClash.label||'') + '"', true); return; }
+    if(userClash){ toast(t('proxyUserUsed', {user: credProxyUser, label: userClash.label || ''}), true); return; }
   }
   if((protocol==='socks5' || protocol==='http-proxy') && credProxyPass && /\s/.test(credProxyPass)){ toast(t('proxyPassSpaces'), true); return; }
   const outboundMode=$m('aoutbound-mode').value||'auto';
@@ -22208,7 +22502,7 @@ async function createLink(){
   const xrayDohUrl=$m('xray-doh-url-create').value.trim();
   const xrayAllowedDomains=$m('xray-allowed-domains-create').value.split('\n').map(l=>l.trim()).filter(l=>l).join(',');
   const xrayBlockedDomains=$m('xray-blocked-domains-create').value.split('\n').map(l=>l.trim()).filter(l=>l).join(',');
-  const restrictionProfile=$m('ares-profile').value||'default';
+  const restrictionProfile=$m('ares-profile').value||'custom';
   const echPreset=$m('ech-preset-create') ? $m('ech-preset-create').value||'' : '';
   const bypassIran = $m('bypass-iran-create').classList.contains('on');
   const bypassChina = $m('bypass-china-create').classList.contains('on');
@@ -22278,7 +22572,7 @@ async function showEditMo(uid) {
   if (consumedEdit) consumedEdit.textContent = l.limit_bytes > 0 ? t('consumedLine', {used: fmtB(l.used_bytes || 0), limit: fmtB(l.limit_bytes), pct: Math.min(100, Math.round((l.used_bytes || 0) / l.limit_bytes * 100))}) : t('consumedLineNoLimit', {used: fmtB(l.used_bytes || 0)});
   $m('ed').value = l.expires_at ? Math.max(0, Math.ceil((new Date(l.expires_at) - Date.now()) / 86400000)) : '';
   const expPrevEdit = $m('expires-preview-edit');
-  if (expPrevEdit) expPrevEdit.textContent = l.expires_at ? 'Current expiry: ' + new Date(l.expires_at).toLocaleDateString('en-CA') + ' ' + new Date(l.expires_at).toLocaleTimeString('en-GB', {hour:'2-digit', minute:'2-digit'}) : '';
+  if (expPrevEdit) expPrevEdit.textContent = l.expires_at ? t('currentExpiry', {date: new Date(l.expires_at).toLocaleDateString(lang === 'fa' ? 'fa-IR' : 'en-CA') + ' ' + new Date(l.expires_at).toLocaleTimeString('en-GB', {hour:'2-digit', minute:'2-digit'})}) : '';
   $m('ep').value = l.custom_path || '';
   $m('esni').value = l.custom_sni || '';
   $m('ehost').value = l.custom_host || '';
@@ -22336,12 +22630,12 @@ async function showEditMo(uid) {
   if($m('ewebproxy-token')) $m('ewebproxy-token').value = l.webproxy_token || '';
   $m('eoutbound-mode').value = l.outbound_mode || 'auto';
   $m('egaming-profile').value = l.gaming_profile || 'off';
-  $m('eres-profile').value = l.profile || 'default';
+  $m('eres-profile').value = l.profile === 'custom' ? '' : (l.profile || 'default');
   if ($m('ech-preset-edit')) $m('ech-preset-edit').value = l.ech_preset || 'custom';
   if ($m('xray-blocked-domains')) $m('xray-blocked-domains').value = (l.xray_blocked_domains || '').replace(/,/g, '\n');
   $m('eowner-name').value = l.owner_name || '';
   $m('eowner-maxsess').value = l.owner_max_sessions || 0;
-  $m('eused-summary').textContent = fmtB(l.used_bytes || 0) + ' of ' + (l.limit_bytes ? fmtB(l.limit_bytes) : 'Unlimited') + (l.limit_bytes ? ' (' + Math.min(100, Math.round((l.used_bytes || 0) / l.limit_bytes * 100)) + '%)' : '');
+  $m('eused-summary').textContent = t('usedOf', {used: fmtB(l.used_bytes || 0), limit: l.limit_bytes ? fmtB(l.limit_bytes) : t('unlimited')}) + (l.limit_bytes ? ' (' + Math.min(100, Math.round((l.used_bytes || 0) / l.limit_bytes * 100)) + '%)' : '');
 
   const currentFp = l.fingerprint || 'chrome';
   const fpSel = $m('efingerprint-sel');
@@ -22400,10 +22694,10 @@ async function showEditMo(uid) {
 
   const fragMode = l.fragment_mode || 'off';
   $m('efrag-mode').value = fragMode;
+  $m('efrag-length').value = l.fragment_length || '100-200';
+  $m('efrag-interval').value = l.fragment_interval || '10-20';
   if (fragMode === 'range') {
     $m('frag-edit-range').style.display = 'block';
-    $m('efrag-length').value = l.fragment_length || '100-200';
-    $m('efrag-interval').value = l.fragment_interval || '10-20';
   } else {
     $m('frag-edit-range').style.display = 'none';
   }
@@ -22426,6 +22720,7 @@ async function showEditMo(uid) {
   prefillInboundDefaults('edit', l);
   loadDohUpstreamsForSelect('edit', l.xray_doh_url || '');
   bindEffectiveParams('edit');
+  applyProfile();
   renderEffectiveParams('edit');
 }
 
@@ -22460,7 +22755,7 @@ async function saveEdit() {
   const ownerMaxSess = parseInt($m('eowner-maxsess').value) || 0;
   const proxyLine = $m('proxy-line-text-edit').value.trim();
   if (proxyLine && !parseProxyLine(proxyLine)) { toast(t('invalidProxyLine'), true); return; }
-  if (protocol === 'webproxy' && webproxySecretEdit && !/^(dd)?[0-9a-fA-F]{32}$/.test(webproxySecretEdit)) { toast('WEB proxy secret must be 32 hex characters, optionally prefixed with dd', true); return; }
+  if (protocol === 'webproxy' && webproxySecretEdit && !/^(dd)?[0-9a-fA-F]{32}$/.test(webproxySecretEdit)) { toast(t('webSecretHex'), true); return; }
   const fpSel = $m('efingerprint-sel').value; const fingerprint = fpSel === 'custom' ? ($m('efingerprint-custom').value.trim().toLowerCase() || '') : fpSel === 'none' ? '' : fpSel;
   const alpnSel = $m('ealpn-sel').value; const alpn = alpnSel === 'custom' ? $m('ealpn-custom').value.trim() : (alpnSel || '');
   const port = protocol === 'webproxy' ? webproxyPort : parseInt($m('eport').value) || 443;
@@ -22477,7 +22772,7 @@ async function saveEdit() {
   const xrayDohUrl = $m('xray-doh-url').value.trim();
   const xrayAllowedDomains = $m('xray-allowed-domains').value.split('\n').map(l => l.trim()).filter(l => l).join(',');
   const xrayBlockedDomains = $m('xray-blocked-domains').value.split('\n').map(l => l.trim()).filter(l => l).join(',');
-  const restrictionProfile = $m('eres-profile').value || 'default';
+  const restrictionProfile = $m('eres-profile').value || 'custom';
   const echPreset = $m('ech-preset-edit') ? $m('ech-preset-edit').value || '' : '';
   const bypassIran = $m('bypass-iran-edit').classList.contains('on');
   const bypassChina = $m('bypass-china-edit').classList.contains('on');
@@ -22698,9 +22993,9 @@ async function loadStats() {
     safeSetText('sv-requests', sData.total_requests);
     safeSetText('sv-uptime', sData.uptime);
     if (sData.disk_free_gb !== undefined && sData.disk_free_gb !== null && sData.disk_total_gb !== undefined && sData.disk_total_gb !== null) {
-      safeSetHTML('sv-disk', '<span class="stat-unit num">' + sData.disk_free_gb + ' GB free of ' + sData.disk_total_gb + ' GB</span>');
+      safeSetHTML('sv-disk', '<span class="stat-unit num">' + t('diskFreeOf', {free: sData.disk_free_gb, total: sData.disk_total_gb}) + '</span>');
       const dv = $m('sv-disk');
-      if (dv && sData.disk_path) dv.title = 'Disk: ' + sData.disk_path;
+      if (dv && sData.disk_path) dv.title = t('diskTitle', {path: sData.disk_path});
     } else {
       safeSetHTML('sv-disk', '<span class="stat-unit num">N/A</span>');
     }
@@ -22712,7 +23007,7 @@ async function loadStats() {
       const bar = $m('cpu-b');
       if (bar) bar.style.width = c + '%';
     } else {
-      safeSetText('cpu-v', 'N/A');
+      safeSetText('cpu-v', t('notAvailable'));
       const bar = $m('cpu-b');
       if (bar) bar.style.width = '0%';
     }
@@ -22813,7 +23108,7 @@ function initSpeedChart(){
   if(typeof Chart==='undefined')return;
   const ctx=$m('speed-chart');if(!ctx||speedChart)return;
   if(typeof Chart==='undefined'){setChartEmpty('speed-chart',true,t('chartLibFailed'));return;}
-  speedChart=new Chart(ctx,{type:'line',data:{labels:[],datasets:[{label:'DL',borderColor:cssVar('--success'),data:[],tension:0.2},{label:'UL',borderColor:cssVar('--danger'),data:[],tension:0.2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{tooltip:{callbacks:{label:ctx=>ctx.dataset.label+': '+formatSpeed(ctx.raw)}}},scales:{y:{max:undefined,beginAtZero:true,ticks:{callback:v=>formatSpeed(v)}}}}});
+  speedChart=new Chart(ctx,{type:'line',data:{labels:[],datasets:[{label:t('dlLabel'),borderColor:cssVar('--success'),data:[],tension:0.2},{label:t('ulLabel'),borderColor:cssVar('--danger'),data:[],tension:0.2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{tooltip:{callbacks:{label:ctx=>ctx.dataset.label+': '+formatSpeed(ctx.raw)}}},scales:{y:{max:undefined,beginAtZero:true,ticks:{callback:v=>formatSpeed(v)}}}}});
 }
 function updSpeedChart(up,down){
   if(!speedChart)return;
@@ -23004,7 +23299,7 @@ function renderIpProfiles(profiles){
   const list=$m('ip-profiles-list'); if(!list)return;
   list.innerHTML = profiles.map(p=>`
     <div class="status-card active" style="cursor:default; text-align:start;">
-      <div style="font-weight:700;">${esc(p.name)} <span style="font-size:0.7rem;">(${p.address_count} IPs)</span></div>
+      <div style="font-weight:700;">${icon('cleanip',16)} ${esc(p.name)} <span style="font-size:0.7rem;">${t('ipsCount', {n: p.address_count})}</span></div>
       ${p.first_ip ? `<div style="font-size:0.8rem;color:var(--text-2);direction:ltr;text-align:left;">${esc(p.first_ip)}${p.last_ip && p.last_ip !== p.first_ip ? ' – ' + esc(p.last_ip) : ''}</div>` : ''}
       <div style="display:flex; gap:4px; margin-top:6px;">
         <button class="act-btn act-edit" onclick="editIpProfile('${p.id}')">${icon('edit')}</button>
@@ -23269,7 +23564,7 @@ function renderMultiPanel(panels) {
   list.innerHTML = panels.map((p,i)=>`
     <div class="status-card active">
       <div style="display:flex; justify-content:space-between; align-items:center;">
-        <span style="font-weight:700;" onclick="window.open('${esc(p.url)}', '_blank')">${esc(p.name)}</span>
+        <span style="font-weight:700;" onclick="window.open('${esc(p.url)}', '_blank')">${icon('server',16)} ${esc(p.name)}</span>
         <div>
           <button class="act-btn act-edit" onclick="editMultiPanel(${i})">${icon('edit')}</button>
           <button class="act-btn act-del" onclick="removeMultiPanel(${i})">${icon('delete')}</button>
@@ -23567,12 +23862,52 @@ async function saveScannerProfile() {
   } catch(e) { toast(t('Error'), true); }
 }
 
-const LOG_TYPES={Scanner:{en:'Scanner',fa:'اسکنر'},Tunnel:{en:'Tunnel',fa:'تونل'},Proxy:{en:'Proxy',fa:'پروکسی'},Login:{en:'Login',fa:'ورود'},Error:{en:'Error',fa:'خطا'},Event:{en:'Event',fa:'رویداد'}};
+const LOG_TYPES={Scanner:{en:'Scanner',fa:'اسکنر'},Tunnel:{en:'Tunnel',fa:'تونل'},Proxy:{en:'Proxy',fa:'پروکسی'},Login:{en:'Login',fa:'ورود'},Error:{en:'Error',fa:'خطا'},Event:{en:'Event',fa:'رویداد'},Auth:{en:'Auth',fa:'احراز هویت'},Warning:{en:'Warning',fa:'هشدار'},Security:{en:'Security',fa:'امنیت'},Settings:{en:'Settings',fa:'تنظیمات'},Admin:{en:'Admin',fa:'مدیر'},Inbound:{en:'Inbound',fa:'اینباند'},'Clean IP':{en:'Clean IP',fa:'آی‌پی تمیز'},Subscription:{en:'Subscription',fa:'اشتراک'},Blocked:{en:'Blocked',fa:'مسدودشده'},Restricted:{en:'Restricted',fa:'محدودشده'},Auto:{en:'Auto',fa:'خودکار'}};
 function logTypeLabel(ty){const e=LOG_TYPES[ty];if(e)return e[lang]||e.en;return ty||'Event';}
+function trLogMsg(m){
+  if(!m || lang !== 'fa') return m;
+  const s = String(m);
+  const rules = [
+    [/^Session blocked for (\S+) from (\S+)$/, 'نشست برای $1 از $2 مسدود شد'],
+    [/^Session unblocked for (\S+) from (\S+)$/, 'رفع مسدودیت نشست برای $1 از $2'],
+    [/^Restricted source (.+)$/, 'منبع محدودشده $1'],
+    [/^Released restricted source (.+)$/, 'منبع محدودشده آزاد شد: $1'],
+    [/^Expired inbound (.+) auto-disabled$/, 'اینباند منقضی‌شده $1 به‌طور خودکار غیرفعال شد'],
+    [/^Blocked WEB session for (\S+) from (\S+)$/, 'نشست WEB مسدودشده برای $1 از $2'],
+    [/^Restricted WEB session for (\S+) from (\S+)$/, 'نشست WEB محدودشده برای $1 از $2'],
+    [/^Failed login attempt from (\S+)$/, 'تلاش ناموفق برای ورود از $1'],
+    [/^Successful panel login from (\S+)$/, 'ورود موفق به پنل از $1'],
+    [/^Failed to record login event for (\S+): (.*)$/, 'ثبت رویداد ورود برای $1 ناموفق بود: $2'],
+    [/^Failed to record logout event for (\S+): (.*)$/, 'ثبت رویداد خروج برای $1 ناموفق بود: $2'],
+    [/^Admin password changed$/, 'گذرواژه مدیر تغییر کرد'],
+    [/^All settings reset to defaults$/, 'همه تنظیمات به پیش‌فرض بازنشانی شدند'],
+    [/^All logs cleared$/, 'همه گزارش‌ها پاک شدند'],
+    [/^Created inbound (.+) \(([0-9a-f-]{36})\)$/, 'اینباند $1 ($2) ساخته شد'],
+    [/^UUID regenerated for (.+): (\S+) -> (\S+)$/, 'UUID برای $1 تازه‌سازی شد: $2 -> $3'],
+    [/^Disconnected all connections for (\S+)$/, 'همه اتصالات برای $1 قطع شدند'],
+    [/^Updated inbound (\S+)$/, 'اینباند $1 به‌روز شد'],
+    [/^Deleted inbound (\S+)$/, 'اینباند $1 حذف شد'],
+    [/^Cloned inbound (\S+) -> (\S+)$/, 'اینباند $1 کلون شد -> $2'],
+    [/^Added address (\S+) \(flag: (\S*)\)$/, 'آدرس $1 اضافه شد (پرچم: $2)'],
+    [/^Edited address from (\S+) to (\S+)$/, 'آدرس از $1 به $2 ویرایش شد'],
+    [/^Batch added (\d+) addresses$/, '$1 آدرس به‌صورت گروهی اضافه شد'],
+    [/^Deleted address (\S+)$/, 'آدرس $1 حذف شد'],
+    [/^All addresses deleted$/, 'همه آدرس‌ها حذف شدند'],
+    [/^Bulk deleted addresses$/, 'آدرس‌ها به‌صورت گروهی حذف شدند'],
+    [/^Subscription accessed for (.+) \((\S+)\) status=(\S+)$/, 'اشتراک برای $1 ($2) مشاهده شد، وضعیت=$3'],
+    [/^Inbound (.+) \((\S+)\) has used over (\d+)% of quota$/, 'اینباند $1 ($2) بیش از $3٪ سهمیه را مصرف کرده است'],
+    [/^Quota exceeded for (\S+)$/, 'سهمیه برای $1 تمام شد'],
+    [/^Inactive\/not found uuid (\S+)$/, 'uuid غیرفعال/یافت‌نشد $1'],
+    [/^Expired uuid (\S+)$/, 'uuid منقضی‌شده $1'],
+    [/^Blocked SSRF attempt to (\S+) from (\S+)$/, 'تلاش SSRF مسدودشده به $1 از $2']
+  ];
+  for (let i = 0; i < rules.length; i++) { if (rules[i][0].test(s)) return s.replace(rules[i][0], rules[i][1]); }
+  return s;
+}
 async function loadLogs(){
   if (!isAuthenticated || isInitialChecking) return;
   showLogsSkeleton();
-  try{const r=await authenticatedFetch('/api/logs');const d=await r.json();const logs=d.logs||[];const tbody=$m('logs-tbody'),empty=$m('logs-empty');if(!tbody)return;if(!logs.length){tbody.innerHTML='';empty.style.display='block';return;}empty.style.display='none';tbody.innerHTML=logs.map((l,i)=>{const local=getPanelTime(l.time);return`<tr><td>${i+1}</td><td>${local.toISOString().replace('T',' ').split('.')[0]}</td><td>${esc(logTypeLabel(l.type))}</td><td>${esc(l.error||'')}</td></tr>`}).join('');}catch(err){console.error('loadLogs error:',err);}}
+  try{const r=await authenticatedFetch('/api/logs');const d=await r.json();const logs=d.logs||[];const tbody=$m('logs-tbody'),empty=$m('logs-empty');if(!tbody)return;if(!logs.length){tbody.innerHTML='';empty.style.display='block';return;}empty.style.display='none';tbody.innerHTML=logs.map((l,i)=>{const local=getPanelTime(l.time);return`<tr><td>${i+1}</td><td>${local.toISOString().replace('T',' ').split('.')[0]}</td><td>${esc(logTypeLabel(l.type))}</td><td>${esc(trLogMsg(l.error||''))}</td></tr>`}).join('');}catch(err){console.error('loadLogs error:',err);}}
 async function refreshLogs(){ loadLogs(); }
 async function loadLoginLogs(){
   if (!isAuthenticated || isInitialChecking) return;
@@ -24014,9 +24349,9 @@ function startSSE() {
 function stopSSE() {
     if (sseConnection) { sseConnection.close(); sseConnection = null; }
 }
-document.addEventListener('keydown',e=>{if(e.ctrlKey||e.metaKey){const pages=['dashboard','inbounds','active-users','addresses','ipscanner','logs','telegram','settings'];const num=parseInt(e.key);if(num>=1&&num<=pages.length)switchPage(pages[num-1]);}});
+document.addEventListener('keydown',e=>{if(e.ctrlKey||e.metaKey){const pages=['dashboard','inbounds','active-users','addresses','ipscanner','logs','telegram','settings','about'];const num=parseInt(e.key);if(num>=1&&num<=pages.length)switchPage(pages[num-1]);}});
 if(window.matchMedia('(prefers-color-scheme: dark)').matches && !localStorage.getItem('theme'))setTheme('dark');
-setTheme(theme);setLang(lang);checkAuth();
+setTheme(theme);setLang(lang);loadGhCounts();checkAuth();
 setInterval(()=>{if(isAuthenticated && !isInitialChecking){loadStats();}},15000);
 
 async function loadBlockedDomains() {
@@ -24062,7 +24397,7 @@ function renderProxyLines(lines) {
         if (p.last_test_status === 'ok') {
             healthHtml = `<span class="status"><span class="status-dot ok"></span><span>${p.last_latency_ms}ms</span></span>`;
         } else if (p.last_test_status) {
-            healthHtml = `<span class="status"><span class="status-dot err"></span><span>${p.last_test_status}</span></span>`;
+            healthHtml = `<span class="status"><span class="status-dot err"></span><span>${p.last_test_status === 'error' ? t('failed') : p.last_test_status === 'unsupported' ? t('testUnsupported') : p.last_test_status}</span></span>`;
         }
         return `
         <tr id="proxy-row-${p.id}">
@@ -24070,7 +24405,7 @@ function renderProxyLines(lines) {
             <td>${flagEmoji} ${esc(p.name)}</td>
             <td>${p.type.toUpperCase()}</td>
             <td>${esc(p.host)}:${p.port}</td>
-            <td><span class="tag ${p.is_active ? 'tag-on' : 'tag-off'}">${p.is_active ? 'On' : 'Off'}</span></td>
+            <td><span class="tag ${p.is_active ? 'tag-on' : 'tag-off'}">${p.is_active ? t('on') : t('off')}</span></td>
             <td id="proxy-status-${p.id}">${healthHtml}</td>
             <td>
                 <button class="act-btn act-edit" onclick="editProxy(${p.id})">${icon('edit')}</button>
