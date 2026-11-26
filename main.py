@@ -125,6 +125,7 @@ _TELEMT_MTPROTO_GENERATION = 0
 _TELEMT_ROOT_UID = ""
 _TELEMT_ROOT_CHILD_UID = "legacy-root"
 _TELEMT_ROOT_CHILD_TOKEN = "legacy-root"
+_LAST_PUBLIC_DOMAIN = ""
 _PROXY_CODE_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"
 
 
@@ -292,6 +293,9 @@ def _telemt_web_status_cached(uid):
 
 
 def _telemt_web_sessions_value(status):
+    rows = (status or {}).get("session_rows")
+    if isinstance(rows, list):
+        return rows
     sessions = (status or {}).get("sessions")
     if isinstance(sessions, list):
         return sessions
@@ -474,7 +478,7 @@ async def _telemt_sync_link(link, previous=None):
                 changed = True
                 break
     if protocol == "webproxy":
-        provisioned = uid in _TELEMT_PROVISIONED["web"]
+        provisioned = uid in _TELEMT_PROVISIONED["web"] and _telemt_web_port_for_uid(uid) is not None
         if changed or not provisioned:
             try:
                 if provisioned:
@@ -592,6 +596,7 @@ def validate_patch_protocol_fields(link, body):
             body["ss_psk"] = raw
     body.pop("mtproto_secret", None)
     body.pop("webproxy_secret", None)
+    validate_transport_fields(body)
     protocol = body.get("protocol") or link.get("protocol", "")
     if protocol not in VALID_PROTOCOLS:
         raise HTTPException(status_code=400, detail="Invalid protocol")
@@ -619,6 +624,75 @@ SS_METHODS = (
     "aes-256-gcm", "aes-128-gcm", "chacha20-poly1305",
 )
 VMESS_SECURITY_METHODS = ("auto", "aes-128-gcm", "chacha20-poly1305")
+VALID_FINGERPRINTS = ("chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq", "random", "randomized", "none")
+
+
+def normalize_fingerprint(value):
+    raw = str(value or "").strip().lower()
+    if raw in VALID_FINGERPRINTS:
+        return raw
+    return "chrome"
+
+
+def _valid_host_name(value):
+    text = str(value or "").strip()
+    if not text or len(text) > 253:
+        return False
+    if not re.match(r"^[A-Za-z0-9.-]+$", text) or ".." in text or text.startswith(".") or text.startswith("-") or text.endswith(".") or text.endswith("-"):
+        return False
+    return True
+
+
+def _valid_range_pair(value, low, high):
+    text = str(value or "").strip()
+    match = re.match(r"^(\d+)-(\d+)$", text)
+    if not match:
+        return False
+    first = int(match.group(1))
+    second = int(match.group(2))
+    return low <= first < second <= high
+
+
+def validate_transport_fields(body):
+    for key in ("fingerprint", "custom_fp"):
+        if key in body and body.get(key) is not None and str(body.get(key)).strip() != "":
+            raw = str(body.get(key)).strip().lower()
+            if raw not in VALID_FINGERPRINTS:
+                raise HTTPException(status_code=400, detail="Invalid fingerprint: use chrome, firefox, safari, ios, android, edge, 360, qq, random, randomized or none")
+            body[key] = raw
+    if "custom_path" in body:
+        path = str(body.get("custom_path") or "")
+        if path and (not path.startswith("/") or any(ch.isspace() for ch in path) or "?" in path or "#" in path):
+            raise HTTPException(status_code=400, detail="Invalid path: must start with / and contain no spaces, ? or #")
+    for key in ("custom_sni", "custom_host", "ech_sni"):
+        if key in body and str(body.get(key) or "").strip() and not _valid_host_name(body.get(key)):
+            raise HTTPException(status_code=400, detail="Invalid host name for " + key)
+    if "ech_doh" in body and str(body.get("ech_doh") or "").strip():
+        doh = str(body.get("ech_doh")).strip()
+        if not doh.startswith("https://") or any(ch.isspace() for ch in doh):
+            raise HTTPException(status_code=400, detail="Invalid ECH DoH URL: must start with https://")
+    if "fragment" in body:
+        frag = str(body.get("fragment") or "").strip()
+        if frag and frag != "tlshello" and not _valid_range_pair(frag, 0, 1000):
+            raise HTTPException(status_code=400, detail="Invalid fragment: use tlshello or a range like 1-3")
+    for key in ("fragment_length", "fragment_interval"):
+        if key in body and str(body.get(key) or "").strip() and not _valid_range_pair(body.get(key), 0, 1000):
+            raise HTTPException(status_code=400, detail="Invalid " + key + ": use a range like 100-200")
+    if "fragment_mode" in body and str(body.get("fragment_mode") or "").strip() not in ("off", "tlshello", ""):
+        raise HTTPException(status_code=400, detail="Invalid fragment_mode: use off or tlshello")
+    if "alpn" in body:
+        raw = str(body.get("alpn") or "").strip()
+        if raw and raw.lower() not in ("smart", "none"):
+            parts = [part.strip() for part in raw.split(",") if part.strip()]
+            if not parts or any(part not in ("h2", "http/1.1", "h3") for part in parts):
+                raise HTTPException(status_code=400, detail="Invalid alpn: use smart, none, h2, http/1.1 or h3")
+    if "port" in body and body.get("port") not in (None, ""):
+        try:
+            port_value = int(body.get("port"))
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="Invalid port")
+        if port_value < 1 or port_value > 65535:
+            raise HTTPException(status_code=400, detail="Invalid port: must be 1 to 65535")
 SS_METHOD_ALIASES = {"chacha20-ietf-poly1305": "chacha20-poly1305"}
 
 
@@ -875,7 +949,58 @@ def _proxy_session_count(uid):
     return total
 
 
+BLOCKED_PAIRS = set()
+
+
+def is_session_blocked(uid, ip):
+    return (str(uid or ""), str(ip or "")) in BLOCKED_PAIRS
+
+
+async def load_blocked_sessions():
+    global BLOCKED_PAIRS
+    try:
+        rows = await db_fetchall("SELECT uid, ip FROM blocked_sessions", "SELECT uid, ip FROM blocked_sessions")
+        BLOCKED_PAIRS = {(str(r["uid"]), str(r["ip"])) for r in rows}
+    except Exception as e:
+        logger.error(f"load_blocked_sessions failed: {e}")
+
+
+async def block_session(uid, ip, reason=""):
+    uid = str(uid or "")
+    ip = str(ip or "")
+    if not uid or not ip:
+        return False
+    await db_execute("INSERT OR IGNORE INTO blocked_sessions (uid, ip, reason, created_at) VALUES (?,?,?,?)", "INSERT INTO blocked_sessions (uid, ip, reason, created_at) VALUES ($1,$2,$3,$4) ON CONFLICT (uid, ip) DO NOTHING", (uid, ip, str(reason or "")[:120], datetime.now(UTC).isoformat()))
+    BLOCKED_PAIRS.add((uid, ip))
+    log_event("Blocked", "Session blocked for " + uid + " from " + ip, ip=ip)
+    return True
+
+
+async def unblock_session(uid, ip):
+    uid = str(uid or "")
+    ip = str(ip or "")
+    if not uid or not ip:
+        return False
+    await db_execute("DELETE FROM blocked_sessions WHERE uid = ? AND ip = ?", "DELETE FROM blocked_sessions WHERE uid = $1 AND ip = $2", (uid, ip))
+    BLOCKED_PAIRS.discard((uid, ip))
+    log_event("Blocked", "Session unblocked for " + uid + " from " + ip, ip=ip)
+    return True
+
+
+async def block_pair_with_telemt(uid, ip, reason=""):
+    await block_session(uid, ip, reason)
+    link = LINKS.get(str(uid or ""))
+    if link is not None:
+        proto = link.get("protocol") or ""
+        if proto == "webproxy":
+            await _telemt_remove_web(str(uid or ""))
+        elif proto == "mtproto":
+            await _telemt_remove_mtproto(str(uid or ""))
+
+
 def _session_limit_reason(link, uuid, client_ip, exclude_conn_id=None):
+    if is_session_blocked(uuid, client_ip):
+        return "blocked by admin"
     max_conn = int(link.get("max_connections") or 0)
     if max_conn > 0:
         n = sum(1 for cid, info in connections.items() if info.get("uuid") == uuid and cid != exclude_conn_id)
@@ -1001,31 +1126,47 @@ def _is_trusted_proxy(ip: str):
     return False
 
 
-def get_real_remote_address(request: Request) -> str:
-    peer = request.client.host if request.client else "unknown"
-    if not _is_trusted_proxy(peer):
+def _is_non_routable_ip(ip: str):
+    try:
+        parsed = ipaddress.ip_address(ip.strip())
+    except ValueError:
+        return True
+    return not parsed.is_global
+
+
+def _real_ip_from_peer_and_headers(peer: str, get_header):
+    peer = (peer or "unknown").strip() or "unknown"
+    if not _is_trusted_proxy(peer) and not _is_non_routable_ip(peer):
         return peer
-    forwarded = request.headers.get("x-forwarded-for")
+    forwarded = get_header("x-forwarded-for")
     if forwarded:
         chain = [part.strip() for part in forwarded.split(",") if part.strip()]
         chain.append(peer)
         for candidate in reversed(chain):
             try:
-                ipaddress.ip_address(candidate)
+                parsed = ipaddress.ip_address(candidate)
             except ValueError:
                 continue
-            if not _is_trusted_proxy(candidate):
+            if parsed.is_global and not _is_trusted_proxy(candidate):
                 return candidate
         if chain:
             return chain[0]
-    cf_ip = request.headers.get("cf-connecting-ip")
-    if cf_ip:
-        try:
-            ipaddress.ip_address(cf_ip.strip())
-            return cf_ip.strip()
-        except ValueError:
-            pass
+    for header_name in ("cf-connecting-ip", "x-real-ip"):
+        header_value = get_header(header_name)
+        if header_value:
+            candidate = header_value.strip().split(",")[0].strip()
+            try:
+                parsed = ipaddress.ip_address(candidate)
+            except ValueError:
+                continue
+            if parsed.is_global:
+                return candidate
     return peer
+
+
+def get_real_remote_address(request: Request) -> str:
+    peer = request.client.host if request.client else "unknown"
+    return _real_ip_from_peer_and_headers(peer, lambda name: request.headers.get(name))
 
 limiter = Limiter(key_func=get_real_remote_address, default_limits=["100/minute"])
 _tunnel_error_suppress: dict = {}
@@ -1292,6 +1433,16 @@ flag_semaphore = asyncio.Semaphore(5)
 IP_LOCATION_CACHE: Dict[str, dict] = {}
 IP_LOCATION_CACHE_LOCK = asyncio.Lock()
 IP_LOCATION_CACHE_MAX = 1024
+GEO_STATUS: Dict[str, object] = {"ok": True, "detail": ""}
+GEO_BACKFILL_ATTEMPTED: Dict[str, float] = {}
+BACKGROUND_TASKS: set = set()
+
+
+def spawn_background(coro):
+    task = asyncio.ensure_future(coro)
+    BACKGROUND_TASKS.add(task)
+    task.add_done_callback(BACKGROUND_TASKS.discard)
+    return task
 
 DEFAULT_PATH = "/ws/{uid}"
 DEFAULT_XHTTP_PATH = "/xhttp"
@@ -1854,6 +2005,8 @@ async def stable_account(uid, conn_id, n, gate, direction):
                 connections[conn_id]["bytes_up"] = connections[conn_id].get("bytes_up", 0) + n
             else:
                 connections[conn_id]["bytes_down"] = connections[conn_id].get("bytes_down", 0) + n
+            if gate is not None:
+                connections[conn_id]["quota_gate"] = gate
     return True
 
 
@@ -2468,15 +2621,19 @@ def generate_vmess_link(uid, remark="SulgX", address=None, extra=None, server_do
     host = (extra.get("custom_host") or domain) if extra else domain
     fingerprint = (extra.get("fingerprint") or extra.get("custom_fp") or "chrome") if extra else "chrome"
     if not fingerprint or fingerprint.lower() == "none":
-        fingerprint = "chrome"
+        fingerprint = ""
     alpn = effective_alpn(extra) or ""
     port = extra.get("port", 443) if extra else 443
     scy = vmess_security_for_link(extra)
     node = {
         "v": "2", "ps": remark, "add": addr, "port": str(port), "id": uid,
         "aid": "0", "scy": scy, "net": "ws", "type": "none",
-        "host": host, "path": path, "tls": "tls", "sni": sni, "fp": fingerprint, "alpn": alpn,
+        "host": host, "path": path, "tls": "tls", "sni": sni,
     }
+    if fingerprint:
+        node["fp"] = fingerprint
+    if alpn:
+        node["alpn"] = alpn
     encoded = base64.b64encode(json.dumps(node, separators=(",", ":")).encode()).decode()
     return "vmess://" + encoded
 
@@ -2492,15 +2649,25 @@ def generate_trojan_link(uid, remark="SulgX", address=None, extra=None, server_d
     host = (extra.get("custom_host") or domain) if extra else domain
     fingerprint = (extra.get("fingerprint") or extra.get("custom_fp") or "chrome") if extra else "chrome"
     if not fingerprint or fingerprint.lower() == "none":
-        fingerprint = "chrome"
+        fingerprint = ""
     alpn = effective_alpn(extra) or ""
     port = extra.get("port", 443) if extra else 443
+    fragment = extra.get("fragment", "") if extra else ""
+    allow_insecure = extra.get("allow_insecure", False) if extra else False
     params = {
         "type": "ws", "security": "tls", "sni": sni, "host": host,
-        "path": path, "fp": fingerprint,
+        "path": path,
     }
+    if fingerprint:
+        params["fp"] = fingerprint
     if alpn:
         params["alpn"] = alpn
+    if allow_insecure:
+        params["allowInsecure"] = "1"
+    else:
+        params["allowInsecure"] = "0"
+    if fragment:
+        params["fragment"] = fragment
     query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
     return f"trojan://{uid}@{format_host_port(addr, port)}?{query}#{quote(remark)}"
 
@@ -2868,9 +3035,47 @@ async def refresh_proxy_listener_status(force=False):
             await _telemt_refresh_web_status()
         except Exception:
             pass
+        if web_entry.get("enabled"):
+            async with LINKS_LOCK:
+                web_rows = [link for link in LINKS.values() if (link.get("protocol") or "") == "webproxy" and link.get("active")]
+            if web_rows:
+                any_healthy = False
+                for link in web_rows:
+                    status = _telemt_web_status_cached(str(link.get("uid", "")))
+                    if status.get("enabled") and not status.get("error"):
+                        any_healthy = True
+                        break
+                if not any_healthy:
+                    child_errors = WEBPROXY_STATE.get("child_errors") or {}
+                    web_entry["enabled"] = False
+                    web_entry["error"] = str(next(iter(child_errors.values()))) if child_errors else "telemt WEB child is not running for the active WEB inbound"
+                    TG_PROXY_STATUS["webproxy"] = web_entry
         _invalidate_card_usability()
         _PROXY_LISTENER_PROBE_AT = time.monotonic()
         return TG_PROXY_STATUS
+
+
+async def _telemt_retry_web_children():
+    if tgproxy is None:
+        return
+    if get_domain() == "localhost":
+        return
+    async with LINKS_LOCK:
+        rows = [link for link in LINKS.values() if (link.get("protocol") or "") == "webproxy" and link.get("active")]
+    child_errors = WEBPROXY_STATE.get("child_errors") or {}
+    for link in rows:
+        uid = str(link.get("uid", ""))
+        needs = uid not in _TELEMT_PROVISIONED.get("web", set()) or uid in child_errors or _telemt_web_port_for_uid(uid) is None
+        if not needs:
+            continue
+        try:
+            await _telemt_sync_link(link, previous=dict(link))
+        except Exception:
+            pass
+    try:
+        await _telemt_sync_root_vhost()
+    except Exception:
+        pass
 
 
 async def _proxy_listener_refresh_loop():
@@ -2878,6 +3083,10 @@ async def _proxy_listener_refresh_loop():
         await asyncio.sleep(PROXY_LISTENER_PROBE_TTL)
         try:
             await refresh_proxy_listener_status(force=True)
+        except Exception:
+            pass
+        try:
+            await _telemt_retry_web_children()
         except Exception:
             pass
 
@@ -3123,6 +3332,7 @@ if CONFIG["database_url"] and HAS_POSTGRES:
                     owner_user_id TEXT DEFAULT '', outbound_proxy TEXT DEFAULT '', outbound_proxy_pass TEXT DEFAULT ''
                 );
                 CREATE TABLE IF NOT EXISTS hourly_traffic (hour TEXT PRIMARY KEY, bytes BIGINT DEFAULT 0);
+                CREATE TABLE IF NOT EXISTS blocked_sessions (uid TEXT NOT NULL, ip TEXT NOT NULL, reason TEXT DEFAULT '', created_at TEXT DEFAULT '', PRIMARY KEY (uid, ip));
                 CREATE TABLE IF NOT EXISTS daily_traffic (day TEXT PRIMARY KEY, bytes BIGINT DEFAULT 0, uid TEXT DEFAULT '');
                 CREATE TABLE IF NOT EXISTS custom_addresses (
                     id SERIAL PRIMARY KEY,
@@ -3329,6 +3539,7 @@ else:
                 last_test_ok INTEGER DEFAULT 0, last_test_ms INTEGER DEFAULT 0, last_test_detail TEXT DEFAULT '', last_test_at TEXT DEFAULT '', last_test_target TEXT DEFAULT '', last_test_verdict TEXT DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS hourly_traffic (hour TEXT PRIMARY KEY, bytes INTEGER DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS blocked_sessions (uid TEXT NOT NULL, ip TEXT NOT NULL, reason TEXT DEFAULT '', created_at TEXT DEFAULT '', PRIMARY KEY (uid, ip));
             CREATE TABLE IF NOT EXISTS daily_traffic (day TEXT PRIMARY KEY, bytes INTEGER DEFAULT 0, uid TEXT DEFAULT '');
             CREATE TABLE IF NOT EXISTS custom_addresses (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3524,29 +3735,34 @@ async def flush_traffic_buffer():
         await asyncio.sleep(10)
         try:
             async with traffic_buffer_lock:
-                if not traffic_buffer["hourly"] and not traffic_buffer["daily"]:
-                    continue
-                for hour, bytes_val in traffic_buffer["hourly"].items():
-                    await db_execute(
-                        "INSERT INTO hourly_traffic (hour, bytes) VALUES (?,?) ON CONFLICT(hour) DO UPDATE SET bytes = bytes + ?",
-                        "INSERT INTO hourly_traffic (hour, bytes) VALUES ($1,$2) ON CONFLICT (hour) DO UPDATE SET bytes = hourly_traffic.bytes + $2",
-                        (hour, bytes_val, bytes_val)
-                    )
-                traffic_buffer["hourly"].clear()
                 traffic_buffer["daily"].clear()
         except Exception as e:
             logger.error(f"flush_traffic_buffer error: {e}", exc_info=True)
 
 async def add_traffic_to_buffer(hour: str, day: str, size: int, uid: str = ""):
     async with traffic_buffer_lock:
-        traffic_buffer["hourly"][hour] += size
         traffic_buffer["daily"][(day, uid)] += size
+        await db_execute(
+            "INSERT INTO hourly_traffic (hour, bytes) VALUES (?,?) ON CONFLICT(hour) DO UPDATE SET bytes = bytes + ?",
+            "INSERT INTO hourly_traffic (hour, bytes) VALUES ($1,$2) ON CONFLICT (hour) DO UPDATE SET bytes = hourly_traffic.bytes + $2",
+            (hour, size, size)
+        )
         if uid:
             await db_execute(
                 "INSERT INTO daily_traffic (day, bytes, uid) VALUES (?,?,?) ON CONFLICT(day, uid) DO UPDATE SET bytes = bytes + ?",
                 "INSERT INTO daily_traffic (day, bytes, uid) VALUES ($1,$2,$3) ON CONFLICT (day, uid) DO UPDATE SET bytes = daily_traffic.bytes + $2",
                 (day, size, uid, size)
             )
+
+
+async def account_traffic(uid: str, n: int, direction: str):
+    stats["total_bytes"] += n
+    if direction == "up":
+        stats["upload_bytes"] += n
+    else:
+        stats["download_bytes"] += n
+    local_now = datetime.now(UTC) + timedelta(hours=TIMEZONE_OFFSET)
+    await add_traffic_to_buffer(local_now.strftime("%Y-%m-%d %H:00"), local_now.strftime("%Y-%m-%d"), n, uid)
 
 async def sync_usage_to_db():
     while True:
@@ -3627,6 +3843,8 @@ def _normalize_link_dict(link_dict):
             link_dict["proxy_password"] = str(link_dict.get("uid") or "")
     if link_dict.get("vmess_security") not in VMESS_SECURITY_METHODS:
         link_dict["vmess_security"] = "auto"
+    link_dict["fingerprint"] = normalize_fingerprint(link_dict.get("fingerprint"))
+    link_dict["custom_fp"] = normalize_fingerprint(link_dict.get("custom_fp"))
     if link_dict.get("profile") not in RESTRICTION_PROFILES:
         link_dict["profile"] = "custom" if link_dict.get("profile") in LEGACY_SERVICE_PROFILES else "default"
     if link_dict.get("ech_preset") not in ECH_PRESET_IDS and link_dict.get("ech_preset") != "custom":
@@ -3644,6 +3862,7 @@ async def load_initial_data():
                 continue
             link_dict.pop("region_id", None)
             LINKS[r["uid"]] = link_dict
+    await load_blocked_sessions()
     addr_rows = await db_fetchall("SELECT address, flag FROM custom_addresses", "SELECT address, flag FROM custom_addresses")
     async with CUSTOM_ADDRESSES_LOCK:
         CUSTOM_ADDRESSES[:] = [r["address"] for r in addr_rows]
@@ -5077,9 +5296,17 @@ def _host_header_domain(request: Optional[Request] = None) -> str:
 
 
 def get_domain(request: Optional[Request] = None) -> str:
+    global _LAST_PUBLIC_DOMAIN
     host = _host_header_domain(request)
     if host:
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            if "." in host:
+                _LAST_PUBLIC_DOMAIN = host
         return host
+    if _LAST_PUBLIC_DOMAIN:
+        return _LAST_PUBLIC_DOMAIN
     for var in ("DOMAIN", "RAILWAY_PUBLIC_DOMAIN", "RENDER_EXTERNAL_URL"):
         val = os.environ.get(var)
         if val:
@@ -5340,9 +5567,12 @@ NOTFOUND_HTML = r"""<!DOCTYPE html>
   --border-strong:#3a414c;
   --text:#f2f3f5;
   --text-2:#a7adb8;
-  --text-3:#6e7681;
+  --text-3:#9aa3af;
   --accent:#39ff14;
   --accent-hover:#2ee00e;
+  --accent-ink:#39ff14;
+  --accent-solid:#39ff14;
+  --danger-solid:#dc2626;
   --accent-soft:rgba(57,255,20,0.12);
   --accent-border:rgba(57,255,20,0.35);
   --on-accent:#0b0f0a;
@@ -5384,19 +5614,22 @@ body.light-mode{
   --border-strong:#d5c69c;
   --text:#221c10;
   --text-2:#5c5340;
-  --text-3:#7a6e52;
+  --text-3:#655a3f;
   --accent:#15803d;
   --accent-hover:#166534;
+  --accent-ink:#166534;
+  --accent-solid:#15803d;
+  --danger-solid:#b91c1c;
   --accent-soft:rgba(21,128,61,0.10);
   --accent-border:rgba(21,128,61,0.35);
   --on-accent:#ffffff;
-  --success:#15803d;
+  --success:#166534;
   --success-soft:#dcfce7;
   --success-border:#86efac;
-  --warning:#b45309;
+  --warning:#92400e;
   --warning-soft:#fef3c7;
   --warning-border:#fcd34d;
-  --danger:#dc2626;
+  --danger:#b91c1c;
   --danger-soft:#fee2e2;
   --danger-border:#fca5a5;
   --focus:rgba(21,128,61,0.45);
@@ -5412,12 +5645,16 @@ body.blue-dark{
   --border:#2b3a4f;
   --border-strong:#475569;
   --text:#e2e8f0;
-  --text-2:#94a3b8;
-  --text-3:#64748b;
+  --text-2:#a5b4c7;
+  --text-3:#9fb0c3;
   --accent:#3b82f6;
   --accent-hover:#2563eb;
+  --accent-ink:#93c5fd;
+  --accent-solid:#2563eb;
+  --danger-solid:#dc2626;
   --accent-soft:rgba(59,130,246,0.12);
   --accent-border:rgba(59,130,246,0.35);
+  --danger:#fca5a5;
   --on-accent:#ffffff;
   --focus:rgba(59,130,246,0.55);
 }
@@ -5440,7 +5677,7 @@ body{font-family:var(--font-sans);background:var(--bg);color:var(--text);margin:
 .nf-logo-dot{width:28px;height:28px;background:var(--accent);border-radius:8px;flex:none}
 .nf-code{font-family:var(--font-mono);font-size:48px;font-weight:700;color:var(--accent);margin:24px 0 8px}
 .nf-msg{color:var(--text-2);margin:0 0 24px}
-.nf-btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;background:var(--accent);color:var(--on-accent);border:none;border-radius:6px;padding:10px 18px;font-size:14px;font-weight:500;cursor:pointer;text-decoration:none}
+.nf-btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;background:var(--accent-solid);color:var(--on-accent);border:none;border-radius:6px;padding:10px 18px;font-size:14px;font-weight:500;cursor:pointer;text-decoration:none}
 .nf-btn:hover{background:var(--accent-hover)}
 </style>
 </head>
@@ -5470,9 +5707,12 @@ LANDING_HTML = r"""<!DOCTYPE html>
   --border-strong:#3a414c;
   --text:#f2f3f5;
   --text-2:#a7adb8;
-  --text-3:#6e7681;
+  --text-3:#9aa3af;
   --accent:#39ff14;
   --accent-hover:#2ee00e;
+  --accent-ink:#39ff14;
+  --accent-solid:#39ff14;
+  --danger-solid:#dc2626;
   --accent-soft:rgba(57,255,20,0.12);
   --accent-border:rgba(57,255,20,0.35);
   --on-accent:#0b0f0a;
@@ -5514,19 +5754,22 @@ body.light-mode{
   --border-strong:#d5c69c;
   --text:#221c10;
   --text-2:#5c5340;
-  --text-3:#7a6e52;
+  --text-3:#655a3f;
   --accent:#15803d;
   --accent-hover:#166534;
+  --accent-ink:#166534;
+  --accent-solid:#15803d;
+  --danger-solid:#b91c1c;
   --accent-soft:rgba(21,128,61,0.10);
   --accent-border:rgba(21,128,61,0.35);
   --on-accent:#ffffff;
-  --success:#15803d;
+  --success:#166534;
   --success-soft:#dcfce7;
   --success-border:#86efac;
-  --warning:#b45309;
+  --warning:#92400e;
   --warning-soft:#fef3c7;
   --warning-border:#fcd34d;
-  --danger:#dc2626;
+  --danger:#b91c1c;
   --danger-soft:#fee2e2;
   --danger-border:#fca5a5;
   --focus:rgba(21,128,61,0.45);
@@ -5542,12 +5785,16 @@ body.blue-dark{
   --border:#2b3a4f;
   --border-strong:#475569;
   --text:#e2e8f0;
-  --text-2:#94a3b8;
-  --text-3:#64748b;
+  --text-2:#a5b4c7;
+  --text-3:#9fb0c3;
   --accent:#3b82f6;
   --accent-hover:#2563eb;
+  --accent-ink:#93c5fd;
+  --accent-solid:#2563eb;
+  --danger-solid:#dc2626;
   --accent-soft:rgba(59,130,246,0.12);
   --accent-border:rgba(59,130,246,0.35);
+  --danger:#fca5a5;
   --on-accent:#ffffff;
   --focus:rgba(59,130,246,0.55);
 }
@@ -5592,7 +5839,7 @@ a{text-decoration:none;color:inherit}
   padding:6px 14px;border:none;background:transparent;color:var(--text-3);font-size:13px;font-weight:600;
   border-radius:var(--radius-sm);cursor:pointer;font-family:inherit;transition:background-color 120ms ease-out,color 120ms ease-out;
 }
-.lang-btn.active{background:var(--accent);color:var(--on-accent)}
+.lang-btn.active{background:var(--accent-solid);color:var(--on-accent)}
 .btn-icon{
   background:var(--surface);border:1px solid var(--border);color:var(--text-2);border-radius:var(--radius-sm);
   width:32px;height:32px;padding:0;cursor:pointer;transition:background-color 120ms ease-out,color 120ms ease-out,border-color 120ms ease-out;
@@ -5607,16 +5854,17 @@ a{text-decoration:none;color:inherit}
 }
 h1{
   display:inline-flex;align-items:center;gap:8px;
-  font-family:var(--font-sans);font-size:20px;font-weight:700;color:var(--text);
-  letter-spacing:-0.02em;margin-bottom:12px;
+  font-family:var(--font-sans);font-size:24px;font-weight:700;color:var(--text);
+  letter-spacing:-0.02em;margin-bottom:16px;line-height:1.3;
 }
 h1::before{content:'';width:20px;height:20px;background:var(--accent);border-radius:6px;flex:none}
-.subtitle{color:var(--text-2);font-size:14px;margin-bottom:24px;line-height:1.55}
-.steps{text-align:start;margin-bottom:24px}
+.subtitle{color:var(--text-2);font-size:14px;margin-bottom:28px;line-height:1.65}
+.steps{text-align:start;margin-bottom:28px}
 .step{
-  display:flex;align-items:flex-start;gap:12px;margin-bottom:12px;padding:12px;
+  display:flex;align-items:flex-start;gap:12px;margin-bottom:12px;
   background:var(--surface-2);border-radius:var(--radius-md);border:1px solid var(--border);
   transition:border-color 120ms ease-out;
+  padding:14px;
 }
 .step:hover{border-color:var(--border-strong)}
 .step-num{
@@ -5631,14 +5879,14 @@ h1::before{content:'';width:20px;height:20px;background:var(--accent);border-rad
   gap:8px;border:1px solid transparent;transition:background-color 120ms ease-out,color 120ms ease-out,border-color 120ms ease-out;
   margin:6px;
 }
-.btn-primary{background:var(--accent);color:var(--on-accent)}
+.btn-primary{background:var(--accent-solid);color:var(--on-accent)}
 .btn-primary:hover{background:var(--accent-hover)}
 .footer{
   min-height:52px;display:flex;align-items:center;justify-content:center;font-size:13px;
   color:var(--text-3);border-top:1px solid var(--border);background:var(--surface);padding:12px 16px;margin-top:auto;
 }
 .footer-inner{display:flex;align-items:center;justify-content:center;gap:24px;flex-wrap:wrap}
-.footer-inner a{color:var(--accent);text-decoration:none;font-weight:600;transition:color 120ms ease-out}
+.footer-inner a{color:var(--accent-ink);text-decoration:none;font-weight:600;transition:color 120ms ease-out}
 .footer-inner a:hover{color:var(--accent-hover)}
 @media (max-width: 480px){
   .header{padding:8px 16px}
@@ -5677,8 +5925,8 @@ h1::before{content:'';width:20px;height:20px;background:var(--accent);border-rad
         <div class="step-text" data-en="Always configure a Landing Page and Redirect URL." data-fa="حتماً از صفحه فرود و تغییر مسیر استفاده کنید.">Always configure a Landing Page and Redirect URL.</div>
       </div>
     </div>
-    <div style="margin-top:16px;">
-      <button class="btn btn-primary" id="login-btn" onclick="window.location.href='/login'"><span data-en="Login" data-fa="ورود">Login</span></button>
+    <div style="margin-top:8px;">
+      <button class="btn btn-primary" id="login-btn" onclick="window.location.href='/login'" style="width:100%;margin:0;padding:13px;"><span data-en="Login" data-fa="ورود">Login</span></button>
     </div>
   </div>
 </div>
@@ -5894,6 +6142,7 @@ def _forwarder_headers(request, host, client_ip):
         headers[key] = value
     headers["host"] = host
     headers["x-forwarded-for"] = client_ip
+    headers["accept-encoding"] = "identity"
     return headers
 
 
@@ -5909,26 +6158,39 @@ async def _forward_http_to_telemt(request, uid, upstream_path, upstream_query=b"
     headers = _forwarder_headers(request, host, client_ip)
     timeout = httpx.Timeout(70.0, connect=10.0)
     try:
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False, trust_env=False) as client:
-            req = client.build_request(request.method, upstream, headers=headers, content=body)
-            resp = await client.send(req, stream=True)
-            resp_headers = {k: v for k, v in resp.headers.items() if k.lower() not in _FORWARDER_HOP_BY_HOP}
-            status = resp.status_code
-            chunks = []
-            total_down = 0
-            async for chunk in resp.aiter_bytes():
-                chunks.append(chunk)
-                total_down += len(chunk)
-            if total_down:
-                try:
-                    await consume_quota_partial(uid, total_down)
-                except Exception:
-                    pass
-            return Response(content=b"".join(chunks), status_code=status, headers=resp_headers)
+        client = httpx.AsyncClient(timeout=timeout, follow_redirects=False, trust_env=False)
+        req = client.build_request(request.method, upstream, headers=headers, content=body)
+        resp = await client.send(req, stream=True)
     except httpx.TimeoutException:
         return JSONResponse(status_code=504, content={"ok": False, "detail": "upstream WEB proxy timed out"})
     except Exception as exc:
         return JSONResponse(status_code=502, content={"ok": False, "detail": "upstream WEB proxy error: " + str(exc)})
+    resp_headers = {k: v for k, v in resp.headers.items() if k.lower() not in _FORWARDER_HOP_BY_HOP}
+    status = resp.status_code
+    total = {"down": 0}
+
+    async def _forward_gen():
+        try:
+            async for chunk in resp.aiter_raw():
+                if chunk:
+                    total["down"] += len(chunk)
+                    yield chunk
+        finally:
+            try:
+                await resp.aclose()
+            except Exception:
+                pass
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+            if total["down"]:
+                try:
+                    await consume_quota_partial(uid, total["down"])
+                except Exception:
+                    pass
+
+    return StreamingResponse(_forward_gen(), status_code=status, headers=resp_headers)
 
 
 async def _forward_ws_to_telemt(websocket, uid, upstream_path):
@@ -5938,6 +6200,10 @@ async def _forward_ws_to_telemt(websocket, uid, upstream_path):
         return
     host = get_domain(websocket)
     client_ip = _forwarder_client_ip(websocket)
+    if is_session_blocked(uid, client_ip):
+        log_event("Tunnel", "Blocked WEB session for " + str(uid) + " from " + str(client_ip), ip=client_ip)
+        await websocket.close(code=1008, reason="blocked by admin")
+        return
     offered = websocket.headers.get("sec-websocket-protocol", "")
     subprotocols = [part.strip() for part in offered.split(",") if part.strip()] or None
     raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -5954,7 +6220,12 @@ async def _forward_ws_to_telemt(websocket, uid, upstream_path):
     raw.settimeout(None)
     url = "ws://" + host + upstream_path
     try:
-        upstream_ws = await websockets.connect(url, sock=raw, subprotocols=subprotocols, extra_headers={"X-Forwarded-For": client_ip}, open_timeout=10.0, ping_interval=None)
+        ws_major = int(str(websockets.version.version).split(".")[0])
+    except (AttributeError, TypeError, ValueError):
+        ws_major = 12
+    ws_header_key = "additional_headers" if ws_major >= 13 else "extra_headers"
+    try:
+        upstream_ws = await websockets.connect(url, sock=raw, subprotocols=subprotocols, open_timeout=10.0, ping_interval=None, max_size=None, compression=None, **{ws_header_key: {"X-Forwarded-For": client_ip}})
     except Exception:
         try:
             raw.close()
@@ -6002,7 +6273,11 @@ async def _forward_ws_to_telemt(websocket, uid, upstream_path):
         except Exception:
             pass
 
-    await asyncio.gather(_client_to_upstream(), _upstream_to_client())
+    pump_tasks = [asyncio.create_task(_client_to_upstream()), asyncio.create_task(_upstream_to_client())]
+    _done, pending = await asyncio.wait(pump_tasks, return_when=asyncio.FIRST_COMPLETED)
+    for task in pending:
+        task.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
     try:
         await upstream_ws.close()
     except Exception:
@@ -6107,7 +6382,7 @@ async def api_login(request: Request):
     ip = get_real_remote_address(request)
     user_agent = request.headers.get("user-agent", "")
     success = verify_password(password, ADMIN_PASSWORD_HASH)
-    asyncio.create_task(log_login(ip, success, user_agent, "/api/login"))
+    spawn_background(log_login(ip, success, user_agent, "/api/login"))
     if not success:
         log_event("Auth", f"Failed login attempt from {ip}", ip, user_agent)
         async with _LOGIN_LOCK:
@@ -6149,9 +6424,9 @@ async def log_login(ip: str, success: bool, ua: str, path: str):
             (ip,)
         )
         if login_row and login_row.get("id") is not None:
-            asyncio.create_task(update_login_location(login_row["id"], ip))
+            spawn_background(update_login_location(login_row["id"], ip))
         if success:
-            asyncio.create_task(notify_telegram_login(ip, ua))
+            spawn_background(notify_telegram_login(ip, ua))
     except Exception as e:
         logger.error(f"log_login error: {e}")
         log_event("Warning", f"Failed to record login event for {ip}: {e}", ip, ua)
@@ -6176,7 +6451,7 @@ async def log_logout(ip: str, ua: str, path: str):
             (ip,)
         )
         if logout_row and logout_row.get("id") is not None:
-            asyncio.create_task(update_login_location(logout_row["id"], ip))
+            spawn_background(update_login_location(logout_row["id"], ip))
     except Exception as e:
         logger.error(f"log_logout error: {e}")
         log_event("Warning", f"Failed to record logout event for {ip}: {e}", ip, ua)
@@ -6614,6 +6889,7 @@ async def get_stats(_=Depends(require_auth)):
         "download_bytes": stats["download_bytes"],
         "monthly_usage_bytes": monthly_bytes,
         "monthly_limit_bytes": int(monthly_limit),
+        "links_total_used_bytes": sum(int(l.get("used_bytes") or 0) for l in LINKS.values()),
         "db_fresh_at_boot": DB_FRESH_AT_BOOT,
         "db_path": DB_PATH_AT_BOOT,
         "db_backend": DB_BACKEND,
@@ -6632,12 +6908,13 @@ async def get_detailed_stats(_=Depends(require_auth)):
             exp = parse_expires_at(l["expires_at"])
             if exp and exp < now:
                 expired += 1
-    today = datetime.now(UTC).strftime("%Y-%m-%d")
-    today_row = await db_fetchone("SELECT bytes FROM daily_traffic WHERE day = ?", "SELECT bytes FROM daily_traffic WHERE day = $1", (today,))
-    today_bytes = today_row["bytes"] if today_row else 0
-    daily_rows = await db_fetchall("SELECT day, bytes FROM daily_traffic ORDER BY day DESC LIMIT 7",
-                                   "SELECT day, bytes FROM daily_traffic ORDER BY day DESC LIMIT 7")
-    daily_traffic = {row["day"]: row["bytes"] for row in daily_rows}
+    _local_now = datetime.now(UTC) + timedelta(hours=TIMEZONE_OFFSET)
+    today = _local_now.strftime("%Y-%m-%d")
+    today_row = await db_fetchone("SELECT SUM(bytes) as total FROM daily_traffic WHERE day = ?", "SELECT SUM(bytes) as total FROM daily_traffic WHERE day = $1", (today,))
+    today_bytes = today_row["total"] if today_row and today_row["total"] else 0
+    daily_rows = await db_fetchall("SELECT day, SUM(bytes) as total FROM daily_traffic GROUP BY day ORDER BY day DESC LIMIT 7",
+                                   "SELECT day, SUM(bytes) as total FROM daily_traffic GROUP BY day ORDER BY day DESC LIMIT 7")
+    daily_traffic = {row["day"]: row["total"] for row in daily_rows}
     return {
         "total_links": len(links),
         "active_links": active,
@@ -6650,10 +6927,30 @@ async def get_detailed_stats(_=Depends(require_auth)):
 @app.get("/api/login-logs")
 async def get_login_logs(_=Depends(require_auth)):
     rows = await db_fetchall(
-        "SELECT timestamp, ip, success, user_agent, path, browser, os, country, city, isp, org FROM login_logs ORDER BY timestamp DESC LIMIT 20",
-        "SELECT timestamp, ip, success, user_agent, path, browser, os, country, city, isp, org FROM login_logs ORDER BY timestamp DESC LIMIT 20"
+        "SELECT id, timestamp, ip, success, user_agent, path, browser, os, country, city, isp, org FROM login_logs ORDER BY timestamp DESC LIMIT 20",
+        "SELECT id, timestamp, ip, success, user_agent, path, browser, os, country, city, isp, org FROM login_logs ORDER BY timestamp DESC LIMIT 20"
     )
-    return {"logs": [dict(r) for r in rows]}
+    result = [dict(r) for r in rows]
+    now = time.monotonic()
+    backfilled = 0
+    for row in result:
+        if backfilled >= 5:
+            break
+        if (row.get("country") or "").strip():
+            continue
+        ip = str(row.get("ip") or "").strip()
+        try:
+            parsed = ipaddress.ip_address(ip)
+        except ValueError:
+            continue
+        if not parsed.is_global:
+            continue
+        if now - GEO_BACKFILL_ATTEMPTED.get(ip, 0.0) < 300:
+            continue
+        GEO_BACKFILL_ATTEMPTED[ip] = now
+        spawn_background(update_login_location(int(row["id"]), ip))
+        backfilled += 1
+    return {"logs": result, "geo_status": dict(GEO_STATUS)}
 
 @app.get("/api/logs")
 async def get_logs(_=Depends(require_auth)):
@@ -7067,6 +7364,7 @@ async def create_link(request: Request, _=Depends(require_auth)):
     if protocol not in VALID_PROTOCOLS:
         raise HTTPException(status_code=400, detail="Invalid protocol")
     validate_protocol_fields(protocol, body)
+    validate_transport_fields(body)
     map_protocol_credentials(protocol, body)
     _proxy_user = ""
     _proxy_pw = ""
@@ -7897,6 +8195,7 @@ def active_sessions_snapshot():
             web_sessions = []
         for s in web_sessions:
             sid = "proxy:web:" + _wuid + ":" + str(s.get("id", ""))
+            web_ip = str(s.get("client_ip") or s.get("remote_ip") or s.get("ip") or s.get("peer_ip") or s.get("client") or "")
             live.add(sid)
             up = int(s.get("bytes_up", 0) or 0)
             down = int(s.get("bytes_down", 0) or 0)
@@ -7932,7 +8231,7 @@ def active_sessions_snapshot():
                 "up_bps": up_bps,
                 "down_bps": down_bps,
                 "started_at": s.get("started_at", ""),
-                "client_ip": s.get("client_ip", ""),
+                "client_ip": web_ip,
                 "destination": s.get("destination", ""),
                 "dest_host": s.get("dest_host", ""),
                 "dest_port": s.get("dest_port", 0),
@@ -7953,14 +8252,11 @@ def _aggregate_active_users(rows):
     grouped = {}
     order = []
     for row in rows:
-        uid = str(row.get("uid") or "")
-        owner = str(row.get("owner_user_id") or "")
-        if uid:
-            key = "user:" + uid
-        elif owner:
-            key = "owner:" + owner
-        else:
-            key = "ip:" + str(row.get("client_ip") or "unknown")
+        inbound = str(row.get("uid") or "")
+        if not inbound:
+            inbound = str(row.get("owner_user_id") or "") or str(row.get("inbound_tag") or row.get("transport") or "")
+        client_ip = str(row.get("client_ip") or "").strip()
+        key = "card:" + inbound + "|" + (client_ip or "unknown")
         group = grouped.get(key)
         if group is None:
             group = dict(row)
@@ -8040,6 +8336,62 @@ async def active_user_details(group_id: str, _=Depends(require_auth)):
 
 @app.post("/api/active-users/{conn_id}/disconnect")
 async def disconnect_active_user(conn_id: str, _=Depends(require_auth)):
+    if conn_id.startswith("card:"):
+        body = conn_id[5:]
+        if "|" in body:
+            target_uid, target_ip = body.split("|", 1)
+        else:
+            target_uid, target_ip = body, "unknown"
+        target_uid = target_uid.strip()
+        target_ip = target_ip.strip() or "unknown"
+        disconnected = 0
+        async with connections_lock:
+            ws_ids = []
+            for cid, info in list(connections.items()):
+                if str(info.get("uuid") or "") != target_uid:
+                    continue
+                if target_ip != "unknown" and str(info.get("ip") or "") != target_ip:
+                    continue
+                ws_ids.append(cid)
+        xhttp_ids = {sess.get("conn_id") for sess in xhttp_sessions.values()}
+        for cid in ws_ids:
+            ws = connection_sockets.get(cid)
+            if ws is None and cid not in xhttp_ids:
+                async with connections_lock:
+                    connections.pop(cid, None)
+                disconnected += 1
+                continue
+            if ws is None:
+                continue
+            try:
+                await ws.close(code=1000, reason="disconnected by admin")
+            except Exception:
+                pass
+            async with connections_lock:
+                connections.pop(cid, None)
+            connection_sockets.pop(cid, None)
+            disconnected += 1
+        for sid, sess in list(xhttp_sessions.items()):
+            if sess.get("conn_id") in ws_ids or (str(sess.get("uuid") or "") == target_uid and (target_ip == "unknown" or str(sess.get("ip") or "") == target_ip)):
+                await _teardown_xhttp(sid)
+                disconnected += 1
+        if tgproxy is not None:
+            try:
+                proxy_sessions = tgproxy.active_proxy_sessions()
+            except Exception:
+                proxy_sessions = []
+            for s in proxy_sessions:
+                link = _link_for_proxy_session(s.get("username") or "")
+                row_uid = str(link.get("uid") or "") if link else str(s.get("username") or "")
+                if row_uid == target_uid and (target_ip == "unknown" or str(s.get("client_ip") or "") == target_ip):
+                    if tgproxy.disconnect_proxy_session(s.get("id", "")):
+                        disconnected += 1
+        if disconnected == 0:
+            for group in active_users_snapshot():
+                if group.get("conn_id") == conn_id:
+                    raise HTTPException(status_code=400, detail="WEB proxy sessions live in telemt: disable the WEB inbound to close its sessions")
+            raise HTTPException(status_code=404, detail="session not found")
+        return {"ok": True, "disconnected": disconnected}
     if conn_id.startswith("user:") or conn_id.startswith("owner:") or conn_id.startswith("ip:"):
         kind, target = conn_id.split(":", 1)
         uids = set()
@@ -8051,6 +8403,31 @@ async def disconnect_active_user(conn_id: str, _=Depends(require_auth)):
                     if str(link.get("owner_user_id") or "") == target:
                         uids.add(str(link.get("uid") or ""))
         disconnected = 0
+        _block_pairs = set()
+        async with connections_lock:
+            for _cid, _info in list(connections.items()):
+                _match = False
+                if kind == "user" and str(_info.get("uuid") or "") == target:
+                    _match = True
+                elif kind == "owner" and str(_info.get("uuid") or "") in uids:
+                    _match = True
+                elif kind == "ip" and str(_info.get("ip") or "") == target:
+                    _match = True
+                if _match and _info.get("uuid") and _info.get("ip"):
+                    _block_pairs.add((str(_info.get("uuid")), str(_info.get("ip"))))
+        for _sid, _sess in list(xhttp_sessions.items()):
+            _suuid = str(_sess.get("uuid") or "")
+            _sip = str(_sess.get("ip") or "")
+            if not _suuid or not _sip:
+                continue
+            if (kind == "user" and _suuid == target) or (kind == "owner" and _suuid in uids) or (kind == "ip" and _sip == target):
+                _block_pairs.add((_suuid, _sip))
+        for _group in active_users_snapshot():
+            if _group.get("conn_id") == conn_id and str(_group.get("protocol") or "") in ("webproxy", "mtproto"):
+                _g_uid = str(_group.get("uid") or "")
+                for _g_ip in (_group.get("client_ips") or []):
+                    if _g_uid and _g_ip:
+                        _block_pairs.add((_g_uid, str(_g_ip)))
         async with connections_lock:
             ws_ids = []
             for cid, info in list(connections.items()):
@@ -8084,6 +8461,17 @@ async def disconnect_active_user(conn_id: str, _=Depends(require_auth)):
                 disconnected += 1
         if tgproxy is not None:
             try:
+                for _s in tgproxy.active_proxy_sessions():
+                    _slink = _link_for_proxy_session(_s.get("username") or "")
+                    _suid = str(_slink.get("uid") or "") if _slink else str(_s.get("username") or "")
+                    _sip = str(_s.get("client_ip") or "")
+                    if not _suid or not _sip:
+                        continue
+                    if _suid in uids or (kind == "ip" and _sip == target):
+                        _block_pairs.add((_suid, _sip))
+            except Exception:
+                pass
+            try:
                 proxy_sessions = tgproxy.active_proxy_sessions()
             except Exception:
                 proxy_sessions = []
@@ -8093,30 +8481,109 @@ async def disconnect_active_user(conn_id: str, _=Depends(require_auth)):
                 if row_uid in uids or (kind == "ip" and str(s.get("client_ip") or "") == target):
                     if tgproxy.disconnect_proxy_session(s.get("id", "")):
                         disconnected += 1
+        for _buid, _bip in sorted(_block_pairs):
+            await block_pair_with_telemt(_buid, _bip, "disconnected by admin")
         if disconnected == 0:
+            if _block_pairs:
+                return {"ok": True, "disconnected": 0, "blocked": len(_block_pairs)}
             for group in active_users_snapshot():
                 if group.get("conn_id") == conn_id:
                     raise HTTPException(status_code=400, detail="WEB proxy sessions live in telemt: disable the WEB inbound to close its sessions")
             raise HTTPException(status_code=404, detail="session not found")
-        return {"ok": True, "disconnected": disconnected}
+        return {"ok": True, "disconnected": disconnected, "blocked": len(_block_pairs)}
     if conn_id.startswith("proxy:"):
+        _ppair = None
+        if tgproxy is not None:
+            try:
+                for _s in tgproxy.active_proxy_sessions():
+                    if str(_s.get("id", "")) == conn_id[6:]:
+                        _plink = _link_for_proxy_session(_s.get("username") or "")
+                        _puid = str(_plink.get("uid") or "") if _plink else str(_s.get("username") or "")
+                        _pip = str(_s.get("client_ip") or "")
+                        if _puid and _pip:
+                            _ppair = (_puid, _pip)
+                        break
+            except Exception:
+                pass
         if tgproxy is not None and tgproxy.disconnect_proxy_session(conn_id[6:]):
+            if _ppair is not None:
+                await block_pair_with_telemt(_ppair[0], _ppair[1], "disconnected by admin")
             return {"ok": True}
         if conn_id.startswith("proxy:web:"):
+            _parts = conn_id.split(":")
+            _wuid = _parts[2] if len(_parts) > 2 else ""
+            _wip = ""
+            for _row in active_sessions_snapshot():
+                if _row.get("conn_id") == conn_id:
+                    _wip = str(_row.get("client_ip") or "")
+                    break
+            if _wuid and _wip:
+                await block_pair_with_telemt(_wuid, _wip, "disconnected by admin")
+                return {"ok": True, "blocked": True}
             raise HTTPException(status_code=400, detail="WEB proxy sessions live in telemt: disable the WEB inbound to close its sessions")
         raise HTTPException(status_code=404, detail="proxy session not found")
     ws = connection_sockets.get(conn_id)
     if ws is not None:
+        _pair = None
+        async with connections_lock:
+            _info = connections.get(conn_id)
+            if _info and _info.get("uuid") and _info.get("ip"):
+                _pair = (str(_info.get("uuid")), str(_info.get("ip")))
         try:
             await ws.close(code=1000, reason="disconnected by admin")
         except Exception:
             pass
+        if _pair is not None:
+            await block_pair_with_telemt(_pair[0], _pair[1], "disconnected by admin")
         return {"ok": True}
     for sid, sess in list(xhttp_sessions.items()):
         if sess.get("conn_id") == conn_id:
+            _xpair = None
+            if sess.get("uuid") and sess.get("ip"):
+                _xpair = (str(sess.get("uuid")), str(sess.get("ip")))
             await _teardown_xhttp(sid)
+            if _xpair is not None:
+                await block_pair_with_telemt(_xpair[0], _xpair[1], "disconnected by admin")
             return {"ok": True}
     raise HTTPException(status_code=404, detail="session not found")
+
+
+@app.get("/api/blocked-sessions")
+async def list_blocked_sessions(_=Depends(require_auth)):
+    rows = await db_fetchall("SELECT uid, ip, reason, created_at FROM blocked_sessions ORDER BY created_at DESC", "SELECT uid, ip, reason, created_at FROM blocked_sessions ORDER BY created_at DESC")
+    out = []
+    for r in rows:
+        link = LINKS.get(str(r["uid"]))
+        out.append({"uid": str(r["uid"]), "ip": str(r["ip"]), "reason": str(r.get("reason") or ""), "created_at": str(r.get("created_at") or ""), "label": str(link.get("label", "")) if link else "", "protocol": str(link.get("protocol", "")) if link else ""})
+    return {"blocked": out}
+
+
+@app.post("/api/blocked-sessions")
+async def create_blocked_session(request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    uid = str(body.get("uid") or "").strip()
+    ip = str(body.get("ip") or "").strip()
+    reason = str(body.get("reason") or "").strip()[:120]
+    if uid not in LINKS:
+        raise HTTPException(status_code=404, detail="link not found")
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid IP address")
+    await block_pair_with_telemt(uid, ip, reason or "blocked by admin")
+    await close_connections_for_link(uid)
+    return {"ok": True, "blocked": {"uid": uid, "ip": ip}}
+
+
+@app.delete("/api/blocked-sessions/{uid}/{ip}")
+async def delete_blocked_session(uid: str, ip: str, _=Depends(require_auth)):
+    if (str(uid), str(ip)) not in BLOCKED_PAIRS:
+        raise HTTPException(status_code=404, detail="session is not blocked")
+    await unblock_session(uid, ip)
+    link = LINKS.get(str(uid))
+    if link is not None and str(link.get("protocol") or "") in ("webproxy", "mtproto") and link.get("active"):
+        await _telemt_sync_link(link)
+    return {"ok": True}
 
 
 @app.get("/api/export-links")
@@ -8405,6 +8872,22 @@ async def regenerate_uuid(uid: str, _=Depends(require_auth)):
 
 @app.post("/api/links/{uid}/disconnect")
 async def disconnect_link(uid: str, _=Depends(require_auth)):
+    _pairs = set()
+    async with connections_lock:
+        for _info in list(connections.values()):
+            if str(_info.get("uuid") or "") == uid and _info.get("ip"):
+                _pairs.add((uid, str(_info.get("ip"))))
+    for _sess in list(xhttp_sessions.values()):
+        if str(_sess.get("uuid") or "") == uid and _sess.get("ip"):
+            _pairs.add((uid, str(_sess.get("ip"))))
+    if tgproxy is not None:
+        try:
+            for _s in tgproxy.active_proxy_sessions():
+                _slink = _link_for_proxy_session(_s.get("username") or "")
+                if _slink is not None and str(_slink.get("uid") or "") == uid and _s.get("client_ip"):
+                    _pairs.add((uid, str(_s.get("client_ip"))))
+        except Exception:
+            pass
     await close_connections_for_link(uid)
     if tgproxy is not None:
         try:
@@ -8414,8 +8897,10 @@ async def disconnect_link(uid: str, _=Depends(require_auth)):
                     tgproxy.disconnect_proxy_session(s.get("id", ""))
         except Exception:
             pass
+    for _buid, _bip in sorted(_pairs):
+        await block_pair_with_telemt(_buid, _bip, "disconnected by admin")
     log_event("Inbound", f"Disconnected all connections for {uid}")
-    return {"ok": True}
+    return {"ok": True, "blocked": len(_pairs)}
 
 
 @app.patch("/api/links/{uid}")
@@ -8894,15 +9379,22 @@ async def get_ip_location(ip: str) -> dict:
     try:
         parsed = ipaddress.ip_address(ip)
         if parsed.is_private or parsed.is_loopback or parsed.is_link_local or parsed.is_reserved or parsed.is_multicast or parsed.is_unspecified:
+            GEO_STATUS["ok"] = True
+            GEO_STATUS["detail"] = "local address"
             return dict(empty)
     except ValueError:
+        GEO_STATUS["ok"] = False
+        GEO_STATUS["detail"] = "invalid IP"
         return dict(empty)
     async with IP_LOCATION_CACHE_LOCK:
         if ip in IP_LOCATION_CACHE:
+            GEO_STATUS["ok"] = True
+            GEO_STATUS["detail"] = ""
             return dict(IP_LOCATION_CACHE[ip])
     result = dict(empty)
+    failures = []
     try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
+        async with httpx.AsyncClient(timeout=3.0, trust_env=False) as client:
             resp = await client.get(f"http://ip-api.com/json/{ip}?fields=status,country,countryCode,city,isp,org")
             if resp.status_code == 200:
                 data = resp.json()
@@ -8913,11 +9405,15 @@ async def get_ip_location(ip: str) -> dict:
                         "isp": data.get("isp", "") or "",
                         "org": data.get("org", "") or ""
                     }
-    except Exception:
-        pass
+                else:
+                    failures.append("ip-api: " + str(data.get("message") or "failed"))
+            else:
+                failures.append("ip-api: HTTP " + str(resp.status_code))
+    except Exception as e:
+        failures.append("ip-api: " + str(e)[:120])
     if not any(result.values()):
         try:
-            async with httpx.AsyncClient(timeout=3.0) as client:
+            async with httpx.AsyncClient(timeout=3.0, trust_env=False) as client:
                 resp = await client.get(f"https://ipapi.co/{ip}/json/")
                 if resp.status_code == 200:
                     data = resp.json()
@@ -8928,11 +9424,15 @@ async def get_ip_location(ip: str) -> dict:
                             "isp": data.get("org", "") or "",
                             "org": data.get("org", "") or ""
                         }
-        except Exception:
-            pass
+                    else:
+                        failures.append("ipapi.co: " + str(data.get("reason") or data.get("error") or "failed")[:120])
+                else:
+                    failures.append("ipapi.co: HTTP " + str(resp.status_code))
+        except Exception as e:
+            failures.append("ipapi.co: " + str(e)[:120])
     if not any(result.values()):
         try:
-            async with httpx.AsyncClient(timeout=3.0) as client:
+            async with httpx.AsyncClient(timeout=3.0, trust_env=False) as client:
                 resp = await client.get(f"https://ipinfo.io/{ip}/json")
                 if resp.status_code == 200:
                     data = resp.json()
@@ -8942,13 +9442,21 @@ async def get_ip_location(ip: str) -> dict:
                         "isp": data.get("org", "") or "",
                         "org": data.get("org", "") or ""
                     }
-        except Exception:
-            pass
+                else:
+                    failures.append("ipinfo.io: HTTP " + str(resp.status_code))
+        except Exception as e:
+            failures.append("ipinfo.io: " + str(e)[:120])
     if any(result.values()):
         async with IP_LOCATION_CACHE_LOCK:
             if len(IP_LOCATION_CACHE) >= IP_LOCATION_CACHE_MAX:
                 IP_LOCATION_CACHE.pop(next(iter(IP_LOCATION_CACHE)))
             IP_LOCATION_CACHE[ip] = dict(result)
+        GEO_STATUS["ok"] = True
+        GEO_STATUS["detail"] = ""
+        return dict(result)
+    GEO_STATUS["ok"] = False
+    GEO_STATUS["detail"] = "location lookup failed: " + "; ".join(failures) if failures else "location lookup failed"
+    logger.warning(f"get_ip_location failed for {ip}: {GEO_STATUS['detail']}")
     return dict(result)
 
 @app.post("/api/ip-profiles")
@@ -9346,8 +9854,6 @@ async def http_proxy(target_url: str, request: Request, _=Depends(require_auth))
         async def response_streamer():
             try:
                 async for chunk in resp.aiter_bytes():
-                    stats["total_bytes"] += len(chunk)
-                    stats["download_bytes"] += len(chunk)
                     yield chunk
             finally:
                 await resp.aclose()
@@ -9523,7 +10029,7 @@ async def user_dashboard(uid: str, request: Request):
     <button class="btn btn-outline" onclick="copyToClip('{sub_url_esc}', t('sub_copied'))"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/><line x1="2" y1="21" x2="9" y2="21"/></svg></span> <span data-en="Copy Sub" data-fa="کپی اشتراک">Copy Sub</span></button>
     <button class="btn btn-outline" onclick="toggleLinkText()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></span> <span data-en="Show link text" data-fa="نمایش متن لینک">Show link text</span></button>"""
         else:
-            actions_html = """<div style="color:#f87171;" data-en="Proxy listener is disabled on this host, so no working link exists for this inbound." data-fa="شنونده پروکسی در این هاست غیرفعال است، پس هیچ لینک سالمی برای این اینباند وجود ندارد.">Proxy listener is disabled on this host, so no working link exists for this inbound.</div>"""
+            actions_html = """<div style="color:var(--danger);" data-en="Proxy listener is disabled on this host, so no working link exists for this inbound." data-fa="شنونده پروکسی در این هاست غیرفعال است، پس هیچ لینک سالمی برای این اینباند وجود ندارد.">Proxy listener is disabled on this host, so no working link exists for this inbound.</div>"""
     else:
         actions_html = f"""<button class="btn btn-outline" onclick="copyToClip('{sub_url_esc}', t('sub_copied'))"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/><line x1="2" y1="21" x2="9" y2="21"/></svg></span> <span data-en="Copy Sub" data-fa="کپی اشتراک">Copy Sub</span></button>
     <button class="btn btn-outline" onclick="copyToClip('{clash_url_esc}', t('clash_copied'))"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l3 3-3 3-3-3z"/><path d="M6 11l3 3-3 3-3-3z"/><path d="M18 11l3 3-3 3-3-3z"/></svg></span> <span data-en="Copy Clash" data-fa="کپی کلش">Copy Clash</span></button>
@@ -9549,9 +10055,12 @@ async def user_dashboard(uid: str, request: Request):
   --border-strong:#3a414c;
   --text:#f2f3f5;
   --text-2:#a7adb8;
-  --text-3:#6e7681;
+  --text-3:#9aa3af;
   --accent:#39ff14;
   --accent-hover:#2ee00e;
+  --accent-ink:#39ff14;
+  --accent-solid:#39ff14;
+  --danger-solid:#dc2626;
   --accent-soft:rgba(57,255,20,0.12);
   --accent-border:rgba(57,255,20,0.35);
   --on-accent:#0b0f0a;
@@ -9593,19 +10102,22 @@ body.light-mode{{
   --border-strong:#d5c69c;
   --text:#221c10;
   --text-2:#5c5340;
-  --text-3:#7a6e52;
+  --text-3:#655a3f;
   --accent:#15803d;
   --accent-hover:#166534;
+  --accent-ink:#166534;
+  --accent-solid:#15803d;
+  --danger-solid:#b91c1c;
   --accent-soft:rgba(21,128,61,0.10);
   --accent-border:rgba(21,128,61,0.35);
   --on-accent:#ffffff;
-  --success:#15803d;
+  --success:#166534;
   --success-soft:#dcfce7;
   --success-border:#86efac;
-  --warning:#b45309;
+  --warning:#92400e;
   --warning-soft:#fef3c7;
   --warning-border:#fcd34d;
-  --danger:#dc2626;
+  --danger:#b91c1c;
   --danger-soft:#fee2e2;
   --danger-border:#fca5a5;
   --focus:rgba(21,128,61,0.45);
@@ -9621,12 +10133,16 @@ body.blue-dark{{
   --border:#2b3a4f;
   --border-strong:#475569;
   --text:#e2e8f0;
-  --text-2:#94a3b8;
-  --text-3:#64748b;
+  --text-2:#a5b4c7;
+  --text-3:#9fb0c3;
   --accent:#3b82f6;
   --accent-hover:#2563eb;
+  --accent-ink:#93c5fd;
+  --accent-solid:#2563eb;
+  --danger-solid:#dc2626;
   --accent-soft:rgba(59,130,246,0.12);
   --accent-border:rgba(59,130,246,0.35);
+  --danger:#fca5a5;
   --on-accent:#ffffff;
   --focus:rgba(59,130,246,0.55);
 }}
@@ -9663,7 +10179,7 @@ body[dir="rtl"]{{direction:rtl;text-align:start}}
 h1{{color:var(--text); font-size:20px; font-weight:600; letter-spacing:-0.02em;}}
 .lang-switch{{display:flex; gap:2px; background:var(--surface-2); border-radius:var(--radius-sm); padding:3px;}}
 .lang-btn{{padding:6px 14px; border:none; background:transparent; color:var(--text-3); font-size:13px; font-weight:600; border-radius:var(--radius-sm); cursor:pointer; font-family:inherit; transition:background-color 120ms ease-out,color 120ms ease-out;}}
-.lang-btn.active{{background:var(--accent); color:var(--on-accent);}}
+.lang-btn.active{{background:var(--accent-solid); color:var(--on-accent);}}
 .info-box{{
   background:var(--surface-2); border-radius:var(--radius-md); padding:16px; margin-bottom:20px;
   display:grid; grid-template-columns:1fr 1fr; gap:12px 24px; text-align:start;
@@ -9684,7 +10200,7 @@ h1{{color:var(--text); font-size:20px; font-weight:600; letter-spacing:-0.02em;}
 .actions-grid{{display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,220px),1fr)); gap:10px; margin-bottom:10px;}}
 .btn{{
   display:flex; align-items:center; justify-content:center; gap:8px; padding:8px 14px;
-  background:var(--accent);
+  background:var(--accent-solid);
   color:var(--on-accent); font-weight:500; border-radius:var(--radius-sm); text-decoration:none;
   transition:background-color 120ms ease-out,color 120ms ease-out,border-color 120ms ease-out; border:1px solid transparent; cursor:pointer; font-family:inherit; font-size:14px;
 }}
@@ -10451,6 +10967,7 @@ async def clash_subscription(uid: str, request: Request):
             proxy["xhttp-opts"] = {
                 "path": xhttp_path,
                 "mode": xhttp_mode,
+                "host": link.get("custom_host") or domain,
                 "headers": {"Host": link.get("custom_host") or domain}
             }
 
@@ -10469,9 +10986,7 @@ async def clash_subscription(uid: str, request: Request):
             if _frag:
                 proxy["fragment"] = _frag
         if ech_enabled and ech_sni:
-            proxy["ech"] = {"enable": True, "sni": ech_sni}
-            if ech_doh:
-                proxy["ech"]["doh"] = ech_doh
+            proxy["ech-opts"] = {"enable": True, "query-server-name": ech_sni}
         if proto == "vmess-ws":
             proxy["type"] = "vmess"
             proxy["alterId"] = 0
@@ -10491,6 +11006,9 @@ async def clash_subscription(uid: str, request: Request):
             proxy.pop("uuid", None)
             proxy.pop("packet-encoding", None)
             proxy.pop("ws-opts", None)
+            proxy.pop("network", None)
+            proxy.pop("tls", None)
+            proxy.pop("sni", None)
             proxy["udp"] = False
         proxies.append(proxy)
 
@@ -10585,6 +11103,8 @@ async def singbox_subscription(uid: str, request: Request):
     domain = get_domain(request)
     if (link.get("protocol") or "") in PROXY_PROTOCOLS:
         return _proxy_singbox_response(link, domain)
+    if (link.get("protocol") or "").startswith("xhttp-"):
+        raise HTTPException(status_code=422, detail="Sing-box has no XHTTP transport in any upstream version, use the vless:// link, the Clash subscription (mihomo 1.19.22 or newer) or the Xray config instead")
     ip_profile_id = link.get("ip_profile_id")
     address_entries = []
 
@@ -10711,9 +11231,7 @@ async def singbox_subscription(uid: str, request: Request):
         if tfo:
             proxy["tcp_fast_open"] = True
         if ech_enabled and ech_sni:
-            proxy["tls"]["ech"] = {"enabled": True, "sni": ech_sni}
-            if ech_doh:
-                proxy["tls"]["ech"]["doh"] = ech_doh
+            proxy["tls"]["ech"] = {"enabled": True}
         if proto == "vmess-ws":
             proxy["type"] = "vmess"
             proxy["alter_id"] = 0
@@ -10732,6 +11250,8 @@ async def singbox_subscription(uid: str, request: Request):
             proxy["plugin_opts"] = "mode=websocket;host=" + (link.get("custom_host") or domain) + ";path=" + path + ";tls;mux=0"
             proxy.pop("uuid", None)
             proxy.pop("packet_encoding", None)
+            proxy.pop("tls", None)
+            proxy.pop("transport", None)
         outbounds.append(proxy)
 
     proxy_tags = [o["tag"] for o in outbounds]
@@ -10769,7 +11289,8 @@ async def singbox_subscription(uid: str, request: Request):
             else:
                 rules.append({"domain": d, "outbound": "🚀 Select"})
     rules.append({"network": "tcp", "outbound": "🚀 Select"})
-    if udp_enabled:
+    _sb_udp = bool(udp_enabled) and proto != "ss-ws" and not proto.startswith("xhttp-")
+    if _sb_udp:
         rules.append({"network": "udp", "outbound": "🚀 Select"})
     else:
         rules.append({"network": "udp", "outbound": "block"})
@@ -11389,24 +11910,51 @@ def _test_public_address(request):
     return domain, domain_source, tls, panel_port, ws_scheme, http_scheme
 
 
+_PUBLIC_TCP_PROBE_TIMEOUT = 1.5
+
+
+async def _probe_public_tcp(host, port, timeout=_PUBLIC_TCP_PROBE_TIMEOUT):
+    started = time.monotonic()
+    try:
+        _reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
+    except asyncio.TimeoutError:
+        return False, "connection timed out after " + str(timeout) + "s (port not published or filtered)", round((time.monotonic() - started) * 1000, 1)
+    except OSError as e:
+        return False, "connection failed: " + str(e), round((time.monotonic() - started) * 1000, 1)
+    except Exception as e:
+        return False, "connection failed: " + str(e), round((time.monotonic() - started) * 1000, 1)
+    try:
+        writer.close()
+    except OSError:
+        pass
+    return True, "", round((time.monotonic() - started) * 1000, 1)
+
+
 async def _test_raw_tcp_public_first(handshake, domain, raw_port, uid):
     public_target = format_host_port(domain, raw_port)
     local_target = "127.0.0.1:" + str(raw_port)
-    try:
-        ok, detail = await handshake(domain, raw_port, uid)
-        if ok:
-            return True, "pass", detail, public_target + " (public address)"
-    except Exception as e:
-        public_reason = "could not reach " + public_target + ": " + str(e)
-    else:
-        public_reason = "public address answered but the handshake was rejected: " + detail
+    local_started = time.monotonic()
     try:
         local_ok, local_detail = await handshake("127.0.0.1", raw_port, uid)
     except Exception as e:
-        return False, "fail", "Public address " + public_reason + "; local listener also failed: " + str(e) + ". " + _PAAS_TCP_NOTE, local_target + " (local listener)"
+        local_ok = False
+        local_detail = "raised " + type(e).__name__ + (": " + str(e) if str(e) else "")
+    local_ms = round((time.monotonic() - local_started) * 1000, 1)
+    probe_ok, probe_reason, probe_ms = await _probe_public_tcp(domain, raw_port)
+    if probe_ok:
+        try:
+            ok, detail = await handshake(domain, raw_port, uid)
+        except Exception as e:
+            ok = False
+            detail = "public handshake raised " + type(e).__name__ + (": " + str(e) if str(e) else "")
+        if ok:
+            return True, "pass", detail, public_target + " (public address)"
+        if local_ok:
+            return True, "local_only", "Public address " + public_target + " accepts TCP but the handshake was rejected: " + detail + "; local listener handshake passed in " + str(local_ms) + " ms: " + local_detail + ". " + _PAAS_TCP_NOTE, local_target + " (local listener)"
+        return False, "fail", "Public address " + public_target + " accepts TCP but the handshake was rejected: " + detail + "; local listener handshake failed: " + local_detail + ". " + _PAAS_TCP_NOTE, local_target + " (local listener)"
     if local_ok:
-        return True, "local_only", "Public address " + public_reason + "; local listener handshake passed: " + local_detail + ". " + _PAAS_TCP_NOTE, local_target + " (local listener)"
-    return False, "fail", "Public address " + public_reason + "; local listener handshake failed: " + local_detail + ". " + _PAAS_TCP_NOTE, local_target + " (local listener)"
+        return True, "local_only", "Public address " + public_target + " is not reachable (" + probe_reason + " in " + str(probe_ms) + " ms); local listener handshake passed in " + str(local_ms) + " ms: " + local_detail + ". " + _PAAS_TCP_NOTE, local_target + " (local listener)"
+    return False, "fail", "Public address " + public_target + " is not reachable (" + probe_reason + " in " + str(probe_ms) + " ms); local listener handshake failed: " + local_detail + ". " + _PAAS_TCP_NOTE, local_target + " (local listener)"
 
 
 async def _test_socks5_handshake(host, port, uid, timeout=5):
@@ -11886,6 +12434,7 @@ async def test_inbound(uid: str, request: Request, _=Depends(require_auth)):
             elif proto == "socks5":
                 raw_port = SOCKS_PORT
                 target = format_host_port(domain, raw_port)
+                await refresh_proxy_listener_status()
                 if not _proxy_listener_enabled("socks5"):
                     verdict = "not_available"
                     detail = "SOCKS5 listener is disabled on this host (port " + str(raw_port) + " not configured). " + _PAAS_TCP_NOTE
@@ -11894,6 +12443,7 @@ async def test_inbound(uid: str, request: Request, _=Depends(require_auth)):
             elif proto == "http-proxy":
                 raw_port = HTTP_PROXY_PORT
                 target = format_host_port(domain, raw_port)
+                await refresh_proxy_listener_status()
                 if not _proxy_listener_enabled("http-proxy"):
                     verdict = "not_available"
                     detail = "HTTP proxy listener is disabled on this host (port " + str(raw_port) + " not configured). " + _PAAS_TCP_NOTE
@@ -12170,6 +12720,12 @@ async def _teardown_xhttp(session_id: str):
         sess = xhttp_sessions.pop(session_id, None)
     if not sess:
         return
+    _teardown_gate = sess.get("quota_gate")
+    if _teardown_gate is not None:
+        try:
+            await _teardown_gate.flush()
+        except Exception:
+            pass
     sess["closed"] = True
     for t in ("uplink_task", "downlink_task"):
         task = sess.get(t)
@@ -12286,7 +12842,7 @@ _MONTHLY_CACHE = {"month": "", "bytes": 0, "limit": 0, "checked_at": 0.0}
 
 
 async def monthly_quota_exceeded():
-    now = datetime.now(UTC)
+    now = datetime.now(UTC) + timedelta(hours=TIMEZONE_OFFSET)
     month = now.strftime("%Y-%m")
     if _MONTHLY_CACHE["month"] != month or time.monotonic() - _MONTHLY_CACHE["checked_at"] > 60:
         limit_row = await db_fetchone("SELECT value FROM settings WHERE key='monthly_limit_gb'", "SELECT value FROM settings WHERE key='monthly_limit_gb'")
@@ -12508,8 +13064,7 @@ async def _trojan_udp_down(websocket, udp_sock, conn_id, uid, gate, address, por
                 except Exception:
                     pass
                 return
-            stats["total_bytes"] += len(data)
-            stats["download_bytes"] += len(data)
+            await account_traffic(uid, len(data), "down")
             packet = _build_trojan_udp_packet(address, port, data)
             try:
                 await websocket.send_bytes(packet)
@@ -12547,8 +13102,7 @@ async def _trojan_udp_session(websocket, conn_id, uid, gate, first_data, link=No
             except Exception:
                 pass
             return False
-        stats["total_bytes"] += len(payload)
-        stats["upload_bytes"] += len(payload)
+        await account_traffic(uid, len(payload), "up")
         udp_sock = sockets.get(key)
         if udp_sock is None:
             try:
@@ -12627,7 +13181,7 @@ async def udp_relay(websocket, udp_sock, conn_id, uid):
                 if not await consume_quota(uid, len(datagram)):
                     await websocket.close(code=1008, reason="quota exceeded")
                     return
-                stats["total_bytes"] += len(datagram); stats["upload_bytes"] += len(datagram)
+                await account_traffic(uid, len(datagram), "up")
                 try:
                     await asyncio.get_event_loop().sock_sendall(udp_sock, datagram)
                 except Exception:
@@ -12646,7 +13200,7 @@ async def udp_from_socket(websocket, udp_sock, conn_id, uid):
             if not await consume_quota(uid, len(data)):
                 await websocket.close(code=1008, reason="quota exceeded")
                 break
-            stats["total_bytes"] += len(data); stats["download_bytes"] += len(data)
+            await account_traffic(uid, len(data), "down")
             try:
                 payload = (b"\x00\x00" + data) if first else data
                 first = False
@@ -12658,10 +13212,8 @@ async def udp_from_socket(websocket, udp_sock, conn_id, uid):
                            "error": f"UDP from socket error {conn_id}: {e}", "type": "Tunnel"})
 
 def get_client_ip(websocket: WebSocket) -> str:
-    forwarded = websocket.headers.get("x-forwarded-for")
-    if forwarded: return forwarded.split(",")[0].strip()
-    if websocket.client: return websocket.client.host
-    return "unknown"
+    peer = websocket.client.host if websocket.client else "unknown"
+    return _real_ip_from_peer_and_headers(peer, lambda name: websocket.headers.get(name))
 
 _ws_connect_attempts = {}
 
@@ -12737,6 +13289,7 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str, route: str = "ws-in"
         return
     writer = None
     udp_sock = None
+    gate = None
     try:
         await websocket.accept()
         logger.info(f"WS accepted {uuid}")
@@ -12815,7 +13368,7 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str, route: str = "ws-in"
                 if not await consume_quota(uuid, len(datagram)):
                     await websocket.close(code=1008, reason="quota exceeded")
                     return
-                stats["total_bytes"] += len(datagram); stats["upload_bytes"] += len(datagram)
+                await account_traffic(uuid, len(datagram), "up")
                 try:
                     await asyncio.get_event_loop().sock_sendall(udp_sock, datagram)
                 except Exception:
@@ -12862,6 +13415,20 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str, route: str = "ws-in"
                            "error": f"Tunnel {uuid}: {exc}", "type": "WebSocket"})
         logger.exception("WS error")
     finally:
+        if gate is not None:
+            try:
+                await gate.flush()
+            except Exception:
+                pass
+        if conn_id:
+            async with connections_lock:
+                _flush_info = connections.get(conn_id)
+            _registered_gate = _flush_info.get("quota_gate") if _flush_info else None
+            if _registered_gate is not None and _registered_gate is not gate:
+                try:
+                    await _registered_gate.flush()
+                except Exception:
+                    pass
         if writer:
             try: writer.close(); await writer.wait_closed()
             except: pass
@@ -13266,6 +13833,8 @@ async def xhttp_stream_one(base_path: str, request: Request):
     if not link or not link["active"]:
         raise HTTPException(status_code=403, detail="inactive or unknown UUID")
     _require_xhttp_protocol(link)
+    if is_session_blocked(user_uuid, ip):
+        raise HTTPException(status_code=403, detail="blocked by admin")
     if not is_ip_allowed(link, user_uuid, ip):
         raise HTTPException(status_code=403, detail="ip limit reached")
 
@@ -16063,9 +16632,12 @@ PANEL_HTML = r"""<!DOCTYPE html>
   --border-strong:#3a414c;
   --text:#f2f3f5;
   --text-2:#a7adb8;
-  --text-3:#6e7681;
+  --text-3:#9aa3af;
   --accent:#39ff14;
   --accent-hover:#2ee00e;
+  --accent-ink:#39ff14;
+  --accent-solid:#39ff14;
+  --danger-solid:#dc2626;
   --accent-soft:rgba(57,255,20,0.12);
   --accent-border:rgba(57,255,20,0.35);
   --on-accent:#0b0f0a;
@@ -16109,19 +16681,22 @@ body.light-mode{
   --border-strong:#d5c69c;
   --text:#221c10;
   --text-2:#5c5340;
-  --text-3:#7a6e52;
+  --text-3:#655a3f;
   --accent:#15803d;
   --accent-hover:#166534;
+  --accent-ink:#166534;
+  --accent-solid:#15803d;
+  --danger-solid:#b91c1c;
   --accent-soft:rgba(21,128,61,0.10);
   --accent-border:rgba(21,128,61,0.35);
   --on-accent:#ffffff;
-  --success:#15803d;
+  --success:#166534;
   --success-soft:#dcfce7;
   --success-border:#86efac;
-  --warning:#b45309;
+  --warning:#92400e;
   --warning-soft:#fef3c7;
   --warning-border:#fcd34d;
-  --danger:#dc2626;
+  --danger:#b91c1c;
   --danger-soft:#fee2e2;
   --danger-border:#fca5a5;
   --focus:rgba(21,128,61,0.45);
@@ -16139,17 +16714,21 @@ body.blue-dark{
   --border:#2b3a4f;
   --border-strong:#475569;
   --text:#e2e8f0;
-  --text-2:#94a3b8;
-  --text-3:#64748b;
+  --text-2:#a5b4c7;
+  --text-3:#9fb0c3;
   --accent:#3b82f6;
   --accent-hover:#2563eb;
+  --accent-ink:#93c5fd;
+  --accent-solid:#2563eb;
+  --danger-solid:#dc2626;
   --accent-soft:rgba(59,130,246,0.12);
   --accent-border:rgba(59,130,246,0.35);
+  --danger:#fca5a5;
   --on-accent:#ffffff;
   --focus:rgba(59,130,246,0.55);
 
 }
-body.light-mode ::selection{ background:var(--accent); color:var(--on-accent); }
+body.light-mode ::selection{ background:var(--accent-solid); color:var(--on-accent); }
 .icon{display: inline-block; width: 1.2em; height: 1.2em; background-color: currentColor; mask-size: contain; mask-repeat: no-repeat; mask-position: center; -webkit-mask-size: contain; -webkit-mask-repeat: no-repeat; -webkit-mask-position: center; vertical-align: middle;}
 .nav-link .nav-icon, .btn-icon .icon, .stat-card .stat-icon, .status-card .status-icon, .header-right .btn-icon .icon{display: inline-block; width: 1.2em; height: 1.2em; background-color: currentColor; mask-size: contain; mask-repeat: no-repeat; mask-position: center; -webkit-mask-size: contain; -webkit-mask-repeat: no-repeat; -webkit-mask-position: center; vertical-align: middle;}
 .icon-dashboard{mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Cpath d='M3 9l9-7 9 7v11a2 2 0 01-2 2H5a2 2 0 01-2-2z'/%3E%3Cpolyline points='9 22 9 12 15 12 15 22'/%3E%3C/svg%3E");}
@@ -16194,7 +16773,7 @@ a{text-decoration: none; color: inherit;}
 ::-webkit-scrollbar-thumb{background: var(--border-strong); border-radius: 10px; transition:background-color 120ms ease-out;}
 ::-webkit-scrollbar-thumb:hover{background: var(--accent-soft);}
 *{scrollbar-width: thin; scrollbar-color: var(--border-strong) var(--surface);}
-::selection{background: var(--accent); color:var(--on-accent);}
+::selection{background: var(--accent-solid); color:var(--on-accent);}
 .header{min-height:56px; background:var(--surface); border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: center; padding:0 16px; position: sticky; top: 0; z-index: 101; }
 .header-inner{display: flex; align-items: center; justify-content: space-between; width: 100%; max-width: 1200px; flex-wrap:wrap; gap: 16px;}
 .logo{display:inline-flex;align-items:center;gap:8px;font-family:var(--font-sans);font-size:20px;font-weight:700;color:var(--text);letter-spacing:-0.02em;flex-shrink:0;}
@@ -16203,16 +16782,16 @@ a{text-decoration: none; color: inherit;}
 .header-nav{display:flex;flex-wrap:wrap;gap:8px; align-items: center; gap: 8px;}
 .nav-link{display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 10px 20px; border-radius: var(--radius-sm); color: var(--text-3); font-size: 0.88rem; font-weight: 600; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out; border: 1px solid transparent; background: none; cursor: pointer; font-family: inherit; position: relative; overflow: hidden;}
 .nav-link::after{content: ''; position: absolute; bottom: 0; left: 50%; width: 0; height: 2px; background: var(--accent); transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out; transform: translateX(-50%);}
-.nav-link:hover{color: var(--accent); background: var(--accent-soft); border-color: transparent;}
+.nav-link:hover{color: var(--accent-ink); background: var(--accent-soft); border-color: transparent;}
 .nav-link:hover::after{width: 75%;}
-.nav-link.active{color:var(--accent); background:var(--accent-soft); border-color:var(--accent);}
+.nav-link.active{color:var(--accent-ink); background:var(--accent-soft); border-color:var(--accent);}
 .nav-link.active::after{width: 95%;}
 .header-right{display: flex; align-items: center; gap: 10px; flex-wrap: nowrap;}
 .btn-icon{background: var(--surface-3); border: 1px solid var(--border); color: var(--text-3); border-radius: var(--radius-sm); padding: 10px; cursor: pointer; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out; font-size: 1.1rem; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0;}
-.btn-icon:hover{color: var(--accent); border-color: var(--accent); background: var(--accent-soft); transform: translateY(-2px);}
+.btn-icon:hover{color: var(--accent-ink); border-color: var(--accent); background: var(--accent-soft); transform: translateY(-2px);}
 .lang-switch{display: flex; gap: 2px; background: var(--surface-3); border-radius: var(--radius-sm); padding: 3px;}
 .lang-btn{padding: 6px 14px; border: none; background: transparent; color: var(--text-3); font-size: 0.8rem; font-weight: 700; border-radius: 8px; cursor: pointer; font-family: inherit; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out;}
-.lang-btn.active{background: var(--accent); color:var(--on-accent);}
+.lang-btn.active{background: var(--accent-solid); color:var(--on-accent);}
 .hamburger{display: none; background: transparent; border: 1px solid var(--border); color: var(--text-3); font-size: 1.9rem; cursor: pointer; padding: 4px 12px; border-radius: var(--radius-sm);}
 .main{flex: 1; min-height: calc(100vh - 56px - 52px); padding:24px 16px; overflow-y: auto; overflow-x: hidden;}
 .page{display: none;}
@@ -16226,7 +16805,7 @@ a{text-decoration: none; color: inherit;}
 .stat-card:hover{border-color: var(--border-strong); }
 .stat-label{font-size: 0.75rem; color: var(--text-3); font-weight: 700; text-transform: uppercase; letter-spacing: 0.14em; margin-bottom: 14px;}
 .stat-val{font-size: 2.2rem; font-weight: 800; color: var(--text); transition:color 120ms ease-out;}
-.stat-card:hover .stat-val{color: var(--accent);}
+.stat-card:hover .stat-val{color: var(--accent-ink);}
 .stat-unit{font-size: 1rem; font-weight: 400; color: var(--text-3);}
 @container (max-width: 200px) {
 .stat-val{font-size: 1.4rem;}
@@ -16244,12 +16823,12 @@ a{text-decoration: none; color: inherit;}
 .chart-container{height: 280px; width: 100%;}
 .btn{font-family: inherit; font-size:14px; font-weight:500; border-radius:6px; padding:8px 14px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: 10px; border: none; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out; position: relative; overflow: hidden; letter-spacing: 0.3px;}
 .btn:active{transform: scale(0.97);}
-.btn-primary{background:var(--accent); color:var(--on-accent); box-shadow:var(--shadow-sm);}
+.btn-primary{background:var(--accent-solid); color:var(--on-accent); box-shadow:var(--shadow-sm);}
 .btn-primary:hover{ }
 .btn-primary:active{transform: translateY(0) scale(0.97);}
 .btn-outline{background:var(--surface); color: var(--text); border:1px solid var(--border-strong);}
-.btn-outline:hover{background: var(--accent-soft); border-color: var(--accent); color: var(--accent);}
-.btn-danger{background:var(--danger); color:#fff; border: 1px solid rgba(248,113,113,0.3);}
+.btn-outline:hover{background: var(--accent-soft); border-color: var(--accent); color: var(--accent-ink);}
+.btn-danger{background:var(--danger-solid); color:#fff; border: 1px solid rgba(248,113,113,0.3);}
 .btn-danger:hover{background:var(--danger);}
 .btn-sm{padding: 8px 18px; font-size: 0.78rem;}
 .tbl-wrap{overflow-x: auto; border-radius: var(--radius-sm);}
@@ -16280,7 +16859,7 @@ a{text-decoration: none; color: inherit;}
 .tbl.scanner-tbl th:first-child,
 .tbl.scanner-tbl td:first-child{width: auto; text-align: left;}
 .tag{display: inline-flex; align-items: center; padding: 5px 14px; border-radius: 10px; font-size: 0.68rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.06em;}
-.tag-vless{background: var(--accent-soft); color: var(--accent); border: 1px solid var(--border);}
+.tag-vless{background: var(--accent-soft); color: var(--accent-ink); border: 1px solid var(--border);}
 .tag-on{background:var(--success-soft);color:var(--success);border:1px solid var(--success-border);}
 .tag-off{background:var(--danger-soft);color:var(--danger);border:1px solid var(--danger-border);}
 .pill{display: flex; align-items: center; gap: 12px; font-size: 0.9rem;}
@@ -16322,26 +16901,26 @@ body[dir="rtl"] .row-act-grid{direction: ltr;}
 @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
 .mo-box{background: var(--surface-2); border: 1px solid var(--border-strong); border-radius:var(--radius-xl); padding: 42px; width:min(560px,calc(100vw - 32px)); min-width:min(560px,calc(100vw - 32px)); max-width:min(560px,calc(100vw - 32px)); max-height: 90vh; overflow-y: auto; overflow-x: hidden; margin: auto; box-shadow: 0 32px 80px rgba(0,0,0,0.7); position: relative; animation:scaleIn 150ms ease;}
 @keyframes scaleIn { from { transform: scale(0.95); opacity: 0; } to { transform: scale(1); opacity: 1; } }
-.mo-title{font-size: 1.6rem; font-weight: 700; margin-bottom: 28px; color: var(--accent);}
+.mo-title{font-size: 1.6rem; font-weight: 700; margin-bottom: 28px; color: var(--accent-ink);}
 .mo-close{position: absolute; top: 20px; inset-inline-end: 20px; background: var(--surface-3); border: 1px solid var(--border); color: var(--text-3); width: 40px; height: 40px; border-radius: var(--radius-sm); cursor: pointer; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out; display: flex; align-items: center; justify-content: center; font-size: 1.4rem;}
 .mo-close:hover{color: var(--danger); border-color: var(--danger);}
 .qr-box{text-align: center; padding: 30px; background: var(--surface-3); border-radius: var(--radius-md); border: 1px solid var(--border); margin-top: 18px;}
 .qr-box canvas{display:block;max-width:100%;height:auto;}
 .footer{ display: flex; align-items: center; justify-content: center; font-size: 0.85rem; color: var(--text-3); border-top: 1px solid var(--border); background:var(--surface); margin-top: auto;}
 .footer-inner{display: flex; align-items: center; justify-content: center; gap: 36px; flex-wrap: wrap;}
-.footer-inner a{color: var(--accent); text-decoration: none; font-weight: 600; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out;}
+.footer-inner a{color: var(--accent-ink); text-decoration: none; font-weight: 600; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out;}
 .footer-inner a:hover{}
 textarea.fi{resize: vertical; min-height: 130px; white-space: pre-wrap; overflow-wrap: break-word; word-break: break-word;}
 .chip{padding: 9px 20px; border-radius: 14px; font-size: 0.82rem; font-weight: 700; color: var(--text-3); cursor: pointer; border: none; background: none; font-family: inherit; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out;}
-.chip:hover{color: var(--accent); background: var(--accent-soft);}
-.chip.active{background:var(--accent-soft); color:var(--accent);}
+.chip:hover{color: var(--accent-ink); background: var(--accent-soft);}
+.chip.active{background:var(--accent-soft); color:var(--accent-ink);}
 .chip:active{transform: scale(0.95);}
 .pill-group{display: flex; flex-wrap: wrap; gap: 14px;}
 .pill-btn{padding: 12px 22px; border-radius: 28px; border: 1px solid var(--border); background: var(--surface-3); color: var(--text-3); cursor: pointer; font-size: 0.86rem; font-weight: 600; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out; font-family: inherit;}
-.pill-btn:hover{border-color: var(--accent); color: var(--accent);}
-.pill-btn.active{background:var(--accent-soft); color:var(--accent); border-color:var(--accent);}
+.pill-btn:hover{border-color: var(--accent); color: var(--accent-ink);}
+.pill-btn.active{background:var(--accent-soft); color:var(--accent-ink); border-color:var(--accent);}
 .pill-btn:active{transform: scale(0.97);}
-.adv-toggle{cursor: pointer; color: var(--accent); font-weight: 600; margin-bottom: 20px; display: inline-flex; align-items: center; gap: 10px; border: none; background: none; font-size: 0.98rem; font-family: inherit; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out;}
+.adv-toggle{cursor: pointer; color: var(--accent-ink); font-weight: 600; margin-bottom: 20px; display: inline-flex; align-items: center; gap: 10px; border: none; background: none; font-size: 0.98rem; font-family: inherit; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out;}
 .adv-toggle:hover{opacity: 0.85;}
 .adv-section{display: none; padding: 20px; background: var(--surface); border-radius: var(--radius-sm); border: 1px solid var(--border); margin-top: 14px;}
 .addr-list-scroll{max-height:480px; overflow-y: auto; -webkit-overflow-scrolling: touch; border: 1px solid var(--border); border-radius: var(--radius-md); padding: 14px; background: var(--surface);}
@@ -16350,7 +16929,7 @@ textarea.fi{resize: vertical; min-height: 130px; white-space: pre-wrap; overflow
 .mobile-nav{display: none; position: fixed; bottom: 0; left: 0; right: 0; background: var(--surface); border-top: 1px solid var(--border); z-index: 9999; padding: 12px 0 env(safe-area-inset-bottom, 0);}
 .mobile-nav .nav-items{display: flex; justify-content: space-around; align-items: center; width: 100%;}
 .mobile-nav .nav-item{flex: 1; display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 10px 4px; color: var(--text-3); font-size: 0.72rem; cursor: pointer; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out; border-radius: var(--radius-sm);}
-.mobile-nav .nav-item.active{color: var(--accent); background: var(--accent-soft);}
+.mobile-nav .nav-item.active{color: var(--accent-ink); background: var(--accent-soft);}
 .seg-group{display: flex; flex-wrap: wrap; gap: 8px; background:var(--surface-2); border: 1px solid var(--border); padding: 6px; border-radius:6px;}
 .seg-btn{flex: 1; min-width: 90px; background:var(--surface-2); border: none; color: var(--text-3); padding: 14px 20px; border-radius:6px; cursor: pointer; font-weight: 600; font-family: inherit; font-size: 0.86rem; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out;}
 .seg-btn.active{background:var(--surface);border:1px solid var(--border);color:var(--text);}
@@ -16362,7 +16941,7 @@ textarea.fi{resize: vertical; min-height: 130px; white-space: pre-wrap; overflow
 .status-card.active{border-color:var(--accent-border);background:var(--accent-soft);}
 .status-card.inactive{border-color:var(--border);background:var(--surface);}
 .status-card:active{transform: scale(0.97);}
-.railway-hl{background: rgba(168,85,247,0.2) !important; color: var(--accent) !important; border: 1px solid var(--accent) !important; font-weight: 800;}
+.railway-hl{background: rgba(168,85,247,0.2) !important; color: var(--accent-ink) !important; border: 1px solid var(--accent) !important; font-weight: 800;}
 .tooltip-container{position: relative; display: inline-flex;}
 .tooltip-text{visibility: hidden; background:var(--surface-3); color:var(--text); text-align: center; border-radius: 12px; padding: 10px 18px; position: absolute; z-index: 100; bottom: 140%; left: 50%; transform: translateX(-50%); white-space: nowrap; width: max-content; max-width: min(320px, 90vw); border: 1px solid rgba(255,255,255,0.2); box-shadow: 0 14px 40px rgba(0,0,0,0.6); opacity: 0; transition:opacity 120ms ease-out, transform 150ms ease-out; font-size: 0.75rem; pointer-events: none;border:1px solid var(--border-strong);border-radius:8px;}
 .tooltip-container:hover .tooltip-text{visibility: visible; opacity: 1; transform: translateX(-50%) translateY(-8px);}
@@ -16533,6 +17112,13 @@ html{scroll-padding-top: 84px;}
 <div id="login-page" style="display:none;width:100%">
   <div style="display:flex;align-items:center;justify-content:center;min-height:100vh;">
     <div style="background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:32px 24px;width:min(400px,calc(100vw - 32px));max-width:400px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:24px;">
+        <div class="lang-switch">
+          <button class="lang-btn lang-en active" onclick="setLang('en')">EN</button>
+          <button class="lang-btn lang-fa" onclick="setLang('fa')">FA</button>
+        </div>
+        <button class="btn-icon" onclick="toggleTheme()" title="Toggle theme" data-en-title="Toggle theme" data-fa-title="تغییر تم" aria-label="Toggle theme" data-en-aria="Toggle theme" data-fa-aria="تغییر تم"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg></span></button>
+      </div>
       <div style="text-align:center;margin-bottom:32px;">
         <div style="display:flex;align-items:center;justify-content:center;gap:10px;font-family:var(--font-sans);font-size:28px;font-weight:700;color:var(--text);letter-spacing:-0.02em;">
           <span style="width:28px;height:28px;background:var(--accent);border-radius:8px;flex:none;"></span>SulgX Panel
@@ -16540,7 +17126,7 @@ html{scroll-padding-top: 84px;}
         <div style="display:flex;justify-content:center;margin-top:12px;">
           <span style="font-family:var(--font-mono);font-size:11px;font-weight:600;background:var(--surface-2);border:1px solid var(--border);color:var(--text-2);border-radius:9999px;padding:2px 8px;">V 1.5.8</span>
         </div>
-        <div style="font-size:1rem;color:var(--text-3);margin-top:8px;" data-en="Enter your password" data-fa="رمز عبور را وارد کنید">Enter your password</div>
+        <div style="font-size:1rem;color:var(--text-2);margin-top:12px;line-height:1.55;" data-en="Enter your password" data-fa="رمز عبور را وارد کنید">Enter your password</div>
         <div id="login-custom-message" style="margin-top:20px; text-align:center; color:var(--text-3); font-size:0.9rem;"></div>
       </div>
       <form id="login-form" onsubmit="doLogin();return false;" autocomplete="off">
@@ -16549,10 +17135,10 @@ html{scroll-padding-top: 84px;}
       </form>
       <div id="login-err" style="color:var(--danger);font-size:0.9rem;margin-top:10px;text-align:center;display:none" data-en="Invalid password" data-fa="رمز عبور نامعتبر">Invalid password</div>
       <div style="margin-top:20px; text-align:center; display:flex; justify-content:center; gap:20px;">
-        <a href="https://github.com/SulgX" target="_blank" style="color:var(--text-3); text-decoration:none; font-size:0.9rem;">
+        <a href="https://github.com/SulgX" target="_blank" style="color:var(--text-3); text-decoration:none; font-size:0.9rem; display:inline-flex; align-items:center; gap:6px;">
           <span class="icon icon-github"></span> GitHub
         </a>
-        <a href="https://t.me/SulgX" target="_blank" style="color:var(--text-3); text-decoration:none; font-size:0.9rem;">
+        <a href="https://t.me/SulgX" target="_blank" style="color:var(--text-3); text-decoration:none; font-size:0.9rem; display:inline-flex; align-items:center; gap:6px;">
           <span class="icon icon-telegram-link"></span> Telegram
         </a>
       </div>
@@ -16564,7 +17150,7 @@ html{scroll-padding-top: 84px;}
     <div class="header-inner">
       <div style="display:flex;align-items:center;gap:16px;">
         <span class="logo">SulgX</span><span class="version-tag">v1.5.8</span>
-        <span id="panel-clock" style="font-weight:600;color:var(--accent);margin-inline-start:8px;font-size:0.9rem;"></span>
+        <span id="panel-clock" style="font-weight:600;color:var(--accent-ink);margin-inline-start:8px;font-size:0.9rem;"></span>
         <nav class="header-nav" id="mainNav">
           <button class="nav-link active" data-page="dashboard">
             <span class="nav-icon icon-dashboard"></span>
@@ -16656,7 +17242,7 @@ html{scroll-padding-top: 84px;}
         </div>
       </div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
-        <div class="card"><div class="card-hd"><span class="card-title" data-en="CPU" data-fa="پردازنده">CPU</span><span id="cpu-v" style="font-weight:700;color:var(--accent);">–%</span></div><div class="sys-bar"><div class="sys-fill" id="cpu-b" style="background:var(--accent);width:0%"></div></div></div>
+        <div class="card"><div class="card-hd"><span class="card-title" data-en="CPU" data-fa="پردازنده">CPU</span><span id="cpu-v" style="font-weight:700;color:var(--accent-ink);">–%</span></div><div class="sys-bar"><div class="sys-fill" id="cpu-b" style="background:var(--accent);width:0%"></div></div></div>
         <div class="card"><div class="card-hd"><span class="card-title" data-en="Memory" data-fa="حافظه">Memory</span><span id="mem-v" style="font-weight:700;color:var(--success);">–%</span></div><div class="sys-bar"><div class="sys-fill" id="mem-b" style="background:var(--success);width:0%"></div></div></div>
       </div>
       <div class="card"><div class="card-hd"><span class="card-title" data-en="Protocols" data-fa="پروتکل‌ها">Protocols</span></div><div id="proto-summary" style="display:flex;flex-wrap:wrap;gap:8px;min-height:24px;"></div></div>
@@ -16683,6 +17269,7 @@ html{scroll-padding-top: 84px;}
       <tbody id="login-logs-tbody"></tbody>
     </table>
   </div>
+  <div id="login-geo-note" style="font-size:0.85rem;color:var(--text-2);padding:8px 4px 0;"></div>
 </div>
     </section>
     <section class="page" id="page-inbounds">
@@ -16896,6 +17483,10 @@ example.com
       <div class="card">
         <div class="card-hd"><span class="card-title" data-en="Sessions" data-fa="نشست‌ها">Sessions</span><span id="active-users-summary" style="color:var(--text-2);font-size:0.85rem;"></span></div>
         <div id="active-users-cards" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px;"></div>
+      </div>
+      <div class="card" style="margin-top:12px;">
+        <div class="card-hd"><span class="card-title" data-en="Disabled users" data-fa="کاربران مسدودشده">Disabled users</span><span style="color:var(--text-2);font-size:0.85rem;" data-en="Blocked IPs stay blocked until released" data-fa="آی‌پی‌های مسدودشده تا زمان رفع مسدودیت، مسدود می‌مانند">Blocked IPs stay blocked until released</span></div>
+        <div id="blocked-users-list" style="display:grid;gap:8px;"></div>
       </div>
     </section>
     <section class="page" id="page-settings">
@@ -17868,6 +18459,9 @@ const i18n = {
     loadingLogs: 'Loading logs…',
     loading: 'Loading…',
     noActiveUsers: 'No active users',
+    noBlockedUsers: 'No blocked users',
+    unblockBtn: 'Unblock',
+    unblocked: 'Unblocked',
     disconnectBtn: 'Disconnect',
     noAddressesAdded: 'No addresses added',
     noAddressesInProfile: 'No addresses in this profile',
@@ -18061,6 +18655,9 @@ const i18n = {
     loadingLogs: 'در حال بارگیری گزارش‌ها…',
     loading: 'در حال بارگیری…',
     noActiveUsers: 'کاربر فعالی نیست',
+    noBlockedUsers: 'کاربر مسدودشده‌ای نیست',
+    unblockBtn: 'رفع مسدودیت',
+    unblocked: 'رفع مسدودیت شد',
     disconnectBtn: 'قطع اتصال',
     noAddressesAdded: 'آدرسی اضافه نشده است',
     noAddressesInProfile: 'در این پروفایل آدرسی نیست',
@@ -19665,6 +20262,10 @@ async function showDashboard(){
     if (mobileNavScanner) mobileNavScanner.style.display = 'none';
   }
   buildProfileTabs();
+  try{
+    var _rp=_initialPage; _initialPage='dashboard';
+    if(_rp&&_rp!=='dashboard'&&!(_rp==='ipscanner'&&stealthMode)){ switchPage(_rp); }
+  }catch(e){}
 
 }
 
@@ -19825,11 +20426,23 @@ async function loadTgProxyCard(){
   }catch(e){ if(body) body.innerHTML = '<div>'+(lang==='fa'?'بارگذاری وضعیت پروکسی تلگرام ناموفق بود.':'Failed to load Telegram proxy status.')+'</div>'; toast(lang==='fa'?'بارگذاری وضعیت پروکسی تلگرام ناموفق بود':'Failed to load Telegram proxy status', true); return false; }
   finally{ if(btn){ btn.disabled = false; btn.textContent = btn.getAttribute('data-' + (document.body.dir === 'rtl' ? 'fa' : 'en')) || 'Refresh'; } }
 }
-function switchPage(id){
+var SXPAGES=['dashboard','inbounds','active-users','addresses','ipscanner','logs','telegram','settings'];
+function pageFromLocation(){
+  var h='';
+  try{ h=(window.location.hash||'').replace(/^#\/?/,''); }catch(e){ h=''; }
+  if(SXPAGES.indexOf(h)!==-1) return h;
+  try{ var s=sessionStorage.getItem('sulgx-page'); if(SXPAGES.indexOf(s)!==-1) return s; }catch(e){}
+  return 'dashboard';
+}
+var _initialPage=pageFromLocation();
+function switchPage(id,opts){
+  if(SXPAGES.indexOf(id)===-1) id='dashboard';
   document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
   $m('page-'+id).classList.add('active');
   document.querySelectorAll('.nav-link').forEach(n=>n.classList.toggle('active',n.dataset.page===id));
   document.querySelectorAll('.mobile-nav .nav-item').forEach(n=>n.classList.toggle('active',n.dataset.page===id));
+  try{ sessionStorage.setItem('sulgx-page',id); }catch(e){}
+  if(!opts||!opts.fromHash){ try{ history.pushState({page:id},'','#/'+id); }catch(e){} }
   if (id === 'inbounds') {
     loadLinks();
     loadProxyLines();
@@ -19837,6 +20450,7 @@ function switchPage(id){
   }
   if (id === 'active-users') {
     loadActiveUsers();
+    loadBlockedUsers();
   }
   if (id === 'telegram') {
     loadTgProxyCard();
@@ -19849,6 +20463,15 @@ function switchPage(id){
     loadAddrs();
   }
 }
+window.addEventListener('hashchange',function(){
+  if(!isAuthenticated) return;
+  var h='';
+  try{ h=(window.location.hash||'').replace(/^#\/?/,''); }catch(e){ h=''; }
+  if(SXPAGES.indexOf(h)===-1) return;
+  var cur=document.querySelector('.page.active');
+  if(cur&&cur.id==='page-'+h) return;
+  switchPage(h,{fromHash:true});
+});
 function toast(msg, err = false) {
     const t = $m('toast');
     const m = $m('toast-msg');
@@ -20096,6 +20719,7 @@ function protoShort(p){
   return p.replace('xhttp-', 'XHTTP ').toUpperCase();
 }
 function fmtBps(b){ if(!b) return '0 B/s'; return b >= 1048576 ? (b/1048576).toFixed(2)+' MB/s' : b >= 1024 ? (b/1024).toFixed(1)+' KB/s' : b+' B/s'; }
+let _audOpen = {};
 function renderActiveUsers(sessions){
   const box = $m('active-users-cards');
   if(!box) return;
@@ -20115,18 +20739,26 @@ function renderActiveUsers(sessions){
     + '<div style="font-size:0.85rem;">' + t('totalWord') + ' ↑ <span class="num">' + fmtB(s.bytes_up) + '</span> &nbsp; ↓ <span class="num">' + fmtB(s.bytes_down) + '</span></div>'
     + '<div style="font-size:0.85rem;color:var(--text-2);">IP ' + esc(ips.join(', ') || '') + ' · Since ' + esc(s.started_at || '') + '</div>'
     + '<div style="font-size:0.85rem;">' + t('quotaLeft') + ' ' + (s.quota_remaining === null || s.quota_remaining === undefined ? '∞' : '<span class="num">' + fmtB(s.quota_remaining) + '</span>') + ' · ' + t('sessionsOnLink') + ' ' + (s.session_count || s.link_sessions || 0) + '/' + (s.max_connections || '∞') + '</div>'
-    + '<div style="display:flex;gap:8px;margin-top:8px;"><button class="btn btn-outline btn-sm" id="aud-btn-' + idx + '" onclick="toggleActiveUserDetails(' + idx + ')">' + t('detailsBtn') + '</button>'
+    + '<div style="display:flex;gap:8px;margin-top:8px;"><button class="btn btn-outline btn-sm" id="aud-btn-' + idx + '" onclick="toggleActiveUserDetails(' + idx + ', \'' + esc(s.conn_id) + '\')">' + t('detailsBtn') + '</button>'
     + '<button class="btn btn-danger btn-sm" onclick="disconnectActiveUser(\'' + esc(s.conn_id) + '\')">' + t('disconnectBtn') + '</button></div>'
     + '<div id="aud-' + idx + '" style="display:none;margin-top:8px;"><div style="font-size:0.85rem;font-weight:600;">' + t('destinationCol') + ' (' + dests.length + ')</div>' + (detRows || '<div style="font-size:0.85rem;color:var(--text-2);">—</div>') + '<div style="font-size:0.85rem;font-weight:600;margin-top:8px;">' + t('sessionsCol') + ' (' + sessRows.length + ')</div>' + (sesRows || '<div style="font-size:0.85rem;color:var(--text-2);">—</div>') + '</div>'
     + '</div>';
   }).join('');
+  (sessions || []).forEach((s, idx) => {
+    if(!_audOpen[s.conn_id]) return;
+    const el = $m('aud-' + idx);
+    if(el) el.style.display = 'block';
+    const btn = $m('aud-btn-' + idx);
+    if(btn) btn.textContent = t('hideDetailsBtn');
+  });
 }
-function toggleActiveUserDetails(idx){
+function toggleActiveUserDetails(idx, connId){
   const el = $m('aud-' + idx);
   const btn = $m('aud-btn-' + idx);
   if(!el) return;
   const open = el.style.display === 'none';
   el.style.display = open ? 'block' : 'none';
+  if(connId){ if(open){ _audOpen[connId] = true; } else { delete _audOpen[connId]; } }
   if(btn) btn.textContent = open ? t('hideDetailsBtn') : t('detailsBtn');
 }
 async function loadActiveUsers(){
@@ -20136,15 +20768,30 @@ async function loadActiveUsers(){
     const r = await authenticatedFetch('/api/active-users');
     const d = await r.json();
     renderActiveUsers(d.sessions || []);
+    loadBlockedUsers();
     return true;
   }catch(e){ toast(t('Error'), true); return false; }
 }
 async function disconnectActiveUser(connId){
-  const isGroup = String(connId).indexOf('user:') === 0 || String(connId).indexOf('owner:') === 0 || String(connId).indexOf('ip:') === 0;
+  const isGroup = String(connId).indexOf('user:') === 0 || String(connId).indexOf('owner:') === 0 || String(connId).indexOf('ip:') === 0 || String(connId).indexOf('card:') === 0;
   if(!(await confirmDialog(isGroup ? t('confirmDisconnectUser') : t('confirmDisconnectSession')))) return;
-  try{ const r = await authenticatedFetch('/api/active-users/' + encodeURIComponent(connId) + '/disconnect', {method:'POST'}); if(!r.ok) throw new Error('failed'); toast(t('disconnected')); loadActiveUsers(); }catch(e){ toast(t('Error'), true); }
+  try{ const r = await authenticatedFetch('/api/active-users/' + encodeURIComponent(connId) + '/disconnect', {method:'POST'}); if(!r.ok) throw new Error('failed'); toast(t('disconnected')); loadActiveUsers(); loadBlockedUsers(); }catch(e){ toast(t('Error'), true); }
 }
 
+async function loadBlockedUsers(){
+  const box = $m('blocked-users-list');
+  if(!box) return;
+  try{
+    const r = await authenticatedFetch('/api/blocked-sessions');
+    const d = await r.json();
+    const rows = d.blocked || [];
+    if(!rows.length){ box.innerHTML = '<div style="color:var(--text-2);">' + t('noBlockedUsers') + '</div>'; return; }
+    box.innerHTML = rows.map(row => '<div style="display:flex;justify-content:space-between;gap:8px;align-items:center;font-size:0.85rem;padding:8px 0;border-top:1px solid var(--border);"><span><b>' + esc(row.label || row.uid || '') + '</b> · ' + esc(row.protocol || '') + '<br><span style="color:var(--text-2);">IP ' + esc(row.ip || '') + ' · ' + esc(row.created_at || '') + (row.reason ? ' · ' + esc(row.reason) : '') + '</span></span><button class="btn btn-outline btn-sm" onclick="unblockSession(\'' + esc(row.uid) + '\', \'' + esc(row.ip) + '\')">' + t('unblockBtn') + '</button></div>').join('');
+  }catch(e){ box.innerHTML = '<div style="color:var(--text-2);">' + t('Error') + '</div>'; }
+}
+async function unblockSession(uid, ip){
+  try{ const r = await authenticatedFetch('/api/blocked-sessions/' + encodeURIComponent(uid) + '/' + encodeURIComponent(ip), {method:'DELETE'}); if(!r.ok) throw new Error('failed'); toast(t('unblocked')); loadBlockedUsers(); loadActiveUsers(); }catch(e){ toast(t('Error'), true); }
+}
 function proxyInfoText(proto, info){
   const st = (info && info.proxy_status) || {};
   const on = (k) => st[k] && st[k].enabled;
@@ -20824,7 +21471,7 @@ async function loadStats() {
     const pc = sData.protocol_counts || {};
     const ps = $m('proto-summary');
     if (ps) {
-      ps.innerHTML = Object.keys(pc).map(k => `<span class=\"tag tag-vless\">${esc(protoShort(k))}: ${pc[k]}</span>`).join('') || '<span style=\"color:var(--muted)\">–</span>';
+      ps.innerHTML = Object.keys(pc).map(k => `<span class=\"tag tag-vless\">${esc(protoShort(k))}: ${pc[k]}</span>`).join('') || '<span style=\"color:var(--text-3)\">–</span>';
     }
 
     updChart();
@@ -20882,7 +21529,7 @@ function updChart(){
   for(let h=0;h<24;h++){
     const key = `${h.toString().padStart(2,'0')}:00`;
     labels.push(key);
-    data.push(Math.round((sData.hourly_traffic[key]||0)/1048576));
+    data.push(Math.round((sData.hourly_traffic[key]||0)/1048576*100)/100);
   }
   tChart.data.labels = labels;
   tChart.data.datasets[0].data = data;
@@ -21669,10 +22316,15 @@ async function loadLoginLogs(){
     const d = await r.json();
     const tbody = $m('login-logs-tbody');
     if(!tbody) return;
+    const geoFailed = !!(d.geo_status && d.geo_status.ok === false);
+    const geoNote = $m('login-geo-note');
+    if(geoNote) geoNote.textContent = geoFailed ? (lang === 'fa' ? 'یافتن موقعیت مکانی ناموفق بود: ' + (d.geo_status.detail || '') : 'Location lookup failed: ' + (d.geo_status.detail || '')) : '';
     tbody.innerHTML = d.logs.map(l => {
       const country = l.country || '';
       const city = l.city || '';
-      const locationDisplay = country ? `${city ? city + ', ' : ''}${country}` : '-';
+      const ipText = String(l.ip || '');
+      const privateIp = /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|127\.|::1$|fe80:|fc00:|fd)/.test(ipText);
+      const locationDisplay = country ? `${city ? city + ', ' : ''}${country}` : (privateIp ? (lang === 'fa' ? 'شبکه داخلی' : 'local network') : (geoFailed ? (lang === 'fa' ? 'یافتن موقعیت ناموفق بود' : 'lookup failed') : '-'));
       const isp = l.isp || l.org || '-';
       const isLogout = l.path && l.path.includes('logout');
       const statusStyle = isLogout ? 'color: var(--warning);' : (l.success ? 'color: var(--success);' : 'color: var(--danger);');
@@ -21876,13 +22528,13 @@ function previewTemplate() {
                        .replace(/{browser}/g, mockData.browser)
                        .replace(/{os}/g, mockData.os);
             previewHTML += `<div style="margin-bottom:10px;border-bottom:1px solid var(--border);padding-bottom:6px;">`;
-            previewHTML += `<span style="color:var(--accent);font-weight:bold;font-size:0.8rem;">[${key}]:</span><br>`;
+            previewHTML += `<span style="color:var(--accent-ink);font-weight:bold;font-size:0.8rem;">[${key}]:</span><br>`;
             previewHTML += `<span>${text}</span></div>`;
         }
 
         const mockDomain = window.location.host || "your-domain.com";
         const prefix = window.panelPrefix ? '/' + window.panelPrefix : '';
-        previewHTML += `<div style="margin-top:6px;padding-top:4px;color:#4caf50;">`;
+        previewHTML += `<div style="margin-top:6px;padding-top:4px;color:var(--success);">`;
         previewHTML += icon('warning') + ` <i>${t('autoAppended')}</i><br>${t('openPanelLink', {url: 'https://' + mockDomain + prefix + '/panel'})}`;
         previewHTML += `</div>`;
 
@@ -22715,10 +23367,8 @@ def build_xray_config(link: dict, proxy_line: dict, request: Request, address: s
     if alpn:
         tls_settings["alpn"] = [a.strip() for a in str(alpn).split(",") if a.strip()]
     _ech_on, _ech_sni, _ech_doh = resolve_ech_for_link(link)
-    if _ech_on and _ech_sni:
-        tls_settings["ech"] = {"enable": True, "sni": _ech_sni}
-        if _ech_doh:
-            tls_settings["ech"]["doh"] = _ech_doh
+    if _ech_on and _ech_sni and _ech_doh:
+        tls_settings["echConfigList"] = _ech_sni + "+" + _ech_doh
     stream_settings["tlsSettings"] = tls_settings
 
     stream_settings["sockopt"] = {
@@ -22968,10 +23618,8 @@ async def xray_balancer_config(uid: str, request: Request):
     if alpn:
         tls_settings["alpn"] = [a.strip() for a in str(alpn).split(",") if a.strip()]
     _ech_on, _ech_sni, _ech_doh = resolve_ech_for_link(link)
-    if _ech_on and _ech_sni:
-        tls_settings["ech"] = {"enable": True, "sni": _ech_sni}
-        if _ech_doh:
-            tls_settings["ech"]["doh"] = _ech_doh
+    if _ech_on and _ech_sni and _ech_doh:
+        tls_settings["echConfigList"] = _ech_sni + "+" + _ech_doh
     stream_settings["tlsSettings"] = tls_settings
 
     stream_settings["sockopt"] = {
