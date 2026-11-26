@@ -74,8 +74,9 @@ ACTIVE_PROXY = {}
 _SERVERS = []
 _BOUND_PORTS = set()
 _BIND_ERRORS = {}
-_STATS = {"socks_connections": 0, "socks_bytes": 0, "mtproxy_connections": 0, "mtproxy_bytes": 0, "http_connections": 0, "http_bytes": 0}
+_STATS = {"socks_connections": 0, "socks_bytes": 0, "mtproxy_connections": 0, "mtproxy_bytes": 0, "http_connections": 0, "http_bytes": 0, "panel_forward_connections": 0}
 _MTPROXY_LINK_SECRETS = {}
+_PANEL_FORWARD = None
 
 _TELEMT_DIR_CACHED = ""
 _TELEMT_DECOY_READY = False
@@ -152,6 +153,34 @@ def http_proxy_link(host, port, username, password):
 
 def stats():
     return dict(_STATS)
+
+
+def set_panel_forward(host, port):
+    global _PANEL_FORWARD
+    try:
+        wanted = int(port or 0)
+    except (TypeError, ValueError):
+        wanted = 0
+    if wanted:
+        _PANEL_FORWARD = (str(host or "127.0.0.1"), wanted)
+    else:
+        _PANEL_FORWARD = None
+    return _PANEL_FORWARD
+
+
+def panel_forward():
+    return _PANEL_FORWARD
+
+
+def _bind_error_text(port, exc):
+    text = str(exc)
+    try:
+        errno = getattr(exc, "errno", 0) or 0
+    except Exception:
+        errno = 0
+    if errno in (98, 48) and _PANEL_FORWARD is not None and int(port) == int(_PANEL_FORWARD[1]):
+        return "port " + str(port) + " is the panel web server's own listen port; restart the panel with the panel on an internal port (set PORT to an internal port such as 8000 and PANEL_BIND_HOST to 127.0.0.1) so the multiplexer can own port " + str(port) + " and forward panel traffic to it"
+    return text
 
 
 def is_telegram_ip(ip_str):
@@ -529,10 +558,90 @@ async def _handle_mtproto_relay(reader, writer, prefix):
             pass
 
 
+async def _handle_panel_forward(reader, writer):
+    _STATS["panel_forward_connections"] += 1
+    target = _PANEL_FORWARD
+    upstream_writer = None
+    try:
+        if not target or int(target[1]) in _BOUND_PORTS:
+            writer.write(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            await writer.drain()
+            return
+        try:
+            upstream_reader, upstream_writer = await asyncio.wait_for(asyncio.open_connection(target[0], target[1]), timeout=5)
+        except (OSError, asyncio.TimeoutError):
+            writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            await writer.drain()
+            return
+        peer = writer.get_extra_info("peername")
+        peer_ip = peer[0] if peer else ""
+        head = None
+        try:
+            head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=5.0)
+        except (asyncio.TimeoutError, asyncio.IncompleteReadError, asyncio.LimitOverrunError, ConnectionError, OSError):
+            head = None
+        if head:
+            text = head.decode("iso-8859-1", "ignore")
+            lines = text.split("\r\n")
+            kept = []
+            for line in lines:
+                if line.lower().startswith("x-forwarded-for:"):
+                    continue
+                kept.append(line)
+            if peer_ip:
+                kept.insert(len(kept) - 2, "X-Forwarded-For: " + peer_ip)
+            upstream_writer.write("\r\n".join(kept).encode("iso-8859-1"))
+            await upstream_writer.drain()
+
+        async def _relay(src, dst):
+            try:
+                while True:
+                    chunk = await src.read(65536)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+                    await dst.drain()
+            except (ConnectionError, asyncio.IncompleteReadError, asyncio.TimeoutError, OSError):
+                pass
+            finally:
+                try:
+                    dst.write_eof()
+                except (AttributeError, OSError, RuntimeError):
+                    try:
+                        dst.close()
+                    except OSError:
+                        pass
+
+        await asyncio.gather(_relay(reader, upstream_writer), _relay(upstream_reader, writer))
+    except (ConnectionError, asyncio.IncompleteReadError, asyncio.TimeoutError, OSError):
+        pass
+    finally:
+        if upstream_writer is not None:
+            try:
+                upstream_writer.close()
+            except OSError:
+                pass
+        try:
+            writer.close()
+        except OSError:
+            pass
+
+
 async def _handle_multi(reader, writer):
     prefix = await _peek_prefix(reader)
     if _looks_http(prefix):
-        await _handle_http_proxy(_PrefixedReader(reader, prefix), writer)
+        while b" " not in prefix and len(prefix) < 16:
+            try:
+                chunk = await asyncio.wait_for(reader.read(16 - len(prefix)), timeout=1.0)
+            except (asyncio.TimeoutError, ConnectionError, OSError):
+                break
+            if not chunk:
+                break
+            prefix += bytes(chunk)
+        if prefix.split(b" ", 1)[0].upper() == b"CONNECT":
+            await _handle_http_proxy(_PrefixedReader(reader, prefix), writer)
+            return
+        await _handle_panel_forward(_PrefixedReader(reader, prefix), writer)
         return
     if _looks_socks5(prefix):
         await _handle_socks5(_PrefixedReader(reader, prefix), writer)
@@ -1993,10 +2102,10 @@ async def start_all(multi_ports, auth_lookup, count_traffic, mtproxy_quota_ok, s
             _BIND_ERRORS.pop(port, None)
             bound.append(port)
         except OSError as exc:
-            failed[port] = str(exc)
-            _BIND_ERRORS[port] = str(exc)
+            failed[port] = _bind_error_text(port, exc)
+            _BIND_ERRORS[port] = _bind_error_text(port, exc)
             if not bind_error:
-                bind_error = str(exc)
+                bind_error = _bind_error_text(port, exc)
     first = bound[0] if bound else 0
     status["socks"]["port"] = first
     status["http"]["port"] = first
@@ -2043,8 +2152,8 @@ async def ensure_proxy_ports(ports):
             _BIND_ERRORS.pop(port, None)
             bound.append(port)
         except OSError as exc:
-            failed[port] = str(exc)
-            _BIND_ERRORS[port] = str(exc)
+            failed[port] = _bind_error_text(port, exc)
+            _BIND_ERRORS[port] = _bind_error_text(port, exc)
     return {"bound": bound, "failed": {str(k): v for k, v in failed.items()}, "ports": sorted(_BOUND_PORTS), "errors": {str(k): v for k, v in _BIND_ERRORS.items()}}
 
 
