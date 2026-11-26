@@ -222,6 +222,13 @@ def _web_secret_hex_for_link(link):
     return _web_secret_bytes_for_link(link).hex()
 
 
+def _web_secret_hex_or_empty(link):
+    try:
+        return _web_secret_hex_for_link(link)
+    except ValueError:
+        return ""
+
+
 def _web_link_secret_for_link(link):
     return _b64u_encode(b"\x70\xdd" + _web_secret_bytes_for_link(link))
 
@@ -593,6 +600,8 @@ VALID_PROTOCOLS = (
     "socks5", "mtproto", "webproxy", "http-proxy",
 )
 PROXY_PROTOCOLS = ("socks5", "mtproto", "webproxy", "http-proxy")
+MUX_PROTOCOLS = ("socks5", "mtproto", "http-proxy")
+WS_PROTOCOLS = ("vless-ws", "vmess-ws", "trojan-ws", "ss-ws")
 PROTOCOL_FIELD_SCHEMA = {
     "vless-ws": {"identity": "uuid", "fields": ("uuid",), "display": ()},
     "vmess-ws": {"identity": "uuid", "fields": ("uuid", "vmess_security"), "display": ()},
@@ -1082,10 +1091,10 @@ def get_inbound_definitions():
         {"tag": "ws-random-in", "type": "websocket", "path": "/{random}/ws/{uuid}", "protocols": ["vless-ws", "vmess-ws", "trojan-ws", "ss-ws"], "port": "PORT env", "tls": "terminated by platform"},
         {"tag": "ws-custom-in", "type": "websocket", "path": "link custom_path, {uid} replaced with the link UUID", "protocols": ["vless-ws", "vmess-ws", "trojan-ws", "ss-ws"], "port": "PORT env", "tls": "terminated by platform", "note": "served by the catch-all WS route, path must match the link custom_path exactly, one leading random segment allowed when random_path is on"},
         {"tag": "xhttp-in", "type": "xhttp", "path": "/xhttp/{session}", "protocols": ["xhttp-packet-up", "xhttp-stream-up", "xhttp-stream-one", "xhttp-auto"], "port": "PORT env", "tls": "terminated by platform"},
-        {"tag": "socks5-in", "type": "socks5", "path": "Raw TCP listener on the inbound port (default 1080), NOT the panel HTTPS port", "protocols": ["socks5"], "port": "per-inbound, default 1080", "tls": "none, username/password auth per link uid", "note": "SOCKS5, raw TCP listener, TCP CONNECT only, destinations restricted to the allowed ranges, no UDP associate. Each inbound needs its own port. Cannot be exposed on single-port PaaS (Cloady/Render expose one HTTPS port only); needs a VPS or Railway TCP Proxy."},
-        {"tag": "mtproxy-in", "type": "mtproxy", "path": "Raw TCP listener on the inbound port (default 8443), NOT the panel HTTPS port", "protocols": ["mtproto"], "port": "per-inbound, default 8443", "tls": "obfuscated2 / fake-tls", "note": "Telegram MTProto proxy, raw TCP listener, per-link secret derived from the panel secret, variants plain / dd / fake-TLS. Each inbound needs its own port. Cannot be exposed on single-port PaaS (Cloady/Render expose one HTTPS port only); needs a VPS or Railway TCP Proxy."},
-        {"tag": "http-proxy-in", "type": "http-proxy", "path": "Raw TCP listener on the inbound port (default 3128), NOT the panel HTTPS port", "protocols": ["http-proxy"], "port": "per-inbound, default 3128", "tls": "none, Basic auth per link uid, CONNECT only", "note": "HTTP CONNECT proxy, raw TCP listener, destinations restricted to the allowed ranges, not an open web proxy. Each inbound needs its own port. Cannot be exposed on single-port PaaS (Cloady/Render expose one HTTPS port only); needs a VPS or Railway TCP Proxy."},
-        {"tag": "webproxy-in", "type": "webproxy", "path": "panel HTTPS port, bridge at /tgweb and at / with a valid capability", "protocols": ["webproxy"], "port": "443 public, rides the panel HTTPS port", "tls": "terminated by platform, per-inbound secret", "note": "Telegram WEB proxy (Direct-DC), rides the panel HTTPS port so it works on Cloady, Render and Railway. Port 443 is shared: each link carries its own 12-hex token in the server path and its own per-inbound secret, so many users share 443 with different links. Any other port is per-inbound and the token-routed bridge serves on that port too. On a single-port host only the public port 443 is reachable, so only port-443 links work there."},
+        {"tag": "socks5-in", "type": "socks5", "path": "Shared multiplexer listener on the inbound port (default 1080); the same port can also serve WebSocket, WEB proxy and the panel through the multiplexer front door", "protocols": ["socks5"], "port": "per-inbound, default 1080, may be shared with other SOCKS5, HTTP and MTProto inbounds", "tls": "none, username/password auth per link uid", "note": "SOCKS5, raw TCP listener, TCP CONNECT only, destinations restricted to the allowed ranges, no UDP associate. Several inbounds may share one port: the multiplexer routes by protocol and by login, so each SOCKS5 or HTTP inbound needs its own username. Cannot be exposed on single-port PaaS (Cloady/Render expose one HTTPS port only); needs a VPS or Railway TCP Proxy."},
+        {"tag": "mtproxy-in", "type": "mtproxy", "path": "Shared multiplexer listener on the inbound port (default 8443); the same port can also serve WebSocket, WEB proxy and the panel through the multiplexer front door", "protocols": ["mtproto"], "port": "per-inbound, default 8443, may be shared with other SOCKS5, HTTP and MTProto inbounds", "tls": "obfuscated2 / fake-tls", "note": "Telegram MTProto proxy, raw TCP listener, per-link secret derived from the panel secret, variants plain / dd / fake-TLS. Several inbounds may share one port: the multiplexer routes each connection by its secret to the shared telemt child. Cannot be exposed on single-port PaaS (Cloady/Render expose one HTTPS port only); needs a VPS or Railway TCP Proxy."},
+        {"tag": "http-proxy-in", "type": "http-proxy", "path": "Shared multiplexer listener on the inbound port (default 3128); the same port can also serve WebSocket, WEB proxy and the panel through the multiplexer front door", "protocols": ["http-proxy"], "port": "per-inbound, default 3128, may be shared with other SOCKS5, HTTP and MTProto inbounds", "tls": "none, Basic auth per link uid, CONNECT only", "note": "HTTP CONNECT proxy, raw TCP listener, destinations restricted to the allowed ranges, not an open web proxy. Several inbounds may share one port: the multiplexer routes by protocol and by login, so each SOCKS5 or HTTP inbound needs its own username. Cannot be exposed on single-port PaaS (Cloady/Render expose one HTTPS port only); needs a VPS or Railway TCP Proxy."},
+        {"tag": "webproxy-in", "type": "webproxy", "path": "panel HTTPS port, bridge at /tgweb and at / with a valid capability", "protocols": ["webproxy"], "port": "443 public, rides the panel HTTPS port or any shared multiplexer port", "tls": "terminated by platform, per-inbound secret", "note": "Telegram WEB proxy (Direct-DC), rides the panel HTTPS port so it works on Cloady, Render and Railway. Port 443 is shared: each link carries its own 12-hex token in the server path and its own per-inbound secret, so many users share 443 with different links. Any other port is per-inbound: on a multiplexer port the token-routed panel serves it, otherwise the token-routed bridge serves on that port. On a single-port host only the public port 443 is reachable, so only port-443 links work there."},
     ]
 
 
@@ -2999,7 +3008,7 @@ def _webproxy_conflict(port, exclude_uid=""):
     if int(port) == int(WEBPROXY_PUBLIC_PORT):
         return None
     for _l in LINKS.values():
-        if (_l.get("protocol") or "") == "webproxy" and int(_l.get("port") or 443) == int(port) and _l.get("uid") != exclude_uid:
+        if (_l.get("protocol") or "") == "webproxy" and _l.get("active") and int(_l.get("port") or 443) == int(port) and _l.get("uid") != exclude_uid:
             return _l
     return None
 
@@ -3037,50 +3046,121 @@ def _parse_proxy_port(raw, protocol):
     return value
 
 
-def _proxy_port_conflict(port, protocol, exclude_uid=""):
+def _panel_listen_port():
     try:
-        wanted = int(port)
+        return int(os.environ.get("PORT", CONFIG.get("port", 8000)) or 0)
     except (TypeError, ValueError):
-        return None
+        return 0
+
+
+def _web_port_is_fronted(port):
+    try:
+        wanted = int(port or 0)
+    except (TypeError, ValueError):
+        return False
     if not wanted:
-        return None
-    for _l in LINKS.values():
-        if (_l.get("protocol") or "") not in PROXY_PROTOCOLS:
+        return False
+    if wanted == int(WEBPROXY_PUBLIC_PORT):
+        return True
+    if wanted == _panel_listen_port():
+        return True
+    return wanted in _mux_ports_in_use()
+
+
+def _mux_ports_in_use(exclude_uid="", links=None):
+    ports = set()
+    for _env_port in (SOCKS_PORT, TG_PROXY_PORT, HTTP_PROXY_PORT):
+        try:
+            if int(_env_port or 0):
+                ports.add(int(_env_port))
+        except (TypeError, ValueError):
+            continue
+    rows = list(links) if links is not None else list(LINKS.values())
+    for _l in rows:
+        if (_l.get("protocol") or "") not in MUX_PROTOCOLS:
             continue
         if not _l.get("active"):
             continue
         if str(_l.get("uid") or "") == str(exclude_uid or ""):
             continue
         try:
-            other = int(_l.get("port") or 0)
+            _p = int(_l.get("port") or 0)
         except (TypeError, ValueError):
             continue
-        if other != wanted:
-            continue
-        if protocol == "webproxy" and (_l.get("protocol") or "") == "webproxy" and wanted == int(WEBPROXY_PUBLIC_PORT):
-            continue
-        return _l
+        if _p:
+            ports.add(_p)
+    return ports
+
+
+def _proxy_port_conflict(port, protocol, exclude_uid="", links=None):
+    try:
+        wanted = int(port)
+    except (TypeError, ValueError):
+        return None
+    if not wanted:
+        return None
+    if protocol in MUX_PROTOCOLS:
+        if wanted == _panel_listen_port():
+            return {"label": "panel web server", "uid": "panel", "protocol": "panel", "kind": "panel"}
     return None
 
 
 def _proxy_port_conflict_detail(port, protocol, conflict):
-    return "Proxy port " + str(port) + " is already used by inbound '" + str(conflict.get("label", "")) + "' (" + str(conflict.get("uid", "")) + ", " + str(conflict.get("protocol", "")) + "). Each proxy inbound needs its own port, except WEB proxy inbounds sharing port 443 with their own token."
+    return "Proxy port " + str(port) + " cannot be used for " + str(protocol) + ": the panel web server already listens on port " + str(port) + ", and the proxy multiplexer needs its own listener on that port. Restart the panel with the panel on an internal port (set PORT to an internal port such as 8000 and PANEL_BIND_HOST to 127.0.0.1), then create this inbound on port " + str(port) + ": the multiplexer will own port " + str(port) + " and forward panel, WebSocket and WEB proxy traffic to the panel."
 
 
-def _next_free_proxy_port(start, exclude_uid=""):
-    try:
-        base = int(start)
-    except (TypeError, ValueError):
-        base = 0
-    if not base:
-        return 0
-    panel_port = int(CONFIG.get("port", 8000) or 0)
-    for candidate in range(base + 1, base + 501):
-        if candidate == panel_port:
+def _proxy_username_conflict(username, exclude_uid="", links=None):
+    wanted = str(username or "").strip()
+    if not wanted:
+        return None
+    rows = list(links) if links is not None else list(LINKS.values())
+    for _l in rows:
+        if str(_l.get("uid") or "") == str(exclude_uid or ""):
             continue
-        if _proxy_port_conflict(candidate, "socks5", exclude_uid=exclude_uid) is None:
-            return candidate
-    return 0
+        if str(_l.get("uid") or "") == wanted:
+            return _l
+        if (_l.get("protocol") or "") in ("socks5", "http-proxy") and str(_l.get("proxy_username") or "").strip() == wanted:
+            return _l
+    return None
+
+
+def _proxy_username_conflict_detail(username, conflict):
+    return "Proxy username '" + str(username) + "' is already used by inbound '" + str(conflict.get("label", "")) + "' (" + str(conflict.get("uid", "")) + ", " + str(conflict.get("protocol", "")) + "). SOCKS5 and HTTP proxy logins share one credential namespace on every shared port, so each username must be unique, and it must not equal another inbound UUID. Choose a different username."
+
+
+def _ws_effective_path(uid, custom_path):
+    raw = str(custom_path or "").strip()
+    if raw:
+        return raw.replace("{uid}", str(uid))
+    return str(DEFAULT_PATH or "/ws/{uid}").replace("{uid}", str(uid))
+
+
+def _ws_path_routes_to_uid(uid, custom_path):
+    eff = _ws_effective_path(uid, custom_path)
+    parts = [p for p in eff.strip("/").split("/") if p]
+    return bool(parts) and parts[-1] == str(uid)
+
+
+def _ws_path_conflict(uid, protocol, custom_path, exclude_uid="", links=None):
+    if (protocol or "") not in WS_PROTOCOLS:
+        return None
+    mine = _ws_effective_path(uid, custom_path)
+    rows = list(links) if links is not None else list(LINKS.values())
+    for _l in rows:
+        if (_l.get("protocol") or "") not in WS_PROTOCOLS:
+            continue
+        if not _l.get("active"):
+            continue
+        if str(_l.get("uid") or "") == str(exclude_uid or ""):
+            continue
+        other = _ws_effective_path(str(_l.get("uid") or ""), str(_l.get("custom_path") or ""))
+        if other == mine:
+            return _l
+    return None
+
+
+def _ws_path_conflict_detail(uid, custom_path, conflict):
+    return "WebSocket path '" + _ws_effective_path(uid, custom_path) + "' is already used by inbound '" + str(conflict.get("label", "")) + "' (" + str(conflict.get("uid", "")) + ", " + str(conflict.get("protocol", "")) + "). All WebSocket inbounds share the panel port and are routed by path, so each inbound needs a different path. Use a custom path containing {uid}."
 
 
 def _webproxy_shared_443():
@@ -3182,6 +3262,8 @@ def _proxy_inbound_disabled_reason(link):
         except (TypeError, ValueError):
             port = 443
         if port != int(WEBPROXY_PUBLIC_PORT):
+            if _web_port_is_fronted(port):
+                return _proxy_disabled_reason("webproxy")
             if _is_single_port_host():
                 return "WEB proxy link port " + str(port) + " is not reachable on this single-port host: only port 443 works here (the bridge rides the panel HTTPS port). Recreate this inbound on port 443 to get a working tg://webproxy link."
             err = _WEB_BRIDGE_ERRORS.get(port, "")
@@ -3602,6 +3684,9 @@ async def _proxy_mux_ensure_ports(ports):
             wanted.append(_v)
     if not wanted:
         return {"bound": [], "failed": {}}
+    for _p in wanted:
+        if _web_bridge_running(_p):
+            await _release_web_bridge_port(_p)
     if tgproxy is None:
         for _p in wanted:
             if _p not in _PROXY_MUX_PORTS:
@@ -3649,6 +3734,9 @@ async def _ensure_web_bridge_port(port):
     except (TypeError, ValueError):
         return False
     if not port or port == int(WEBPROXY_PUBLIC_PORT):
+        return True
+    if _web_port_is_fronted(port):
+        _WEB_BRIDGE_ERRORS.pop(port, None)
         return True
     if _web_bridge_running(port):
         return True
@@ -3726,7 +3814,7 @@ async def _release_web_bridge_port_if_unused(port):
     for _l in list(LINKS.values()):
         if (_l.get("protocol") or "") == "webproxy" and _l.get("active"):
             try:
-                if int(_l.get("port") or 443) == port:
+                if int(_l.get("port") or 443) == port and not _web_port_is_fronted(port):
                     return
             except (TypeError, ValueError):
                 continue
@@ -3772,7 +3860,11 @@ async def _proxy_ensure_active_proxy_ports():
             except (TypeError, ValueError):
                 _p = 443
             if _p != int(WEBPROXY_PUBLIC_PORT):
-                await _ensure_web_bridge_port(_p)
+                if _web_port_is_fronted(_p):
+                    if _web_bridge_running(_p):
+                        await _release_web_bridge_port(_p)
+                else:
+                    await _ensure_web_bridge_port(_p)
 
 
 async def _proxy_listener_refresh_loop():
@@ -3880,7 +3972,10 @@ def proxy_link_for_uid(uid, protocol, host, port, variant="dd", domain="www.goog
     if protocol in PROXY_PROTOCOLS:
         merged = dict(stored)
         merged["port"] = use_port
-        if not _proxy_inbound_enabled(merged):
+        if protocol == "webproxy":
+            if not stored.get("active"):
+                return ""
+        elif not _proxy_inbound_enabled(merged):
             return ""
     if protocol == "socks5":
         user, pw = _proxy_creds_for_link(stored)
@@ -3916,7 +4011,7 @@ def proxy_links_for_link(link, host):
         out["variants"] = tgproxy.mtproxy_links_for_uid(host, port, uid, domain) if _link_enabled else {"plain": "", "dd": "", "faketls": ""}
         out["variant"] = variant
     if protocol == "webproxy":
-        if token and _link_enabled:
+        if token and link.get("active"):
             try:
                 out["all_ports"] = [{"port": port, "token": token, "secret": _web_link_secret_for_link(link), "link": _web_link(host, token, link, port), "link_https": _web_link_https(host, token, link, port)}]
             except ValueError:
@@ -3931,7 +4026,7 @@ def proxy_links_for_link(link, host):
     if protocol == "webproxy":
         out["port"] = port
         out["webproxy_token"] = token
-        if token and _link_enabled:
+        if token and link.get("active"):
             try:
                 out["secret"] = _web_link_secret_for_link(link)
                 out["link_https"] = _web_link_https(host, token, link, port)
@@ -5308,6 +5403,12 @@ async def lifespan(app: FastAPI):
             except Exception:
                 return True
 
+        _set_forward = _tg_fn("set_panel_forward")
+        if _set_forward is not None:
+            try:
+                _set_forward("127.0.0.1", int(os.environ.get("PORT", CONFIG.get("port", 8000)) or 0))
+            except (TypeError, ValueError):
+                pass
         multi_ports = []
         for _p in (SOCKS_PORT, HTTP_PROXY_PORT, TG_PROXY_PORT):
             _p = int(_p or 0)
@@ -6297,6 +6398,375 @@ def parse_user_agent(ua: str) -> tuple:
         browser = "Unknown"
     return browser, os_name
 
+SX_TOKEN_CSS = r""":root{
+--sx-bg:#070a06;
+--sx-surface:#0d120b;
+--sx-surface-2:#131a0f;
+--sx-surface-3:#1a2314;
+--sx-border:#26301e;
+--sx-border-strong:#3e4f31;
+--sx-text:#edf6e3;
+--sx-text-2:#a7bda0;
+--sx-text-3:#7d9377;
+--sx-accent:#39ff14;
+--sx-accent-hover:#2ee00e;
+--sx-accent-ink:#86ff6b;
+--sx-accent-solid:#39ff14;
+--sx-on-accent:#081006;
+--sx-accent-soft:rgba(57,255,20,0.12);
+--sx-accent-border:rgba(57,255,20,0.38);
+--sx-success:#4ade80;
+--sx-success-soft:rgba(74,222,128,0.12);
+--sx-success-border:rgba(74,222,128,0.38);
+--sx-success-ink:#86efac;
+--sx-warning:#fbbf24;
+--sx-warning-soft:rgba(251,191,36,0.12);
+--sx-warning-border:rgba(251,191,36,0.38);
+--sx-warning-ink:#fcd34d;
+--sx-danger:#f87171;
+--sx-danger-soft:rgba(248,113,113,0.12);
+--sx-danger-border:rgba(248,113,113,0.38);
+--sx-danger-ink:#fca5a5;
+--sx-danger-solid:#dc2626;
+--sx-danger-hover:#b91c1c;
+--sx-info:var(--sx-accent);
+--sx-info-soft:var(--sx-accent-soft);
+--sx-info-border:var(--sx-accent-border);
+--sx-focus:rgba(57,255,20,0.55);
+--sx-row-alt:rgba(255,255,255,0.03);
+--sx-knob-on:#ffffff;
+--sx-shadow-sm:0 1px 2px rgba(0,0,0,0.55);
+--sx-shadow-md:0 4px 16px rgba(0,0,0,0.50);
+--sx-shadow-lg:0 12px 32px rgba(0,0,0,0.55);
+--sx-glow:0 0 24px rgba(57,255,20,0.18);
+--sx-scrim:rgba(0,0,0,0.60);
+--sx-scrim-soft:rgba(0,0,0,0.55);
+--sx-qr:#ffffff;
+--sx-on-danger:#ffffff;
+--sx-radius-xs:4px;
+--sx-radius-sm:6px;
+--sx-radius-md:8px;
+--sx-radius-lg:12px;
+--sx-radius-xl:16px;
+--sx-radius-full:9999px;
+--sx-font-sans:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,"Tahoma",sans-serif;
+--sx-font-mono:ui-monospace,"SF Mono","Cascadia Mono",Menlo,Consolas,"Roboto Mono",monospace;
+--sx-transition:120ms ease-out;
+--sx-space-1:4px;
+--sx-space-2:8px;
+--sx-space-3:12px;
+--sx-space-4:16px;
+--sx-space-5:20px;
+--sx-space-6:24px;
+--sx-space-7:32px;
+--sx-space-8:40px;
+--sx-text-xs:11px;
+--sx-text-sm:12px;
+--sx-text-md:14px;
+--sx-text-base:15px;
+--sx-text-lg:17px;
+--sx-text-xl:20px;
+--sx-text-2xl:24px;
+--sx-leading-tight:1.25;
+--sx-leading-normal:1.5;
+--sx-leading-relaxed:1.65;
+--sx-control-h:40px;
+--sx-control-h-sm:32px;
+--sx-sidebar-w:272px;
+--bg:var(--sx-bg);
+--surface:var(--sx-surface);
+--surface-2:var(--sx-surface-2);
+--surface-3:var(--sx-surface-3);
+--border:var(--sx-border);
+--border-strong:var(--sx-border-strong);
+--text:var(--sx-text);
+--text-2:var(--sx-text-2);
+--text-3:var(--sx-text-3);
+--accent:var(--sx-accent);
+--accent-hover:var(--sx-accent-hover);
+--accent-ink:var(--sx-accent-ink);
+--accent-solid:var(--sx-accent-solid);
+--on-accent:var(--sx-on-accent);
+--accent-soft:var(--sx-accent-soft);
+--accent-border:var(--sx-accent-border);
+--success:var(--sx-success);
+--success-soft:var(--sx-success-soft);
+--success-border:var(--sx-success-border);
+--success-ink:var(--sx-success-ink);
+--warning:var(--sx-warning);
+--warning-soft:var(--sx-warning-soft);
+--warning-border:var(--sx-warning-border);
+--warning-ink:var(--sx-warning-ink);
+--danger:var(--sx-danger);
+--danger-soft:var(--sx-danger-soft);
+--danger-border:var(--sx-danger-border);
+--danger-ink:var(--sx-danger-ink);
+--danger-solid:var(--sx-danger-solid);
+--danger-hover:var(--sx-danger-hover);
+--info:var(--sx-info);
+--info-soft:var(--sx-info-soft);
+--info-border:var(--sx-info-border);
+--focus:var(--sx-focus);
+--row-alt:var(--sx-row-alt);
+--knob-on:var(--sx-knob-on);
+--shadow-sm:var(--sx-shadow-sm);
+--shadow-md:var(--sx-shadow-md);
+--shadow-lg:var(--sx-shadow-lg);
+--radius-xs:var(--sx-radius-xs);
+--radius-sm:var(--sx-radius-sm);
+--radius-md:var(--sx-radius-md);
+--radius-lg:var(--sx-radius-lg);
+--radius-xl:var(--sx-radius-xl);
+--radius-full:var(--sx-radius-full);
+--font-sans:var(--sx-font-sans);
+--font-mono:var(--sx-font-mono);
+--transition:var(--sx-transition);
+--space-1:var(--sx-space-1);
+--space-2:var(--sx-space-2);
+--space-3:var(--sx-space-3);
+--space-4:var(--sx-space-4);
+--space-5:var(--sx-space-5);
+--space-6:var(--sx-space-6);
+--space-7:var(--sx-space-7);
+--space-8:var(--sx-space-8);
+--text-xs:var(--sx-text-xs);
+--text-sm:var(--sx-text-sm);
+--text-md:var(--sx-text-md);
+--text-base:var(--sx-text-base);
+--text-lg:var(--sx-text-lg);
+--text-xl:var(--sx-text-xl);
+--text-2xl:var(--sx-text-2xl);
+--leading-tight:var(--sx-leading-tight);
+--leading-normal:var(--sx-leading-normal);
+--leading-relaxed:var(--sx-leading-relaxed);
+--control-h:var(--sx-control-h);
+--control-h-sm:var(--sx-control-h-sm);
+}
+html.light-mode,body.light-mode{
+--sx-bg:#f1f4ec;
+--sx-surface:#ffffff;
+--sx-surface-2:#edf0e6;
+--sx-surface-3:#e2e7d8;
+--sx-border:#d7ddd0;
+--sx-border-strong:#b8c1ab;
+--sx-text:#161c13;
+--sx-text-2:#4c5747;
+--sx-text-3:#5d6856;
+--sx-accent:#177245;
+--sx-accent-hover:#145c38;
+--sx-accent-ink:#14663a;
+--sx-accent-solid:#177245;
+--sx-on-accent:#ffffff;
+--sx-accent-soft:rgba(23,114,69,0.10);
+--sx-accent-border:rgba(23,114,69,0.38);
+--sx-success:#177245;
+--sx-success-soft:#dcfce7;
+--sx-success-border:#86efac;
+--sx-success-ink:#14663a;
+--sx-warning:#92400e;
+--sx-warning-soft:#fef3c7;
+--sx-warning-border:#fcd34d;
+--sx-warning-ink:#92400e;
+--sx-danger:#b91c1c;
+--sx-danger-soft:#fee2e2;
+--sx-danger-border:#fca5a5;
+--sx-danger-ink:#991b1b;
+--sx-danger-solid:#b91c1c;
+--sx-danger-hover:#991b1b;
+--sx-focus:rgba(23,114,69,0.45);
+--sx-row-alt:rgba(22,28,19,0.04);
+--sx-shadow-sm:0 1px 2px rgba(16,24,40,0.06),0 1px 3px rgba(16,24,40,0.10);
+--sx-shadow-md:0 4px 12px rgba(16,24,40,0.08);
+--sx-shadow-lg:0 16px 40px rgba(16,24,40,0.14);
+--sx-glow:0 0 0 rgba(0,0,0,0);
+--sx-scrim:rgba(0,0,0,0.45);
+--sx-scrim-soft:rgba(0,0,0,0.35);
+}
+html.blue-dark,body.blue-dark{
+--sx-bg:#0a0f1e;
+--sx-surface:#101a30;
+--sx-surface-2:#16223e;
+--sx-surface-3:#1e2c4d;
+--sx-border:#263650;
+--sx-border-strong:#3e547c;
+--sx-text:#e6ecf7;
+--sx-text-2:#a3b1c9;
+--sx-text-3:#8ba0bd;
+--sx-accent:#60a5fa;
+--sx-accent-hover:#4a86f7;
+--sx-accent-ink:#a5c8fb;
+--sx-accent-solid:#2f6fe0;
+--sx-on-accent:#ffffff;
+--sx-accent-soft:rgba(96,165,250,0.14);
+--sx-accent-border:rgba(96,165,250,0.40);
+--sx-success:#4ade80;
+--sx-success-soft:rgba(74,222,128,0.12);
+--sx-success-border:rgba(74,222,128,0.38);
+--sx-success-ink:#86efac;
+--sx-warning:#fbbf24;
+--sx-warning-soft:rgba(251,191,36,0.12);
+--sx-warning-border:rgba(251,191,36,0.38);
+--sx-warning-ink:#fcd34d;
+--sx-danger:#f87171;
+--sx-danger-soft:rgba(248,113,113,0.12);
+--sx-danger-border:rgba(248,113,113,0.38);
+--sx-danger-ink:#fca5a5;
+--sx-danger-solid:#dc2626;
+--sx-danger-hover:#b91c1c;
+--sx-focus:rgba(96,165,250,0.55);
+--sx-row-alt:rgba(255,255,255,0.03);
+--sx-shadow-sm:0 1px 2px rgba(0,0,0,0.55);
+--sx-shadow-md:0 4px 16px rgba(0,0,0,0.50);
+--sx-shadow-lg:0 12px 32px rgba(0,0,0,0.55);
+--sx-glow:0 0 24px rgba(96,165,250,0.20);
+}"""
+SX_PUBLIC_CSS = SX_TOKEN_CSS + r"""
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{min-height:100%}
+body{font-family:var(--sx-font-sans);background:var(--sx-bg);color:var(--sx-text);font-size:var(--sx-text-base);line-height:var(--sx-leading-normal);transition:background-color var(--sx-transition),color var(--sx-transition)}
+body[dir="rtl"]{direction:rtl;text-align:start}
+a{color:var(--sx-accent-ink);text-decoration:none}
+a:hover{text-decoration:underline}
+button{font-family:inherit}
+::selection{background:var(--sx-accent-solid);color:var(--sx-on-accent)}
+:focus-visible{outline:2px solid var(--sx-focus);outline-offset:2px}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--sx-border-strong);border-radius:var(--sx-radius-full)}
+::-webkit-scrollbar-thumb:hover{background:var(--sx-text-3)}
+.hidden{display:none}
+.ltr{direction:ltr;unicode-bidi:isolate}
+bdi{unicode-bidi:isolate}
+.ic{display:inline-flex;flex:none;width:var(--ic,18px);height:var(--ic,18px);vertical-align:-3px;color:inherit}
+.ic svg{width:100%;height:100%;display:block}
+[dir="rtl"] .ic-flip{transform:scaleX(-1)}
+.cc{font-family:var(--sx-font-mono);font-size:var(--sx-text-xs);font-weight:600;background:var(--sx-surface-2);border:1px solid var(--sx-border);border-radius:var(--sx-radius-xs);padding:1px 5px;color:var(--sx-text-2)}
+.status{display:inline-flex;align-items:center;gap:6px;font-size:13px}
+.status-dot{width:8px;height:8px;border-radius:var(--sx-radius-full);flex:none}
+.status-dot.ok{background:var(--sx-success)}
+.status-dot.warn{background:var(--sx-warning)}
+.status-dot.err{background:var(--sx-danger)}
+.status-dot.off{background:var(--sx-text-3)}
+.num{font-family:var(--sx-font-mono);font-variant-numeric:tabular-nums}
+.logo{display:inline-flex;align-items:center;gap:8px;font-family:var(--sx-font-sans);font-size:20px;font-weight:800;color:var(--sx-text);letter-spacing:-0.02em;flex-shrink:0}
+.logo::before{content:"";width:20px;height:20px;background:var(--sx-accent);border-radius:6px;flex:none;box-shadow:var(--sx-glow)}
+.version-tag{font-family:var(--sx-font-mono);font-size:var(--sx-text-xs);font-weight:600;background:var(--sx-surface-2);border:1px solid var(--sx-border);color:var(--sx-text-2);border-radius:var(--sx-radius-full);padding:2px 8px}
+.btn{font-family:inherit;font-size:var(--sx-text-md);font-weight:600;border-radius:var(--sx-radius-md);padding:8px 14px;min-height:var(--sx-control-h);cursor:pointer;display:inline-flex;align-items:center;justify-content:center;gap:8px;border:1px solid transparent;transition:background-color var(--sx-transition),color var(--sx-transition),border-color var(--sx-transition),transform 150ms ease-out;position:relative;letter-spacing:0.01em;background:var(--sx-surface-2);color:var(--sx-text)}
+.btn:active{transform:scale(0.97)}
+.btn:disabled{opacity:0.5;cursor:not-allowed}
+.btn-primary{background:var(--sx-accent-solid);color:var(--sx-on-accent);box-shadow:var(--sx-shadow-sm)}
+.btn-primary:hover{background:var(--sx-accent-hover)}
+.btn-outline{background:transparent;border-color:var(--sx-border-strong);color:var(--sx-text)}
+.btn-outline:hover{background:var(--sx-surface-2);border-color:var(--sx-accent-border)}
+.btn-danger{background:var(--sx-danger-solid);color:var(--sx-on-danger)}
+.btn-danger:hover{background:var(--sx-danger-hover)}
+.btn-sm{min-height:var(--sx-control-h-sm);padding:4px 10px;font-size:var(--sx-text-sm)}
+.btn-icon{display:inline-flex;align-items:center;justify-content:center;width:38px;height:38px;border-radius:var(--sx-radius-md);border:1px solid var(--sx-border);background:var(--sx-surface);color:var(--sx-text-2);cursor:pointer;transition:background-color var(--sx-transition),color var(--sx-transition),border-color var(--sx-transition);flex:none}
+.btn-icon:hover{background:var(--sx-surface-2);color:var(--sx-text);border-color:var(--sx-accent-border)}
+.btn-danger-icon:hover{color:var(--sx-danger);border-color:var(--sx-danger-border)}
+.btn:focus-visible,.btn-icon:focus-visible,.act-btn:focus-visible,.nav-link:focus-visible,.pill-btn:focus-visible,.chip:focus-visible,.seg-btn:focus-visible,.lang-btn:focus-visible,.mo-close:focus-visible{outline:2px solid var(--sx-focus);outline-offset:2px}
+.lang-switch{display:flex;gap:2px;background:var(--sx-surface-2);border:1px solid var(--sx-border);border-radius:var(--sx-radius-md);padding:3px}
+.lang-btn{padding:6px 12px;border:none;background:transparent;color:var(--sx-text-3);font-size:13px;font-weight:700;border-radius:var(--sx-radius-sm);cursor:pointer;font-family:inherit;transition:background-color var(--sx-transition),color var(--sx-transition)}
+.lang-btn.active{background:var(--sx-accent-solid);color:var(--sx-on-accent)}
+.card{background:var(--sx-surface);border:1px solid var(--sx-border);border-radius:var(--sx-radius-xl);padding:20px;box-shadow:var(--sx-shadow-sm);min-width:0;transition:border-color var(--sx-transition),box-shadow var(--sx-transition)}
+.card:hover{border-color:var(--sx-border-strong)}
+.card-hd{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:14px}
+.card-title{font-size:var(--sx-text-lg);font-weight:700;color:var(--sx-text);letter-spacing:-0.01em}
+.fg{display:flex;flex-direction:column;gap:6px;margin-bottom:14px;min-width:0}
+.fl{font-size:var(--sx-text-sm);font-weight:700;color:var(--sx-text-2);letter-spacing:0.04em;text-transform:uppercase}
+.fi,.fs{width:100%;max-width:100%;min-height:var(--sx-control-h);padding:9px 12px;border:1px solid var(--sx-border);border-radius:var(--sx-radius-md);background:var(--sx-surface-2);color:var(--sx-text);font-size:var(--sx-text-md);font-family:inherit;transition:border-color var(--sx-transition),box-shadow var(--sx-transition)}
+.fi:focus,.fs:focus{outline:none;border-color:var(--sx-accent);box-shadow:0 0 0 3px var(--sx-accent-soft)}
+.fi::placeholder{color:var(--sx-text-3)}
+textarea.fi{resize:vertical;min-height:130px;white-space:pre-wrap;overflow-wrap:break-word;word-break:break-word}
+select.fi,select.fs{cursor:pointer}
+input[type="color"].fi{padding:4px;height:44px}
+.hint{font-size:0.85rem;color:var(--sx-text-3);line-height:var(--sx-leading-relaxed)}
+.tag{display:inline-flex;align-items:center;gap:4px;font-size:var(--sx-text-xs);font-weight:700;padding:3px 8px;border-radius:var(--sx-radius-full);background:var(--sx-surface-3);border:1px solid var(--sx-border);color:var(--sx-text-2);white-space:nowrap}
+.tag-on{background:var(--sx-success-soft);border-color:var(--sx-success-border);color:var(--sx-success-ink)}
+.tag-off{background:var(--sx-danger-soft);border-color:var(--sx-danger-border);color:var(--sx-danger-ink)}
+.tag-vless{background:var(--sx-accent-soft);border-color:var(--sx-accent-border);color:var(--sx-accent-ink)}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:6px 12px;border-radius:var(--sx-radius-full);border:1px solid var(--sx-border);background:var(--sx-surface-2);color:var(--sx-text-2);font-size:var(--sx-text-sm);font-weight:600;cursor:pointer;transition:background-color var(--sx-transition),color var(--sx-transition),border-color var(--sx-transition)}
+.chip:hover{border-color:var(--sx-accent-border);color:var(--sx-text)}
+.chip.active{background:var(--sx-accent-solid);border-color:var(--sx-accent-solid);color:var(--sx-on-accent)}
+.chip:active{transform:scale(0.97)}
+.pill-group{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.pill-btn{padding:7px 14px;border-radius:var(--sx-radius-full);border:1px solid var(--sx-border);background:var(--sx-surface-2);color:var(--sx-text-2);font-size:var(--sx-text-sm);font-weight:600;cursor:pointer;transition:background-color var(--sx-transition),color var(--sx-transition),border-color var(--sx-transition)}
+.pill-btn:hover{border-color:var(--sx-accent-border);color:var(--sx-text)}
+.pill-btn.active{background:var(--sx-accent-solid);border-color:var(--sx-accent-solid);color:var(--sx-on-accent)}
+.pill-btn:active{transform:scale(0.97)}
+.seg-group{display:flex;gap:2px;background:var(--sx-surface-2);border:1px solid var(--sx-border);border-radius:var(--sx-radius-md);padding:3px;width:fit-content;max-width:100%}
+.seg-btn{padding:7px 14px;border:none;background:transparent;color:var(--sx-text-3);font-size:var(--sx-text-sm);font-weight:700;border-radius:var(--sx-radius-sm);cursor:pointer;font-family:inherit;transition:background-color var(--sx-transition),color var(--sx-transition)}
+.seg-btn.active{background:var(--sx-accent-solid);color:var(--sx-on-accent)}
+.seg-btn:hover:not(.active){color:var(--sx-text)}
+.seg-btn:active{transform:scale(0.97)}
+.toast{position:fixed;bottom:40px;left:50%;transform:translateX(-50%) translateY(20px);background:var(--sx-surface-3);color:var(--sx-text);border:1px solid var(--sx-border-strong);border-radius:var(--sx-radius-md);padding:16px 28px;font-size:1rem;font-weight:600;opacity:0;transition:opacity var(--sx-transition),transform 150ms ease-out;z-index:999;box-shadow:var(--sx-shadow-md);pointer-events:none;max-width:90vw;text-align:center;display:flex;align-items:center;gap:10px}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0);pointer-events:auto}
+.mo{position:fixed;inset:0;background:var(--sx-scrim);z-index:200;display:none;align-items:flex-start;justify-content:center;animation:sxFadeIn 150ms ease;padding:20px 12px;overflow-y:auto;box-sizing:border-box}
+.mo.show{display:flex}
+.mo-box{background:var(--sx-surface);border:1px solid var(--sx-border-strong);border-radius:var(--sx-radius-xl);padding:32px;width:min(560px,calc(100vw - 32px));min-width:min(560px,calc(100vw - 32px));max-width:min(560px,calc(100vw - 32px));max-height:90vh;overflow-y:auto;overflow-x:hidden;margin:auto;box-shadow:var(--sx-shadow-lg);position:relative;animation:sxScaleIn 150ms ease}
+.mo-title{font-size:1.6rem;font-weight:700;margin-bottom:28px;color:var(--sx-accent-ink);padding-inline-end:48px}
+.mo-close{position:absolute;top:20px;inset-inline-end:20px;background:var(--sx-surface-3);border:1px solid var(--sx-border);color:var(--sx-text-3);width:40px;height:40px;border-radius:var(--sx-radius-sm);cursor:pointer;transition:background-color var(--sx-transition),color var(--sx-transition),border-color var(--sx-transition);display:flex;align-items:center;justify-content:center;font-size:1.4rem}
+.mo-close:hover{color:var(--sx-text);border-color:var(--sx-accent-border)}
+.footer{padding:20px 24px 32px}
+.footer-inner{display:flex;align-items:center;justify-content:center;gap:20px;flex-wrap:wrap;color:var(--sx-text-3);font-size:var(--sx-text-sm)}
+.footer-inner a{color:var(--sx-text-3);text-decoration:none}
+.footer-inner a:hover{color:var(--sx-accent-ink)}
+@keyframes sxFadeIn{from{opacity:0}to{opacity:1}}
+@keyframes sxScaleIn{from{transform:scale(0.95);opacity:0}to{transform:scale(1);opacity:1}}
+@keyframes sxRot{to{transform:rotate(360deg)}}
+@keyframes sxSpin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion: reduce){*{transition:none !important;animation:none !important}}
+.header{min-height:64px;background:var(--sx-surface);border-bottom:1px solid var(--sx-border);display:flex;align-items:center;justify-content:center;padding:0 20px;position:sticky;top:0;z-index:101}
+.header-inner{display:flex;align-items:center;justify-content:space-between;width:100%;max-width:1080px;gap:16px;flex-wrap:wrap}
+.header-right{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+body.sx-doc-land{display:flex;flex-direction:column;min-height:100vh;line-height:1.55;-webkit-font-smoothing:antialiased}
+body.sx-doc-land .main{flex:1;display:flex;align-items:center;justify-content:center;padding:24px 16px;width:100%;max-width:none}
+body.sx-doc-land .card{width:min(440px,calc(100vw - 32px));text-align:center;padding:28px 24px}
+body.sx-doc-land .card h1{display:inline-flex;align-items:center;gap:10px;font-size:26px;font-weight:800;letter-spacing:-0.02em;color:var(--sx-text);margin-bottom:14px;line-height:1.3}
+body.sx-doc-land .card h1::before{content:"";width:22px;height:22px;background:var(--sx-accent);border-radius:6px;flex:none;box-shadow:var(--sx-glow)}
+body.sx-doc-land .footer{border-top:1px solid var(--sx-border);background:var(--sx-surface);min-height:52px;padding:12px 16px;margin-top:auto}
+.subtitle{font-size:var(--sx-text-md);color:var(--sx-text-2);margin-bottom:24px;line-height:1.65}
+.steps{display:flex;flex-direction:column;gap:12px;margin-bottom:24px;text-align:start}
+.step{display:flex;align-items:flex-start;gap:14px;padding:14px;border:1px solid var(--sx-border);border-radius:var(--sx-radius-lg);background:var(--sx-surface-2)}
+.step:hover{border-color:var(--sx-accent-border)}
+.step-num{flex:none;width:30px;height:30px;border-radius:var(--sx-radius-full);background:var(--sx-accent-solid);color:var(--sx-on-accent);font-weight:800;font-size:var(--sx-text-md);display:flex;align-items:center;justify-content:center}
+.step-text{color:var(--sx-text);font-size:var(--sx-text-md);line-height:1.55;padding-top:3px}
+body.sx-doc-404{display:flex;align-items:center;justify-content:center;min-height:100vh;padding:16px}
+.nf-card{background:var(--sx-surface);border:1px solid var(--sx-border);border-radius:var(--sx-radius-xl);padding:40px 32px;max-width:480px;width:100%;box-shadow:var(--sx-shadow-md);text-align:center}
+.nf-logo{display:flex;align-items:center;justify-content:center;gap:8px;font-size:20px;font-weight:800;color:var(--sx-text);letter-spacing:-0.02em}
+.nf-logo-dot{width:20px;height:20px;background:var(--sx-accent);border-radius:6px;flex:none;box-shadow:var(--sx-glow)}
+.nf-code{font-size:96px;font-weight:800;line-height:1;color:var(--sx-accent);margin:28px 0 8px;font-family:var(--sx-font-mono);letter-spacing:-0.04em}
+.nf-msg{font-size:var(--sx-text-lg);color:var(--sx-text-2);margin-bottom:28px}
+.nf-btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:12px 24px;min-height:var(--sx-control-h);background:var(--sx-accent-solid);color:var(--sx-on-accent);font-weight:700;border-radius:var(--sx-radius-md);text-decoration:none;font-size:var(--sx-text-md)}
+.nf-btn:hover{background:var(--sx-accent-hover);text-decoration:none}
+body.sx-doc-user{display:flex;align-items:center;justify-content:center;min-height:100vh;padding:16px}
+body.sx-doc-user .card{max-width:720px;width:100%;text-align:center}
+.header-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;gap:12px;flex-wrap:wrap}
+.header-row h1{color:var(--sx-text);font-size:20px;font-weight:700;letter-spacing:-0.02em}
+.info-box{background:var(--sx-surface-2);border-radius:var(--sx-radius-md);padding:16px;margin-bottom:20px;display:grid;grid-template-columns:1fr 1fr;gap:12px 24px;text-align:start;border:1px solid var(--sx-border)}
+.info-box .row{display:flex;flex-direction:column;padding:8px 0;border-bottom:1px solid var(--sx-border)}
+.info-box .row:last-child{border-bottom:none}
+.info-box .row-wide{grid-column:span 2}
+.label{color:var(--sx-text-3);font-weight:500;font-size:12px}
+.value{color:var(--sx-text);font-weight:600;font-size:14px;overflow-wrap:anywhere}
+.progress-bar-bg{height:8px;background:var(--sx-surface-3);border-radius:var(--sx-radius-full);margin-top:12px;overflow:hidden;grid-column:span 2}
+.progress-bar-fill{height:100%;width:__USAGE_PCT__%;background:var(--sx-success);border-radius:var(--sx-radius-full);transition:width 120ms ease-out}
+.progress-bar-fill.warn{background:var(--sx-warning)}
+.progress-bar-fill.err{background:var(--sx-danger)}
+.progress-text{font-size:12px;color:var(--sx-text-2);margin-top:6px;text-align:end;grid-column:span 2}
+.daily-chart{grid-column:span 2;height:180px;position:relative}
+.daily-chart canvas{max-width:100%}
+.qr{background:var(--sx-qr);padding:12px;border-radius:16px;display:inline-block;margin-bottom:20px}
+.qr canvas{display:block;border-radius:8px}
+.actions-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,220px),1fr));gap:10px;margin-bottom:10px}
+@media (max-width:500px){
+.info-box{grid-template-columns:1fr}
+.info-box .row-wide{grid-column:span 1}
+.progress-bar-bg,.progress-text,.daily-chart{grid-column:span 1}
+.nf-code{font-size:72px}
+body.sx-doc-land .card h1{font-size:24px}
+}"""
+
 NOTFOUND_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -6304,160 +6774,10 @@ NOTFOUND_HTML = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>404 - SulgX Panel</title>
 <style>
-:root{
-  --bg:#0a0b0d;
-  --surface:#121417;
-  --surface-2:#191c21;
-  --surface-3:#21252c;
-  --border:#262b33;
-  --border-strong:#3a414c;
-  --text:#f2f3f5;
-  --text-2:#a7adb8;
-  --text-3:#9aa3af;
-  --accent:#39ff14;
-  --accent-hover:#2ee00e;
-  --accent-ink:#39ff14;
-  --accent-solid:#39ff14;
-  --danger-solid:#dc2626;
-  --danger-hover:#b91c1c;
-  --row-alt:rgba(255,255,255,0.03);
-  --accent-soft:rgba(57,255,20,0.12);
-  --accent-border:rgba(57,255,20,0.35);
-  --on-accent:#0b0f0a;
-  --success:#4ade80;
-  --success-soft:rgba(74,222,128,0.12);
-  --success-border:rgba(74,222,128,0.35);
-  --success-ink:#86efac;
-  --warning:#fbbf24;
-  --warning-soft:rgba(251,191,36,0.12);
-  --warning-border:rgba(251,191,36,0.35);
-  --warning-ink:#fcd34d;
-  --danger:#f87171;
-  --danger-soft:rgba(248,113,113,0.12);
-  --danger-border:rgba(248,113,113,0.35);
-  --danger-ink:#fca5a5;
-  --info:var(--accent);
-  --info-soft:var(--accent-soft);
-  --info-border:var(--accent-border);
-  --focus:rgba(57,255,20,0.55);
-  --radius-xs:4px;
-  --radius-sm:6px;
-  --radius-md:8px;
-  --radius-lg:12px;
-  --radius-xl:16px;
-  --radius-full:9999px;
-  --shadow-sm:0 1px 2px rgba(0,0,0,0.50);
-  --shadow-md:0 4px 16px rgba(0,0,0,0.45);
-  --shadow-lg:0 12px 32px rgba(0,0,0,0.50);
-  --font-sans:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,"Tahoma",sans-serif;
-  --font-mono:ui-monospace,"SF Mono","Cascadia Mono",Menlo,Consolas,"Roboto Mono",monospace;
-  --transition:120ms ease-out;
-  --knob-on:#ffffff;
-  --space-1:4px;
-  --space-2:8px;
-  --space-3:12px;
-  --space-4:16px;
-  --space-5:20px;
-  --space-6:24px;
-  --space-7:32px;
-  --space-8:40px;
-  --text-xs:11px;
-  --text-sm:12px;
-  --text-md:14px;
-  --text-base:15px;
-  --text-lg:17px;
-  --text-xl:20px;
-  --text-2xl:24px;
-  --leading-tight:1.25;
-  --leading-normal:1.5;
-  --leading-relaxed:1.65;
-  --control-h:40px;
-  --control-h-sm:32px;
-}
-body.light-mode{
-  --bg:#fdfcf8;
-  --surface:#ffffff;
-  --surface-2:#f5f4ef;
-  --surface-3:#edece5;
-  --border:#e3e2db;
-  --border-strong:#cfcec3;
-  --text:#1b1a17;
-  --text-2:#57564e;
-  --text-3:#66655c;
-  --accent:#166534;
-  --accent-hover:#14532d;
-  --accent-ink:#166534;
-  --accent-solid:#15803d;
-  --danger-solid:#b91c1c;
-  --danger-hover:#991b1b;
-  --row-alt:rgba(27,26,23,0.04);
-  --accent-soft:rgba(21,128,61,0.10);
-  --accent-border:rgba(21,128,61,0.35);
-  --on-accent:#ffffff;
-  --success:#166534;
-  --success-soft:#dcfce7;
-  --success-border:#86efac;
-  --warning:#92400e;
-  --warning-soft:#fef3c7;
-  --warning-border:#fcd34d;
-  --danger:#b91c1c;
-  --danger-soft:#fee2e2;
-  --danger-border:#fca5a5;
-  --success-ink:#166534;
-  --warning-ink:#92400e;
-  --danger-ink:#991b1b;
-  --focus:rgba(21,128,61,0.45);
-  --shadow-sm:0 1px 2px rgba(16,24,40,0.06),0 1px 3px rgba(16,24,40,0.10);
-  --shadow-md:0 4px 12px rgba(16,24,40,0.08);
-  --shadow-lg:0 12px 32px rgba(16,24,40,0.12);
-}
-body.blue-dark{
-  --bg:#0b1120;
-  --surface:#182238;
-  --surface-2:#1f2c47;
-  --surface-3:#2b3a5c;
-  --border:#2b3a4f;
-  --border-strong:#475569;
-  --text:#e2e8f0;
-  --text-2:#a5b4c7;
-  --text-3:#9fb0c3;
-  --accent:#3b82f6;
-  --accent-hover:#2563eb;
-  --accent-ink:#93c5fd;
-  --accent-solid:#2563eb;
-  --danger-solid:#dc2626;
-  --danger-hover:#b91c1c;
-  --row-alt:rgba(255,255,255,0.03);
-  --accent-soft:rgba(59,130,246,0.12);
-  --accent-border:rgba(59,130,246,0.35);
-  --danger:#fca5a5;
-  --on-accent:#ffffff;
-  --focus:rgba(59,130,246,0.55);
-}
-.ic{display:inline-flex;flex:none;width:var(--ic,18px);height:var(--ic,18px);vertical-align:-3px;color:inherit}
-.ic svg{width:100%;height:100%;display:block}
-.cc{font-family:var(--font-mono);font-size:11px;font-weight:600;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:1px 5px;color:var(--text-2)}
-.status{display:inline-flex;align-items:center;gap:6px;font-size:13px}
-.status-dot{width:8px;height:8px;border-radius:9999px;flex:none}
-.status-dot.ok{background:var(--success)}
-.status-dot.warn{background:var(--warning)}
-.status-dot.err{background:var(--danger)}
-.status-dot.off{background:var(--text-3)}
-.hidden{display:none}
-.ltr{direction:ltr;unicode-bidi:isolate}
-[dir="rtl"] .ic-flip{transform:scaleX(-1)}
-@media (prefers-reduced-motion: reduce){*{transition:none!important;animation:none!important}}
-body{font-family:var(--font-sans);background:var(--bg);color:var(--text);margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px;box-sizing:border-box}
-.nf-card{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:32px 24px;width:min(400px,calc(100vw - 32px));text-align:center;box-shadow:var(--shadow-md)}
-.nf-logo{display:flex;align-items:center;justify-content:center;gap:10px;font-size:28px;font-weight:700;letter-spacing:-0.02em}
-.nf-logo-dot{width:28px;height:28px;background:var(--accent);border-radius:8px;flex:none}
-.nf-code{font-family:var(--font-mono);font-size:48px;font-weight:700;color:var(--accent-ink);margin:24px 0 8px}
-.nf-msg{color:var(--text-2);margin:0 0 24px}
-.nf-btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;background:var(--accent-solid);color:var(--on-accent);border:none;border-radius:6px;padding:10px 18px;font-size:14px;font-weight:500;cursor:pointer;text-decoration:none}
-.nf-btn:hover{background:var(--accent-hover)}
+""" + SX_PUBLIC_CSS + r"""
 </style>
 </head>
-<body>
+<body class="sx-doc-404">
 <div class="nf-card">
 <div class="nf-logo"><span class="nf-logo-dot"></span>SulgX Panel</div>
 <div class="nf-code">404</div>
@@ -6479,233 +6799,10 @@ LANDING_HTML = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title data-en="SulgX - Welcome" data-fa="SulgX - خوش‌آمدید">SulgX - Welcome</title>
 <style>
-:root{
-  --bg:#0a0b0d;
-  --surface:#121417;
-  --surface-2:#191c21;
-  --surface-3:#21252c;
-  --border:#262b33;
-  --border-strong:#3a414c;
-  --text:#f2f3f5;
-  --text-2:#a7adb8;
-  --text-3:#9aa3af;
-  --accent:#39ff14;
-  --accent-hover:#2ee00e;
-  --accent-ink:#39ff14;
-  --accent-solid:#39ff14;
-  --danger-solid:#dc2626;
-  --danger-hover:#b91c1c;
-  --row-alt:rgba(255,255,255,0.03);
-  --accent-soft:rgba(57,255,20,0.12);
-  --accent-border:rgba(57,255,20,0.35);
-  --on-accent:#0b0f0a;
-  --success:#4ade80;
-  --success-soft:rgba(74,222,128,0.12);
-  --success-border:rgba(74,222,128,0.35);
-  --success-ink:#86efac;
-  --warning:#fbbf24;
-  --warning-soft:rgba(251,191,36,0.12);
-  --warning-border:rgba(251,191,36,0.35);
-  --warning-ink:#fcd34d;
-  --danger:#f87171;
-  --danger-soft:rgba(248,113,113,0.12);
-  --danger-border:rgba(248,113,113,0.35);
-  --danger-ink:#fca5a5;
-  --info:var(--accent);
-  --info-soft:var(--accent-soft);
-  --info-border:var(--accent-border);
-  --focus:rgba(57,255,20,0.55);
-  --radius-xs:4px;
-  --radius-sm:6px;
-  --radius-md:8px;
-  --radius-lg:12px;
-  --radius-xl:16px;
-  --radius-full:9999px;
-  --shadow-sm:0 1px 2px rgba(0,0,0,0.50);
-  --shadow-md:0 4px 16px rgba(0,0,0,0.45);
-  --shadow-lg:0 12px 32px rgba(0,0,0,0.50);
-  --font-sans:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,"Tahoma",sans-serif;
-  --font-mono:ui-monospace,"SF Mono","Cascadia Mono",Menlo,Consolas,"Roboto Mono",monospace;
-  --transition:120ms ease-out;
-  --knob-on:#ffffff;
-  --space-1:4px;
-  --space-2:8px;
-  --space-3:12px;
-  --space-4:16px;
-  --space-5:20px;
-  --space-6:24px;
-  --space-7:32px;
-  --space-8:40px;
-  --text-xs:11px;
-  --text-sm:12px;
-  --text-md:14px;
-  --text-base:15px;
-  --text-lg:17px;
-  --text-xl:20px;
-  --text-2xl:24px;
-  --leading-tight:1.25;
-  --leading-normal:1.5;
-  --leading-relaxed:1.65;
-  --control-h:40px;
-  --control-h-sm:32px;
-}
-body.light-mode{
-  --bg:#fdfcf8;
-  --surface:#ffffff;
-  --surface-2:#f5f4ef;
-  --surface-3:#edece5;
-  --border:#e3e2db;
-  --border-strong:#cfcec3;
-  --text:#1b1a17;
-  --text-2:#57564e;
-  --text-3:#66655c;
-  --accent:#166534;
-  --accent-hover:#14532d;
-  --accent-ink:#166534;
-  --accent-solid:#15803d;
-  --danger-solid:#b91c1c;
-  --danger-hover:#991b1b;
-  --row-alt:rgba(27,26,23,0.04);
-  --accent-soft:rgba(21,128,61,0.10);
-  --accent-border:rgba(21,128,61,0.35);
-  --on-accent:#ffffff;
-  --success:#166534;
-  --success-soft:#dcfce7;
-  --success-border:#86efac;
-  --warning:#92400e;
-  --warning-soft:#fef3c7;
-  --warning-border:#fcd34d;
-  --danger:#b91c1c;
-  --danger-soft:#fee2e2;
-  --danger-border:#fca5a5;
-  --success-ink:#166534;
-  --warning-ink:#92400e;
-  --danger-ink:#991b1b;
-  --focus:rgba(21,128,61,0.45);
-  --shadow-sm:0 1px 2px rgba(16,24,40,0.06),0 1px 3px rgba(16,24,40,0.10);
-  --shadow-md:0 4px 12px rgba(16,24,40,0.08);
-  --shadow-lg:0 12px 32px rgba(16,24,40,0.12);
-}
-body.blue-dark{
-  --bg:#0b1120;
-  --surface:#182238;
-  --surface-2:#1f2c47;
-  --surface-3:#2b3a5c;
-  --border:#2b3a4f;
-  --border-strong:#475569;
-  --text:#e2e8f0;
-  --text-2:#a5b4c7;
-  --text-3:#9fb0c3;
-  --accent:#3b82f6;
-  --accent-hover:#2563eb;
-  --accent-ink:#93c5fd;
-  --accent-solid:#2563eb;
-  --danger-solid:#dc2626;
-  --danger-hover:#b91c1c;
-  --row-alt:rgba(255,255,255,0.03);
-  --accent-soft:rgba(59,130,246,0.12);
-  --accent-border:rgba(59,130,246,0.35);
-  --danger:#fca5a5;
-  --on-accent:#ffffff;
-  --focus:rgba(59,130,246,0.55);
-}
-.ic{display:inline-flex;flex:none;width:var(--ic,18px);height:var(--ic,18px);vertical-align:-3px;color:inherit}
-.ic svg{width:100%;height:100%;display:block}
-.cc{font-family:var(--font-mono);font-size:11px;font-weight:600;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:1px 5px;color:var(--text-2)}
-.status{display:inline-flex;align-items:center;gap:6px;font-size:13px}
-.status-dot{width:8px;height:8px;border-radius:9999px;flex:none}
-.status-dot.ok{background:var(--success)}
-.status-dot.warn{background:var(--warning)}
-.status-dot.err{background:var(--danger)}
-.status-dot.off{background:var(--text-3)}
-.hidden{display:none}
-.ltr{direction:ltr;unicode-bidi:isolate}
-[dir="rtl"] .ic-flip{transform:scaleX(-1)}
-@media (prefers-reduced-motion: reduce){*{transition:none!important;animation:none!important}}
-*{margin:0;padding:0;box-sizing:border-box}
-html,body{height:100%}
-body{
-  font-family:var(--font-sans); color:var(--text); display:flex; flex-direction:column;
-  background:var(--bg); transition:background-color 120ms ease-out,color 120ms ease-out; line-height:1.55;
-  -webkit-font-smoothing:antialiased;
-}
-body[dir="rtl"]{direction:rtl;text-align:start}
-a{text-decoration:none;color:inherit}
-:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
-.header{
-  min-height:56px; background:var(--surface); border-bottom:1px solid var(--border);
-  display:flex; align-items:center; justify-content:center; padding:0 16px;
-  position:sticky; top:0; z-index:101;
-}
-.header-inner{display:flex;align-items:center;justify-content:space-between;width:100%;max-width:1200px;flex-wrap:wrap;gap:12px}
-.logo{
-  display:inline-flex;align-items:center;gap:8px;
-  font-family:var(--font-sans); font-size:20px; font-weight:700; color:var(--text);
-  letter-spacing:-0.02em; flex-shrink:0;
-}
-.logo::before{content:'';width:20px;height:20px;background:var(--accent);border-radius:6px;flex:none}
-.header-right{display:flex;align-items:center;gap:8px;flex-wrap:wrap;flex-shrink:0}
-.lang-switch{display:flex;gap:2px;background:var(--surface-2);border-radius:var(--radius-sm);padding:3px}
-.lang-btn{
-  padding:6px 14px;border:none;background:transparent;color:var(--text-3);font-size:13px;font-weight:600;
-  border-radius:var(--radius-sm);cursor:pointer;font-family:inherit;transition:background-color 120ms ease-out,color 120ms ease-out;
-}
-.lang-btn.active{background:var(--accent-solid);color:var(--on-accent)}
-.btn-icon{
-  background:var(--surface);border:1px solid var(--border);color:var(--text-2);border-radius:var(--radius-sm);
-  width:32px;height:32px;padding:0;cursor:pointer;transition:background-color 120ms ease-out,color 120ms ease-out,border-color 120ms ease-out;
-  display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;
-}
-.btn-icon:hover{color:var(--text);background:var(--surface-2)}
-.main{flex:1;display:flex;align-items:center;justify-content:center;padding:24px 16px;position:relative;z-index:1}
-.card{
-  background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-xl);
-  padding:24px;width:min(400px,calc(100vw - 32px));box-shadow:var(--shadow-sm);
-  text-align:center;position:relative;
-}
-h1{
-  display:inline-flex;align-items:center;gap:8px;
-  font-family:var(--font-sans);font-size:24px;font-weight:700;color:var(--text);
-  letter-spacing:-0.02em;margin-bottom:16px;line-height:1.3;
-}
-h1::before{content:'';width:20px;height:20px;background:var(--accent);border-radius:6px;flex:none}
-.subtitle{color:var(--text-2);font-size:14px;margin-bottom:28px;line-height:1.65}
-.steps{text-align:start;margin-bottom:28px}
-.step{
-  display:flex;align-items:flex-start;gap:12px;margin-bottom:12px;
-  background:var(--surface-2);border-radius:var(--radius-md);border:1px solid var(--border);
-  transition:border-color 120ms ease-out;
-  padding:14px;
-}
-.step:hover{border-color:var(--border-strong)}
-.step-num{
-  width:28px;height:28px;border-radius:var(--radius-full);flex:none;
-  background:var(--surface-2);border:1px solid var(--border);color:var(--text-2);
-  font-size:14px;font-weight:600;display:flex;align-items:center;justify-content:center;
-}
-.step-text{font-size:14px;color:var(--text);line-height:1.55}
-.btn{
-  font-family:inherit;font-size:14px;font-weight:500;border-radius:var(--radius-sm);
-  padding:8px 14px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;
-  gap:8px;border:1px solid transparent;transition:background-color 120ms ease-out,color 120ms ease-out,border-color 120ms ease-out;
-  margin:6px;
-}
-.btn-primary{background:var(--accent-solid);color:var(--on-accent)}
-.btn-primary:hover{background:var(--accent-hover)}
-.footer{
-  min-height:52px;display:flex;align-items:center;justify-content:center;font-size:13px;
-  color:var(--text-3);border-top:1px solid var(--border);background:var(--surface);padding:12px 16px;margin-top:auto;
-}
-.footer-inner{display:flex;align-items:center;justify-content:center;gap:24px;flex-wrap:wrap}
-.footer-inner a{color:var(--accent-ink);text-decoration:none;font-weight:600;transition:color 120ms ease-out}
-.footer-inner a:hover{color:var(--accent-hover)}
-@media (max-width: 480px){
-  .header{padding:8px 16px}
-  .card{padding:20px 16px}
-}
+""" + SX_PUBLIC_CSS + r"""
 </style>
 </head>
-<body>
+<body class="sx-doc-land">
 <div class="header">
   <div class="header-inner">
     <span class="logo">SulgX</span>
@@ -7527,6 +7624,8 @@ async def save_settings(request: Request, _=Depends(require_auth)):
         new_path = str(body['default_path']).strip()
         if not new_path:
             new_path = "/ws/{uid}"
+        if "{uid}" not in new_path:
+            raise HTTPException(status_code=400, detail="Default path must contain {uid} so the server can route each WebSocket inbound to its own link")
         DEFAULT_PATH = new_path
         await db_execute(
             "INSERT OR REPLACE INTO settings (key, value) VALUES ('default_path', ?)",
@@ -8027,7 +8126,8 @@ async def restore_backup(request: Request, _=Depends(require_auth)):
                 "mtproto_variant": restore_str(link.get("mtproto_variant"), "mtproto_variant", "dd") if restore_str(link.get("mtproto_variant"), "mtproto_variant", "dd") in MTPROTO_VARIANTS else "dd",
                 "mtproto_domain": restore_str(link.get("mtproto_domain"), "mtproto_domain", "www.google.com"),
                 "webproxy_token": restore_str(link.get("webproxy_token"), "webproxy_token", ""),
-                "webproxy_secret_enc": _restore_secret_enc
+                "webproxy_secret_enc": _restore_secret_enc,
+                "proxy_username": restore_str(link.get("proxy_username"), "proxy_username", "")
             })
 
     _restore_tokens = set()
@@ -8041,16 +8141,23 @@ async def restore_backup(request: Request, _=Depends(require_auth)):
                 _cl["webproxy_token"] = _rtok
             _restore_tokens.add(_rtok)
 
-    _proxy_ports_seen = {}
     _web_tokens_seen = {}
     for _cl in clean_links:
         if (_cl.get("protocol") or "") in PROXY_PROTOCOLS and _cl.get("active"):
             _wp = int(_cl.get("port") or 443)
-            _seen = _proxy_ports_seen.get(_wp)
-            if _seen is not None and not ((_cl.get("protocol") or "") == "webproxy" and (_seen.get("protocol") or "") == "webproxy" and _wp == int(WEBPROXY_PUBLIC_PORT)):
-                raise HTTPException(status_code=400, detail="Backup has two proxy inbounds on port " + str(_wp) + ": '" + str(_seen.get("label", "")) + "' and '" + str(_cl.get("label", "")) + "'. Each proxy inbound needs its own port, except WEB proxy inbounds sharing port 443 with their own token.")
-            if _seen is None:
-                _proxy_ports_seen[_wp] = _cl
+            _bconflict = _proxy_port_conflict(_wp, _cl.get("protocol"), exclude_uid=str(_cl.get("uid") or ""), links=clean_links)
+            if _bconflict is not None:
+                raise HTTPException(status_code=400, detail="Backup cannot be restored: " + _proxy_port_conflict_detail(_wp, _cl.get("protocol"), _bconflict))
+        if (_cl.get("protocol") or "") in ("socks5", "http-proxy"):
+            _buser = str(_cl.get("proxy_username") or "").strip()
+            if _buser:
+                _buser_conflict = _proxy_username_conflict(_buser, exclude_uid=str(_cl.get("uid") or ""), links=clean_links)
+                if _buser_conflict is not None:
+                    raise HTTPException(status_code=400, detail="Backup cannot be restored: " + _proxy_username_conflict_detail(_buser, _buser_conflict))
+        if (_cl.get("protocol") or "") in WS_PROTOCOLS and _cl.get("active"):
+            _bpath_conflict = _ws_path_conflict(str(_cl.get("uid") or ""), _cl.get("protocol"), str(_cl.get("custom_path") or ""), exclude_uid=str(_cl.get("uid") or ""), links=clean_links)
+            if _bpath_conflict is not None:
+                raise HTTPException(status_code=400, detail="Backup cannot be restored: " + _ws_path_conflict_detail(str(_cl.get("uid") or ""), str(_cl.get("custom_path") or ""), _bpath_conflict))
         if _cl.get("protocol") == "webproxy":
             _wtok = str(_cl.get("webproxy_token") or "").strip().lower()
             if _wtok:
@@ -8366,8 +8473,8 @@ async def create_link(request: Request, _=Depends(require_auth)):
     _web_secret_enc = ""
     if protocol == "webproxy":
         port = _parse_proxy_port(body.get("port"), protocol)
-        if _is_single_port_host() and port != int(WEBPROXY_PUBLIC_PORT):
-            raise HTTPException(status_code=400, detail="WEB proxy port " + str(port) + " cannot work on this host: only port 443 is reachable on a single-port host (the WEB bridge rides the panel HTTPS port). Create the WEB proxy inbound on port 443.")
+        if _is_single_port_host() and port != int(WEBPROXY_PUBLIC_PORT) and not _web_port_is_fronted(port):
+            raise HTTPException(status_code=400, detail="WEB proxy port " + str(port) + " cannot work on this host: only port 443 is reachable on a single-port host (the WEB bridge rides the panel HTTPS port). Create the WEB proxy inbound on port 443, or first create a SOCKS5, HTTP or MTProto inbound on port " + str(port) + " so the multiplexer fronts that port and the WEB proxy rides it.")
         _web_token = str(body.get("webproxy_token") or "").strip().lower()
         if _web_token:
             if not _webproxy_valid_token(_web_token):
@@ -8391,6 +8498,18 @@ async def create_link(request: Request, _=Depends(require_auth)):
         _conflict = _proxy_port_conflict(port, protocol)
         if _conflict is not None:
             raise HTTPException(status_code=400, detail=_proxy_port_conflict_detail(port, protocol, _conflict))
+    if protocol in ("socks5", "http-proxy"):
+        _user_conflict = _proxy_username_conflict(_proxy_user, exclude_uid=uid)
+        if _user_conflict is not None:
+            raise HTTPException(status_code=400, detail=_proxy_username_conflict_detail(_proxy_user, _user_conflict))
+    if protocol in WS_PROTOCOLS:
+        if not _ws_path_routes_to_uid(uid, custom_path):
+            if str(custom_path or "").strip():
+                raise HTTPException(status_code=400, detail="Custom path '" + _ws_effective_path(uid, custom_path) + "' cannot be routed: the WebSocket path must end with the inbound UUID (use {uid} in the path) so the server can tell this inbound apart from the others sharing the panel port.")
+            raise HTTPException(status_code=400, detail="Default WebSocket path '" + _ws_effective_path(uid, custom_path) + "' cannot be routed: it must contain {uid} so the server can tell each inbound apart. Change the default path in settings first.")
+        _path_conflict = _ws_path_conflict(uid, protocol, custom_path)
+        if _path_conflict is not None:
+            raise HTTPException(status_code=400, detail=_ws_path_conflict_detail(uid, custom_path, _path_conflict))
     xray_dns_mode = body.get("xray_dns_mode", "direct")
     if xray_dns_mode not in ("doh", "fakedns", "direct"):
         raise HTTPException(status_code=400, detail="Invalid xray_dns_mode")
@@ -8494,6 +8613,10 @@ async def create_link(request: Request, _=Depends(require_auth)):
             _conflict = _proxy_port_conflict(port, protocol)
             if _conflict is not None:
                 raise HTTPException(status_code=400, detail=_proxy_port_conflict_detail(port, protocol, _conflict))
+            if protocol in ("socks5", "http-proxy"):
+                _user_conflict = _proxy_username_conflict(_proxy_user, exclude_uid=uid)
+                if _user_conflict is not None:
+                    raise HTTPException(status_code=400, detail=_proxy_username_conflict_detail(_proxy_user, _user_conflict))
         try:
             await db_execute(
             "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment, ip_profile_id, naming_mode, tfo, ech_enabled, ech_sni, ech_doh, fragment_mode, fragment_length, fragment_interval, allow_insecure, random_path, enable_ipv6, smux_enabled, ip_limit, protocol, fingerprint, alpn, port, proxy_line_id, bypass_iran, bypass_china, bypass_russia, xray_dns_mode, xray_doh_url, xray_allowed_domains, udp_enabled, outbound_mode, gaming_profile, ss_method, ss_psk, owner_user_id, outbound_proxy, outbound_proxy_pass) VALUES (?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -8677,6 +8800,7 @@ async def list_links(request: Request, _=Depends(require_auth)):
             "mtproto_variant": extra["mtproto_variant"],
             "mtproto_domain": extra["mtproto_domain"],
             "webproxy_token": extra["webproxy_token"],
+            "webproxy_secret": _web_secret_hex_or_empty(row) if (row.get("protocol") or "") == "webproxy" else "",
             "proxy_username": row.get("proxy_username", "") or "",
             "proxy_password": row.get("proxy_password", "") or "",
             "proxy": _link_proxy_view(row, domain),
@@ -8717,10 +8841,10 @@ async def list_protocols(_=Depends(require_auth)):
         "xhttp-stream-one": "VLESS over XHTTP stream-one mode on the panel HTTPS port (TCP only, no UDP, no mux)",
         "xhttp-stream-up": "VLESS over XHTTP stream-up mode on the panel HTTPS port (TCP only, no UDP, no mux)",
         "xhttp-packet-up": "VLESS over XHTTP packet-up mode on the panel HTTPS port (TCP only, no UDP, no mux)",
-        "socks5": "SOCKS5 (raw TCP listener on its own port, NOT the panel HTTPS port; TCP CONNECT only, no UDP associate; unreachable from outside on a single-port PaaS host)",
-        "mtproto": "Telegram MTProto proxy (raw TCP listener on its own port, NOT the panel HTTPS port; per-link secret, plain / dd / fake-TLS variants; unreachable from outside on a single-port PaaS host)",
-        "webproxy": "Telegram WEB proxy (Direct-DC, rides the panel HTTPS port, port 443 shared with a per-user token and secret in each link; the only Telegram proxy that works on a single-port PaaS host)",
-        "http-proxy": "HTTP CONNECT proxy (raw TCP listener on its own port, NOT the panel HTTPS port; Basic auth = link UUID, destinations restricted, not an open web proxy; unreachable from outside on a single-port PaaS host)"
+        "socks5": "SOCKS5 (shared multiplexer listener on the inbound port; TCP CONNECT only, no UDP associate; several inbounds may share one port, each with its own login; one port can also serve WebSocket, WEB proxy and the panel itself through the multiplexer front door; unreachable from outside on a single-port PaaS host)",
+        "mtproto": "Telegram MTProto proxy (shared multiplexer listener on the inbound port; per-link secret, plain / dd / fake-TLS variants; several inbounds may share one port, routed by secret; one port can also serve WebSocket, WEB proxy and the panel itself through the multiplexer front door; unreachable from outside on a single-port PaaS host)",
+        "webproxy": "Telegram WEB proxy (Direct-DC, rides the panel HTTPS port or any shared multiplexer port, port 443 shared with a per-user token and secret in each link; the only Telegram proxy that works on a single-port PaaS host)",
+        "http-proxy": "HTTP CONNECT proxy (shared multiplexer listener on the inbound port; Basic auth = link UUID, destinations restricted, not an open web proxy; several inbounds may share one port, each with its own login; one port can also serve WebSocket, WEB proxy and the panel itself through the multiplexer front door; unreachable from outside on a single-port PaaS host)"
     }
     return {"protocols": [{"id": p, "name": p, "description": info.get(p, p), "identity": protocol_field_schema(p)["identity"], "fields": list(protocol_field_schema(p)["fields"]), "display": list(protocol_field_schema(p)["display"]), "advanced": list(protocol_advanced_schema(p))} for p in VALID_PROTOCOLS]}
 
@@ -8885,7 +9009,7 @@ async def telegram_proxy_status(request: Request, _=Depends(require_auth)):
     web_link_443 = ""
     web_link_https_443 = ""
     _oldest_web = _oldest_active_web()
-    if _oldest_web is not None and web_enabled:
+    if _oldest_web is not None:
         _tok0 = str(_oldest_web.get("webproxy_token") or "").strip().lower()
         if _tok0:
             try:
@@ -9775,6 +9899,22 @@ async def import_links(request: Request, _=Depends(require_auth)):
                     failed += 1
                     errors.append({"index": index, "error": _proxy_port_conflict_detail(port, protocol, _conflict)})
                     continue
+            if protocol in ("socks5", "http-proxy"):
+                _import_user_conflict = _proxy_username_conflict(_import_user, exclude_uid=uid_input)
+                if _import_user_conflict is not None:
+                    failed += 1
+                    errors.append({"index": index, "error": _proxy_username_conflict_detail(_import_user, _import_user_conflict)})
+                    continue
+            if protocol in WS_PROTOCOLS and active:
+                if not _ws_path_routes_to_uid(uid_input, custom_path):
+                    failed += 1
+                    errors.append({"index": index, "error": "WebSocket path '" + _ws_effective_path(uid_input, custom_path) + "' cannot be routed: the WebSocket path must end with the inbound UUID (use {uid} in the path) so the server can tell this inbound apart from the others sharing the panel port."})
+                    continue
+                _import_path_conflict = _ws_path_conflict(uid_input, protocol, custom_path)
+                if _import_path_conflict is not None:
+                    failed += 1
+                    errors.append({"index": index, "error": _ws_path_conflict_detail(uid_input, custom_path, _import_path_conflict)})
+                    continue
         try:
             await db_execute(
             "INSERT INTO links (uid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, custom_path, custom_sni, custom_host, custom_fp, color, flag, fragment, ip_profile_id, naming_mode, tfo, ech_enabled, ech_sni, ech_doh, fragment_mode, fragment_length, fragment_interval, allow_insecure, random_path, enable_ipv6, smux_enabled, ip_limit, protocol, fingerprint, alpn, port, proxy_line_id, bypass_iran, bypass_china, bypass_russia, xray_dns_mode, xray_doh_url, xray_allowed_domains, udp_enabled, outbound_mode, gaming_profile, ss_method, ss_psk, owner_user_id, outbound_proxy, outbound_proxy_pass) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -10041,12 +10181,29 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
     _patch_port_parsed = _parse_proxy_port(body.get("port"), _patch_proto) if "port" in body and _patch_proto in PROXY_PROTOCOLS else (_parse_int_value(body.get("port"), "port", 0, 0, 65535) if "port" in body else None)
     _patch_port = _patch_port_parsed if "port" in body else link.get("port")
     _patch_active = body.get("active", link.get("active"))
-    if _patch_proto == "webproxy" and _patch_port is not None and _is_single_port_host() and int(_patch_port) != int(WEBPROXY_PUBLIC_PORT):
-        raise HTTPException(status_code=400, detail="WEB proxy port " + str(_patch_port) + " cannot work on this host: only port 443 is reachable on a single-port host (the WEB bridge rides the panel HTTPS port). Change this inbound to port 443.")
+    if _patch_proto == "webproxy" and _patch_port is not None and _is_single_port_host() and int(_patch_port) != int(WEBPROXY_PUBLIC_PORT) and not _web_port_is_fronted(int(_patch_port)):
+        raise HTTPException(status_code=400, detail="WEB proxy port " + str(_patch_port) + " cannot work on this host: only port 443 is reachable on a single-port host (the WEB bridge rides the panel HTTPS port). Change this inbound to port 443, or first create a SOCKS5, HTTP or MTProto inbound on port " + str(_patch_port) + " so the multiplexer fronts that port and the WEB proxy rides it.")
     if _patch_proto in PROXY_PROTOCOLS and _patch_port is not None and _patch_active:
         _patch_conflict = _proxy_port_conflict(_patch_port, _patch_proto, exclude_uid=link.get("uid", ""))
         if _patch_conflict is not None:
             raise HTTPException(status_code=400, detail=_proxy_port_conflict_detail(_patch_port, _patch_proto, _patch_conflict))
+    if _patch_proto in ("socks5", "http-proxy") and ("proxy_username" in body or "protocol" in body):
+        _patch_user = str(body.get("proxy_username") or link.get("proxy_username") or "").strip()
+        if not _patch_user:
+            _patch_user = str(link.get("uid") or "")
+        _patch_user_conflict = _proxy_username_conflict(_patch_user, exclude_uid=link.get("uid", ""))
+        if _patch_user_conflict is not None:
+            raise HTTPException(status_code=400, detail=_proxy_username_conflict_detail(_patch_user, _patch_user_conflict))
+    if _patch_proto in WS_PROTOCOLS and _patch_active and ("custom_path" in body or "protocol" in body):
+        _patch_path = body.get("custom_path") if "custom_path" in body else link.get("custom_path", "")
+        if not _ws_path_routes_to_uid(link.get("uid", ""), _patch_path):
+            if str(_patch_path or "").strip():
+                raise HTTPException(status_code=400, detail="Custom path '" + _ws_effective_path(link.get("uid", ""), _patch_path) + "' cannot be routed: the WebSocket path must end with the inbound UUID (use {uid} in the path) so the server can tell this inbound apart from the others sharing the panel port.")
+            raise HTTPException(status_code=400, detail="Default WebSocket path '" + _ws_effective_path(link.get("uid", ""), _patch_path) + "' cannot be routed: it must contain {uid} so the server can tell each inbound apart. Change the default path in settings first.")
+        if "custom_path" in body or "protocol" in body:
+            _patch_path_conflict = _ws_path_conflict(link.get("uid", ""), _patch_proto, _patch_path, exclude_uid=link.get("uid", ""))
+            if _patch_path_conflict is not None:
+                raise HTTPException(status_code=400, detail=_ws_path_conflict_detail(link.get("uid", ""), _patch_path, _patch_path_conflict))
     if "protocol" in body and body["protocol"] in PROXY_PROTOCOLS and "port" not in body:
         try:
             _kept_port = int(link.get("port") or 0)
@@ -10230,16 +10387,16 @@ async def clone_link(uid: str, _=Depends(require_auth)):
         if new_link.get("protocol") == "webproxy":
             new_link["webproxy_token"] = _webproxy_new_token()
             new_link["webproxy_secret_enc"] = encrypt_proxy_password(_webproxy_new_secret_hex())
-            if int(new_link.get("port") or 443) != int(WEBPROXY_PUBLIC_PORT) and _webproxy_conflict(int(new_link.get("port") or 443)) is not None:
-                _free_port = _next_free_webproxy_port()
-                if not _free_port:
-                    raise HTTPException(status_code=400, detail="No free WEB proxy port left (443, 2053, 2083, 2087, 2096, 8443 are all in use). Port 443 is shared, so a WEB proxy inbound can always be created on 443 with its own token.")
-                new_link["port"] = _free_port
-        if new_link.get("protocol") in ("socks5", "mtproto", "http-proxy"):
-            _clone_port = _next_free_proxy_port(int(new_link.get("port") or PROXY_DEFAULT_PORTS.get(new_link.get("protocol"), 443)))
-            if not _clone_port:
-                raise HTTPException(status_code=400, detail="No free proxy port available near port " + str(new_link.get("port")) + " for the cloned inbound '" + str(new_link.get("label", "")) + "'. Each proxy inbound needs its own port.")
-            new_link["port"] = _clone_port
+        if new_link.get("protocol") in PROXY_PROTOCOLS and new_link.get("active"):
+            _clone_conflict = _proxy_port_conflict(int(new_link.get("port") or 443), new_link.get("protocol"), exclude_uid=new_uid)
+            if _clone_conflict is not None:
+                raise HTTPException(status_code=400, detail=_proxy_port_conflict_detail(int(new_link.get("port") or 443), new_link.get("protocol"), _clone_conflict))
+        if new_link.get("protocol") in WS_PROTOCOLS and new_link.get("active"):
+            if not _ws_path_routes_to_uid(new_uid, str(new_link.get("custom_path") or "")):
+                raise HTTPException(status_code=400, detail="WebSocket path '" + _ws_effective_path(new_uid, str(new_link.get("custom_path") or "")) + "' cannot be routed: the WebSocket path must end with the inbound UUID (use {uid} in the path) so the server can tell this inbound apart from the others sharing the panel port.")
+            _clone_path_conflict = _ws_path_conflict(new_uid, new_link.get("protocol"), str(new_link.get("custom_path") or ""))
+            if _clone_path_conflict is not None:
+                raise HTTPException(status_code=400, detail=_ws_path_conflict_detail(new_uid, str(new_link.get("custom_path") or ""), _clone_path_conflict))
         new_link["used_bytes"] = 0
         new_link["created_at"] = datetime.now(UTC).isoformat()
         if new_link.get("protocol") in ("socks5", "http-proxy"):
@@ -11156,219 +11313,10 @@ async def user_dashboard(uid: str, request: Request):
 <title>Dashboard | {label_esc}</title>
 <script src="/static/chart.umd.js"></script>
 <style>
-:root{{
-  --bg:#0a0b0d;
-  --surface:#121417;
-  --surface-2:#191c21;
-  --surface-3:#21252c;
-  --border:#262b33;
-  --border-strong:#3a414c;
-  --text:#f2f3f5;
-  --text-2:#a7adb8;
-  --text-3:#9aa3af;
-  --accent:#39ff14;
-  --accent-hover:#2ee00e;
-  --accent-ink:#39ff14;
-  --accent-solid:#39ff14;
-  --danger-solid:#dc2626;
-  --danger-hover:#b91c1c;
-  --row-alt:rgba(255,255,255,0.03);
-  --accent-soft:rgba(57,255,20,0.12);
-  --accent-border:rgba(57,255,20,0.35);
-  --on-accent:#0b0f0a;
-  --success:#4ade80;
-  --success-soft:rgba(74,222,128,0.12);
-  --success-border:rgba(74,222,128,0.35);
-  --success-ink:#86efac;
-  --warning:#fbbf24;
-  --warning-soft:rgba(251,191,36,0.12);
-  --warning-border:rgba(251,191,36,0.35);
-  --warning-ink:#fcd34d;
-  --danger:#f87171;
-  --danger-soft:rgba(248,113,113,0.12);
-  --danger-border:rgba(248,113,113,0.35);
-  --danger-ink:#fca5a5;
-  --info:var(--accent);
-  --info-soft:var(--accent-soft);
-  --info-border:var(--accent-border);
-  --focus:rgba(57,255,20,0.55);
-  --radius-xs:4px;
-  --radius-sm:6px;
-  --radius-md:8px;
-  --radius-lg:12px;
-  --radius-xl:16px;
-  --radius-full:9999px;
-  --shadow-sm:0 1px 2px rgba(0,0,0,0.50);
-  --shadow-md:0 4px 16px rgba(0,0,0,0.45);
-  --shadow-lg:0 12px 32px rgba(0,0,0,0.50);
-  --font-sans:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,"Tahoma",sans-serif;
-  --font-mono:ui-monospace,"SF Mono","Cascadia Mono",Menlo,Consolas,"Roboto Mono",monospace;
-  --transition:120ms ease-out;
-  --knob-on:#ffffff;
-  --space-1:4px;
-  --space-2:8px;
-  --space-3:12px;
-  --space-4:16px;
-  --space-5:20px;
-  --space-6:24px;
-  --space-7:32px;
-  --space-8:40px;
-  --text-xs:11px;
-  --text-sm:12px;
-  --text-md:14px;
-  --text-base:15px;
-  --text-lg:17px;
-  --text-xl:20px;
-  --text-2xl:24px;
-  --leading-tight:1.25;
-  --leading-normal:1.5;
-  --leading-relaxed:1.65;
-  --control-h:40px;
-  --control-h-sm:32px;
-}}
-body.light-mode{{
-  --bg:#fdfcf8;
-  --surface:#ffffff;
-  --surface-2:#f5f4ef;
-  --surface-3:#edece5;
-  --border:#e3e2db;
-  --border-strong:#cfcec3;
-  --text:#1b1a17;
-  --text-2:#57564e;
-  --text-3:#66655c;
-  --accent:#166534;
-  --accent-hover:#14532d;
-  --accent-ink:#166534;
-  --accent-solid:#15803d;
-  --danger-solid:#b91c1c;
-  --danger-hover:#991b1b;
-  --row-alt:rgba(27,26,23,0.04);
-  --accent-soft:rgba(21,128,61,0.10);
-  --accent-border:rgba(21,128,61,0.35);
-  --on-accent:#ffffff;
-  --success:#166534;
-  --success-soft:#dcfce7;
-  --success-border:#86efac;
-  --warning:#92400e;
-  --warning-soft:#fef3c7;
-  --warning-border:#fcd34d;
-  --danger:#b91c1c;
-  --danger-soft:#fee2e2;
-  --danger-border:#fca5a5;
-  --success-ink:#166534;
-  --warning-ink:#92400e;
-  --danger-ink:#991b1b;
-  --focus:rgba(21,128,61,0.45);
-  --shadow-sm:0 1px 2px rgba(16,24,40,0.06),0 1px 3px rgba(16,24,40,0.10);
-  --shadow-md:0 4px 12px rgba(16,24,40,0.08);
-  --shadow-lg:0 12px 32px rgba(16,24,40,0.12);
-}}
-body.blue-dark{{
-  --bg:#0b1120;
-  --surface:#182238;
-  --surface-2:#1f2c47;
-  --surface-3:#2b3a5c;
-  --border:#2b3a4f;
-  --border-strong:#475569;
-  --text:#e2e8f0;
-  --text-2:#a5b4c7;
-  --text-3:#9fb0c3;
-  --accent:#3b82f6;
-  --accent-hover:#2563eb;
-  --accent-ink:#93c5fd;
-  --accent-solid:#2563eb;
-  --danger-solid:#dc2626;
-  --danger-hover:#b91c1c;
-  --row-alt:rgba(255,255,255,0.03);
-  --accent-soft:rgba(59,130,246,0.12);
-  --accent-border:rgba(59,130,246,0.35);
-  --danger:#fca5a5;
-  --on-accent:#ffffff;
-  --focus:rgba(59,130,246,0.55);
-}}
-.ic{{display:inline-flex;flex:none;width:var(--ic,18px);height:var(--ic,18px);vertical-align:-3px;color:inherit}}
-.ic svg{{width:100%;height:100%;display:block}}
-.cc{{font-family:var(--font-mono);font-size:11px;font-weight:600;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:1px 5px;color:var(--text-2)}}
-.status{{display:inline-flex;align-items:center;gap:6px;font-size:13px}}
-.status-dot{{width:8px;height:8px;border-radius:9999px;flex:none}}
-.status-dot.ok{{background:var(--success)}}
-.status-dot.warn{{background:var(--warning)}}
-.status-dot.err{{background:var(--danger)}}
-.status-dot.off{{background:var(--text-3)}}
-.hidden{{display:none}}
-.ltr{{direction:ltr;unicode-bidi:isolate}}
-[dir="rtl"] .ic-flip{{transform:scaleX(-1)}}
-@media (prefers-reduced-motion: reduce){{*{{transition:none!important;animation:none!important}}}}
-*{{margin:0;padding:0;box-sizing:border-box}}
-body{{
-  font-family:var(--font-sans); background:var(--bg); color:var(--text);
-  display:flex; align-items:center; justify-content:center; min-height:100vh; padding:16px;
-  position:relative;
-  transition:background-color 120ms ease-out,color 120ms ease-out;
-}}
-body[dir="rtl"]{{direction:rtl;text-align:start}}
-:focus-visible{{outline:2px solid var(--focus);outline-offset:2px}}
-.card{{
-  background:var(--surface); border:1px solid var(--border); border-radius:var(--radius-xl);
-  padding:24px; max-width: 720px; width:100%; box-shadow:var(--shadow-sm);
-  position:relative; z-index:1; text-align:center;
-}}
-.header-row{{
-  display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; gap:12px; flex-wrap:wrap;
-}}
-h1{{color:var(--text); font-size:20px; font-weight:600; letter-spacing:-0.02em;}}
-.lang-switch{{display:flex; gap:2px; background:var(--surface-2); border-radius:var(--radius-sm); padding:3px;}}
-.lang-btn{{padding:6px 14px; border:none; background:transparent; color:var(--text-3); font-size:13px; font-weight:600; border-radius:var(--radius-sm); cursor:pointer; font-family:inherit; transition:background-color 120ms ease-out,color 120ms ease-out;}}
-.lang-btn.active{{background:var(--accent-solid); color:var(--on-accent);}}
-.info-box{{
-  background:var(--surface-2); border-radius:var(--radius-md); padding:16px; margin-bottom:20px;
-  display:grid; grid-template-columns:1fr 1fr; gap:12px 24px; text-align:start;
-  border:1px solid var(--border);
-}}
-.info-box .row{{display:flex; flex-direction:column; padding:8px 0; border-bottom:1px solid var(--border);}}
-.info-box .row:last-child{{border-bottom:none;}}
-.info-box .row-wide{{grid-column:span 2;}}
-.label{{color:var(--text-3); font-weight:500; font-size:12px;}}
-.value{{color:var(--text); font-weight:600; font-size:14px;}}
-.progress-bar-bg{{height:6px; background:var(--surface-3); border-radius:var(--radius-full); margin-top:12px; overflow:hidden; grid-column:span 2;}}
-.progress-bar-fill{{height:100%; width:{usage_percent}%; background:var(--success); border-radius:var(--radius-full); transition:width 120ms ease-out;}}
-.progress-bar-fill.warn{{background:var(--warning);}}
-.progress-bar-fill.err{{background:var(--danger);}}
-.progress-text{{font-size:12px; color:var(--text-2); margin-top:4px; text-align:end; grid-column:span 2;}}
-.qr{{background:#fff; padding:12px; border-radius:16px; display:inline-block; margin-bottom:20px;}}
-.qr canvas{{display:block; border-radius:8px;}}
-.actions-grid{{display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,220px),1fr)); gap:10px; margin-bottom:10px;}}
-.btn{{
-  display:flex; align-items:center; justify-content:center; gap:8px; padding:8px 14px;
-  background:var(--accent-solid);
-  color:var(--on-accent); font-weight:500; border-radius:var(--radius-sm); text-decoration:none;
-  transition:background-color 120ms ease-out,color 120ms ease-out,border-color 120ms ease-out; border:1px solid transparent; cursor:pointer; font-family:inherit; font-size:14px;
-}}
-.btn:hover{{background:var(--accent-hover);}}
-.btn-outline{{background:var(--surface); color:var(--text); border:1px solid var(--border-strong);}}
-.btn-outline:hover{{background:var(--surface-2); border-color:var(--border-strong);}}
-#toast{{position:fixed; bottom:40px; left:50%; transform:translateX(-50%); background:var(--surface-3); color:var(--text); border:1px solid var(--border-strong); border-radius:8px; padding:12px 16px; font-weight:500; font-size:14px; opacity:0; transition:opacity 150ms ease-out,transform 150ms ease-out; z-index:999; box-shadow:var(--shadow-md); pointer-events:none; display:flex; align-items:center; gap:8px;}}
-#toast.show{{opacity:1; transform:translateX(-50%) translateY(0); pointer-events:auto;}}
-#toast .ic.ok{{color:var(--success);}}
-#toast .ic.err{{color:var(--danger);}}
-.daily-chart{{
-  margin-top:16px;
-  grid-column:span 2;
-  height: 200px;
-}}
-.daily-chart canvas{{
-  height: 200px !important;
-  width: 100% !important;
-}}
-@media (max-width: 480px){{
-  .card{{padding:20px 16px;}}
-  .info-box{{grid-template-columns:1fr;}}
-  .info-box .row-wide, .progress-bar-bg, .progress-text, .daily-chart{{grid-column:span 1;}}
-  .header-row{{flex-direction:column; gap:8px;}}
-}}
+{SX_PUBLIC_CSS}
 </style>
 </head>
-<body>
+<body class="sx-doc-user">
 <div class="card">
   <div class="header-row">
     <h1>{label_esc}</h1>
@@ -11830,6 +11778,7 @@ if (dailyData.length > 0) {{
 </script>
 </body>
 </html>"""
+    html_content = html_content.replace("__USAGE_PCT__", str(usage_percent))
     return HTMLResponse(content=html_content)
 
 @app.get("/user/{uid}/sub")
@@ -17773,146 +17722,312 @@ PANEL_HTML = r"""<!DOCTYPE html>
 <title>SulgX Panel</title>
 <script src="/static/chart.umd.js"></script>
 <style>
-*{margin: 0; padding: 0; box-sizing: border-box;}
-:root{
-
-  --bg:#0a0b0d;
-  --surface:#121417;
-  --surface-2:#191c21;
-  --surface-3:#21252c;
-  --border:#262b33;
-  --border-strong:#3a414c;
-  --text:#f2f3f5;
-  --text-2:#a7adb8;
-  --text-3:#9aa3af;
-  --accent:#39ff14;
-  --accent-hover:#2ee00e;
-  --accent-ink:#39ff14;
-  --accent-solid:#39ff14;
-  --danger-solid:#dc2626;
-  --danger-hover:#b91c1c;
-  --row-alt:rgba(255,255,255,0.03);
-  --accent-soft:rgba(57,255,20,0.12);
-  --accent-border:rgba(57,255,20,0.35);
-  --on-accent:#0b0f0a;
-  --success:#4ade80;
-  --success-soft:rgba(74,222,128,0.12);
-  --success-border:rgba(74,222,128,0.35);
-  --success-ink:#86efac;
-  --warning:#fbbf24;
-  --warning-soft:rgba(251,191,36,0.12);
-  --warning-border:rgba(251,191,36,0.35);
-  --warning-ink:#fcd34d;
-  --danger:#f87171;
-  --danger-soft:rgba(248,113,113,0.12);
-  --danger-border:rgba(248,113,113,0.35);
-  --danger-ink:#fca5a5;
-  --info:var(--accent);
-  --info-soft:var(--accent-soft);
-  --info-border:var(--accent-border);
-  --focus:rgba(57,255,20,0.55);
-  --radius-xs:4px;
-  --radius-sm:6px;
-  --radius-md:8px;
-  --radius-lg:12px;
-  --radius-xl:16px;
-  --radius-full:9999px;
-  --shadow-sm:0 1px 2px rgba(0,0,0,0.50);
-  --shadow-md:0 4px 16px rgba(0,0,0,0.45);
-  --shadow-lg:0 12px 32px rgba(0,0,0,0.50);
-  --font-sans:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,"Tahoma",sans-serif;
-  --font-mono:ui-monospace,"SF Mono","Cascadia Mono",Menlo,Consolas,"Roboto Mono",monospace;
-  --transition:120ms ease-out;
-  --knob-on:#ffffff;
-  --space-1:4px;
-  --space-2:8px;
-  --space-3:12px;
-  --space-4:16px;
-  --space-5:20px;
-  --space-6:24px;
-  --space-7:32px;
-  --space-8:40px;
-  --text-xs:11px;
-  --text-sm:12px;
-  --text-md:14px;
-  --text-base:15px;
-  --text-lg:17px;
-  --text-xl:20px;
-  --text-2xl:24px;
-  --leading-tight:1.25;
-  --leading-normal:1.5;
-  --leading-relaxed:1.65;
-  --control-h:40px;
-  --control-h-sm:32px;
-
+""" + SX_TOKEN_CSS + r"""
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{min-height:100%}
+body{font-family:var(--sx-font-sans);background:var(--sx-bg);color:var(--sx-text);font-size:var(--sx-text-base);line-height:var(--sx-leading-normal);transition:background-color var(--sx-transition),color var(--sx-transition)}
+body[dir="rtl"]{direction:rtl;text-align:start}
+a{color:var(--sx-accent-ink);text-decoration:none}
+a:hover{text-decoration:underline}
+button{font-family:inherit}
+::selection{background:var(--sx-accent-solid);color:var(--sx-on-accent)}
+:focus-visible{outline:2px solid var(--sx-focus);outline-offset:2px}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--sx-border-strong);border-radius:var(--sx-radius-full)}
+::-webkit-scrollbar-thumb:hover{background:var(--sx-text-3)}
+.hidden{display:none}
+.ltr{direction:ltr;unicode-bidi:isolate}
+bdi{unicode-bidi:isolate}
+.ic{display:inline-flex;flex:none;width:var(--ic,18px);height:var(--ic,18px);vertical-align:-3px;color:inherit}
+.ic svg{width:100%;height:100%;display:block}
+[dir="rtl"] .ic-flip{transform:scaleX(-1)}
+.cc{font-family:var(--sx-font-mono);font-size:var(--sx-text-xs);font-weight:600;background:var(--sx-surface-2);border:1px solid var(--sx-border);border-radius:var(--sx-radius-xs);padding:1px 5px;color:var(--sx-text-2)}
+.status{display:inline-flex;align-items:center;gap:6px;font-size:13px}
+.status-dot{width:8px;height:8px;border-radius:var(--sx-radius-full);flex:none}
+.status-dot.ok{background:var(--sx-success)}
+.status-dot.warn{background:var(--sx-warning)}
+.status-dot.err{background:var(--sx-danger)}
+.status-dot.off{background:var(--sx-text-3)}
+.num{font-family:var(--sx-font-mono);font-variant-numeric:tabular-nums}
+.logo{display:inline-flex;align-items:center;gap:8px;font-family:var(--sx-font-sans);font-size:20px;font-weight:800;color:var(--sx-text);letter-spacing:-0.02em;flex-shrink:0}
+.logo::before{content:"";width:20px;height:20px;background:var(--sx-accent);border-radius:6px;flex:none;box-shadow:var(--sx-glow)}
+.version-tag{font-family:var(--sx-font-mono);font-size:var(--sx-text-xs);font-weight:600;background:var(--sx-surface-2);border:1px solid var(--sx-border);color:var(--sx-text-2);border-radius:var(--sx-radius-full);padding:2px 8px}
+.btn{font-family:inherit;font-size:var(--sx-text-md);font-weight:600;border-radius:var(--sx-radius-md);padding:8px 14px;min-height:var(--sx-control-h);cursor:pointer;display:inline-flex;align-items:center;justify-content:center;gap:8px;border:1px solid transparent;transition:background-color var(--sx-transition),color var(--sx-transition),border-color var(--sx-transition),transform 150ms ease-out;position:relative;letter-spacing:0.01em;background:var(--sx-surface-2);color:var(--sx-text)}
+.btn:active{transform:scale(0.97)}
+.btn:disabled{opacity:0.5;cursor:not-allowed}
+.btn-primary{background:var(--sx-accent-solid);color:var(--sx-on-accent);box-shadow:var(--sx-shadow-sm)}
+.btn-primary:hover{background:var(--sx-accent-hover)}
+.btn-outline{background:transparent;border-color:var(--sx-border-strong);color:var(--sx-text)}
+.btn-outline:hover{background:var(--sx-surface-2);border-color:var(--sx-accent-border)}
+.btn-danger{background:var(--sx-danger-solid);color:var(--sx-on-danger)}
+.btn-danger:hover{background:var(--sx-danger-hover)}
+.btn-sm{min-height:var(--sx-control-h-sm);padding:4px 10px;font-size:var(--sx-text-sm)}
+.btn-icon{display:inline-flex;align-items:center;justify-content:center;width:38px;height:38px;border-radius:var(--sx-radius-md);border:1px solid var(--sx-border);background:var(--sx-surface);color:var(--sx-text-2);cursor:pointer;transition:background-color var(--sx-transition),color var(--sx-transition),border-color var(--sx-transition);flex:none}
+.btn-icon:hover{background:var(--sx-surface-2);color:var(--sx-text);border-color:var(--sx-accent-border)}
+.btn-danger-icon:hover{color:var(--sx-danger);border-color:var(--sx-danger-border)}
+.btn:focus-visible,.btn-icon:focus-visible,.act-btn:focus-visible,.nav-link:focus-visible,.pill-btn:focus-visible,.chip:focus-visible,.seg-btn:focus-visible,.lang-btn:focus-visible,.mo-close:focus-visible{outline:2px solid var(--sx-focus);outline-offset:2px}
+.lang-switch{display:flex;gap:2px;background:var(--sx-surface-2);border:1px solid var(--sx-border);border-radius:var(--sx-radius-md);padding:3px}
+.lang-btn{padding:6px 12px;border:none;background:transparent;color:var(--sx-text-3);font-size:13px;font-weight:700;border-radius:var(--sx-radius-sm);cursor:pointer;font-family:inherit;transition:background-color var(--sx-transition),color var(--sx-transition)}
+.lang-btn.active{background:var(--sx-accent-solid);color:var(--sx-on-accent)}
+.card{background:var(--sx-surface);border:1px solid var(--sx-border);border-radius:var(--sx-radius-xl);padding:20px;box-shadow:var(--sx-shadow-sm);min-width:0;transition:border-color var(--sx-transition),box-shadow var(--sx-transition)}
+.card:hover{border-color:var(--sx-border-strong)}
+.card-hd{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:14px}
+.card-title{font-size:var(--sx-text-lg);font-weight:700;color:var(--sx-text);letter-spacing:-0.01em}
+.fg{display:flex;flex-direction:column;gap:6px;margin-bottom:14px;min-width:0}
+.fl{font-size:var(--sx-text-sm);font-weight:700;color:var(--sx-text-2);letter-spacing:0.04em;text-transform:uppercase}
+.fi,.fs{width:100%;max-width:100%;min-height:var(--sx-control-h);padding:9px 12px;border:1px solid var(--sx-border);border-radius:var(--sx-radius-md);background:var(--sx-surface-2);color:var(--sx-text);font-size:var(--sx-text-md);font-family:inherit;transition:border-color var(--sx-transition),box-shadow var(--sx-transition)}
+.fi:focus,.fs:focus{outline:none;border-color:var(--sx-accent);box-shadow:0 0 0 3px var(--sx-accent-soft)}
+.fi::placeholder{color:var(--sx-text-3)}
+textarea.fi{resize:vertical;min-height:130px;white-space:pre-wrap;overflow-wrap:break-word;word-break:break-word}
+select.fi,select.fs{cursor:pointer}
+input[type="color"].fi{padding:4px;height:44px}
+.hint{font-size:0.85rem;color:var(--sx-text-3);line-height:var(--sx-leading-relaxed)}
+.tag{display:inline-flex;align-items:center;gap:4px;font-size:var(--sx-text-xs);font-weight:700;padding:3px 8px;border-radius:var(--sx-radius-full);background:var(--sx-surface-3);border:1px solid var(--sx-border);color:var(--sx-text-2);white-space:nowrap}
+.tag-on{background:var(--sx-success-soft);border-color:var(--sx-success-border);color:var(--sx-success-ink)}
+.tag-off{background:var(--sx-danger-soft);border-color:var(--sx-danger-border);color:var(--sx-danger-ink)}
+.tag-vless{background:var(--sx-accent-soft);border-color:var(--sx-accent-border);color:var(--sx-accent-ink)}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:6px 12px;border-radius:var(--sx-radius-full);border:1px solid var(--sx-border);background:var(--sx-surface-2);color:var(--sx-text-2);font-size:var(--sx-text-sm);font-weight:600;cursor:pointer;transition:background-color var(--sx-transition),color var(--sx-transition),border-color var(--sx-transition)}
+.chip:hover{border-color:var(--sx-accent-border);color:var(--sx-text)}
+.chip.active{background:var(--sx-accent-solid);border-color:var(--sx-accent-solid);color:var(--sx-on-accent)}
+.chip:active{transform:scale(0.97)}
+.pill-group{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.pill-btn{padding:7px 14px;border-radius:var(--sx-radius-full);border:1px solid var(--sx-border);background:var(--sx-surface-2);color:var(--sx-text-2);font-size:var(--sx-text-sm);font-weight:600;cursor:pointer;transition:background-color var(--sx-transition),color var(--sx-transition),border-color var(--sx-transition)}
+.pill-btn:hover{border-color:var(--sx-accent-border);color:var(--sx-text)}
+.pill-btn.active{background:var(--sx-accent-solid);border-color:var(--sx-accent-solid);color:var(--sx-on-accent)}
+.pill-btn:active{transform:scale(0.97)}
+.seg-group{display:flex;gap:2px;background:var(--sx-surface-2);border:1px solid var(--sx-border);border-radius:var(--sx-radius-md);padding:3px;width:fit-content;max-width:100%}
+.seg-btn{padding:7px 14px;border:none;background:transparent;color:var(--sx-text-3);font-size:var(--sx-text-sm);font-weight:700;border-radius:var(--sx-radius-sm);cursor:pointer;font-family:inherit;transition:background-color var(--sx-transition),color var(--sx-transition)}
+.seg-btn.active{background:var(--sx-accent-solid);color:var(--sx-on-accent)}
+.seg-btn:hover:not(.active){color:var(--sx-text)}
+.seg-btn:active{transform:scale(0.97)}
+.toast{position:fixed;bottom:40px;left:50%;transform:translateX(-50%) translateY(20px);background:var(--sx-surface-3);color:var(--sx-text);border:1px solid var(--sx-border-strong);border-radius:var(--sx-radius-md);padding:16px 28px;font-size:1rem;font-weight:600;opacity:0;transition:opacity var(--sx-transition),transform 150ms ease-out;z-index:999;box-shadow:var(--sx-shadow-md);pointer-events:none;max-width:90vw;text-align:center;display:flex;align-items:center;gap:10px}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0);pointer-events:auto}
+.mo{position:fixed;inset:0;background:var(--sx-scrim);z-index:200;display:none;align-items:flex-start;justify-content:center;animation:sxFadeIn 150ms ease;padding:20px 12px;overflow-y:auto;box-sizing:border-box}
+.mo.show{display:flex}
+.mo-box{background:var(--sx-surface);border:1px solid var(--sx-border-strong);border-radius:var(--sx-radius-xl);padding:32px;width:min(560px,calc(100vw - 32px));min-width:min(560px,calc(100vw - 32px));max-width:min(560px,calc(100vw - 32px));max-height:90vh;overflow-y:auto;overflow-x:hidden;margin:auto;box-shadow:var(--sx-shadow-lg);position:relative;animation:sxScaleIn 150ms ease}
+.mo-title{font-size:1.6rem;font-weight:700;margin-bottom:28px;color:var(--sx-accent-ink);padding-inline-end:48px}
+.mo-close{position:absolute;top:20px;inset-inline-end:20px;background:var(--sx-surface-3);border:1px solid var(--sx-border);color:var(--sx-text-3);width:40px;height:40px;border-radius:var(--sx-radius-sm);cursor:pointer;transition:background-color var(--sx-transition),color var(--sx-transition),border-color var(--sx-transition);display:flex;align-items:center;justify-content:center;font-size:1.4rem}
+.mo-close:hover{color:var(--sx-text);border-color:var(--sx-accent-border)}
+.footer{padding:20px 24px 32px}
+.footer-inner{display:flex;align-items:center;justify-content:center;gap:20px;flex-wrap:wrap;color:var(--sx-text-3);font-size:var(--sx-text-sm)}
+.footer-inner a{color:var(--sx-text-3);text-decoration:none}
+.footer-inner a:hover{color:var(--sx-accent-ink)}
+@keyframes sxFadeIn{from{opacity:0}to{opacity:1}}
+@keyframes sxScaleIn{from{transform:scale(0.95);opacity:0}to{transform:scale(1);opacity:1}}
+@keyframes sxRot{to{transform:rotate(360deg)}}
+@keyframes sxSpin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion: reduce){*{transition:none !important;animation:none !important}}
+.icon{display:inline-block;width:20px;height:20px;flex:none;background-color:currentColor;-webkit-mask-size:contain;mask-size:contain;-webkit-mask-repeat:no-repeat;mask-repeat:no-repeat;-webkit-mask-position:center;mask-position:center}
+html{scroll-padding-top:84px}
+.nav-link .nav-icon,.btn-icon .icon,.stat-card .stat-icon,.status-card .status-icon,.header-right .btn-icon .icon{width:20px;height:20px}
+.sx-shell{min-height:100vh}
+.sx-sidebar{position:fixed;top:0;bottom:0;inset-inline-start:0;width:var(--sx-sidebar-w);background:var(--sx-surface);border-inline-end:1px solid var(--sx-border);z-index:120;display:flex;flex-direction:column;overflow-y:auto;overflow-x:hidden}
+.sx-side-brand{display:flex;align-items:center;gap:10px;padding:20px 20px 16px;border-bottom:1px solid var(--sx-border);flex:none}
+.sx-side-brand .logo{font-size:22px}
+.sx-side-brand .logo::before{width:26px;height:26px;border-radius:8px}
+.sx-side-foot{margin-top:auto;padding:16px 20px;border-top:1px solid var(--sx-border);color:var(--sx-text-3);font-size:var(--sx-text-sm);display:flex;align-items:center;justify-content:space-between;gap:8px;flex:none}
+.sx-side-foot .sx-dot{width:8px;height:8px;border-radius:var(--sx-radius-full);background:var(--sx-success);display:inline-block;margin-inline-end:6px;vertical-align:1px}
+.sx-nav-label{font-size:var(--sx-text-xs);font-weight:800;letter-spacing:0.1em;text-transform:uppercase;color:var(--sx-text-3);padding:20px 24px 8px}
+.sx-nav-group:first-child .sx-nav-label{padding-top:12px}
+.header-nav{display:flex;flex-direction:column;gap:2px;padding:0 12px 8px}
+.nav-link{display:flex;align-items:center;gap:12px;width:100%;text-align:start;padding:11px 12px;border-radius:var(--sx-radius-md);border:1px solid transparent;background:transparent;color:var(--sx-text-2);font-size:var(--sx-text-md);font-weight:600;cursor:pointer;position:relative;transition:background-color var(--sx-transition),color var(--sx-transition)}
+.nav-link .nav-icon{color:var(--sx-text-3);transition:color var(--sx-transition)}
+.nav-link:hover{background:var(--sx-surface-2);color:var(--sx-text)}
+.nav-link:hover .nav-icon{color:var(--sx-accent-ink)}
+.nav-link.active{background:var(--sx-accent-soft);color:var(--sx-accent-ink)}
+.nav-link.active .nav-icon{color:var(--sx-accent-ink)}
+.nav-link.active::after{content:"";position:absolute;inset-inline-start:-12px;top:8px;bottom:8px;width:3px;border-radius:var(--sx-radius-full);background:var(--sx-accent-solid)}
+.sx-backdrop{display:none}
+.sx-burger{display:none}
+.sx-shell>.header,.sx-shell>.main,.sx-shell>.footer{margin-inline-start:var(--sx-sidebar-w)}
+.header{min-height:64px;background:var(--sx-bg);border-bottom:1px solid var(--sx-border);display:flex;align-items:center;padding:0 24px;position:sticky;top:0;z-index:101}
+.header-inner{display:flex;align-items:center;justify-content:space-between;width:100%;max-width:1080px;margin-inline:auto;gap:16px;flex-wrap:wrap}
+.header .logo{display:none}
+.header-right{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+#panel-clock{font-weight:600;color:var(--sx-accent-ink);font-size:0.9rem;font-family:var(--sx-font-mono)}
+.main{display:block;width:auto;max-width:1080px;margin-inline-start:var(--sx-sidebar-w);margin-inline-end:auto;min-width:0;padding:var(--sx-space-6) var(--sx-space-4) var(--sx-space-7)}
+.sx-shell>.footer{max-width:1080px;margin-inline-end:auto}
+.page{display:none;scroll-margin-top:84px;min-width:0}
+.page.active{display:block}
+.page-header{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:20px}
+.page-title{font-size:26px;font-weight:800;color:var(--sx-text);letter-spacing:-0.02em;line-height:var(--sx-leading-tight)}
+.page-sub{font-size:var(--sx-text-md);color:var(--sx-text-2);margin-top:4px}
+.stats-row{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,240px),1fr));gap:16px;margin-bottom:20px}
+.stat-card{background:var(--sx-surface);border:1px solid var(--sx-border);border-radius:var(--sx-radius-xl);padding:18px;box-shadow:var(--sx-shadow-sm);min-width:0;position:relative;overflow:hidden;transition:border-color var(--sx-transition),transform 150ms ease-out}
+.stat-card::before{content:"";position:absolute;top:0;inset-inline-start:0;bottom:0;width:3px;background:var(--sx-accent-solid);opacity:0.85}
+.stat-card:hover{border-color:var(--sx-border-strong);transform:translateY(-1px)}
+.stat-label{font-size:var(--sx-text-sm);font-weight:700;color:var(--sx-text-3);text-transform:uppercase;letter-spacing:0.06em;display:flex;align-items:center;gap:8px}
+.stat-card .stat-icon{width:18px;height:18px;color:var(--sx-accent-ink)}
+.stat-val{font-size:1.75rem;font-weight:800;color:var(--sx-text);line-height:1.2;margin-top:8px;font-variant-numeric:tabular-nums;overflow-wrap:break-word}
+.stat-unit{font-size:var(--sx-text-sm);font-weight:600;color:var(--sx-text-3);margin-inline-start:4px}
+.speed-card{background:var(--sx-surface);border:1px solid var(--sx-border);border-radius:var(--sx-radius-xl);padding:18px}
+.speed-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.speed-item .stat-label{margin-bottom:4px}
+.speed-item .stat-val{font-size:1.4rem}
+.status-cards-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,200px),1fr));gap:12px;margin-bottom:20px}
+.status-card{background:var(--sx-surface);border:1px solid var(--sx-border);border-radius:var(--sx-radius-lg);padding:14px 16px;cursor:pointer;transition:border-color var(--sx-transition),background-color var(--sx-transition);min-width:0}
+.status-card:hover{border-color:var(--sx-accent-border)}
+.status-card.active{border-color:var(--sx-success-border);background:var(--sx-success-soft)}
+.status-card.inactive{opacity:0.75}
+.status-card:active{transform:scale(0.98)}
+.status-card .status-icon{color:var(--sx-text-3)}
+.status-card.active .status-icon{color:var(--sx-success-ink)}
+.multi-panel-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,280px),1fr));gap:12px}
+.multi-panel-grid .status-card{cursor:default}
+.multi-panel-grid .status-card>div:first-child{display:flex;align-items:center;gap:8px;font-weight:700}
+.sys-bar{height:10px;background:var(--sx-border);border-radius:var(--sx-radius-full);overflow:hidden}
+.sys-fill{height:100%;background:var(--sx-accent-solid);border-radius:var(--sx-radius-full);transition:width 300ms ease-out}
+.hc-spin{display:inline-block;width:12px;height:12px;border:2px solid var(--sx-border);border-top-color:var(--sx-accent);border-radius:50%;animation:sxSpin 800ms linear infinite;vertical-align:-2px}
+.chart-container{height:280px;width:100%;max-width:100%;position:relative}
+.chart-container canvas{max-width:100%}
+.tbl-wrap{overflow-x:auto;overflow-y:auto;-webkit-overflow-scrolling:touch;border:1px solid var(--sx-border);border-radius:var(--sx-radius-lg);background:var(--sx-surface);max-height:560px}
+.tbl{border-collapse:collapse;min-width:560px;width:100%}
+.tbl th{text-align:center;font-size:0.78rem;font-weight:700;color:var(--sx-text-3);padding:12px 16px;text-transform:uppercase;border-bottom:1px solid var(--sx-border);background:var(--sx-surface-3);letter-spacing:0.08em;position:sticky;top:0;z-index:1}
+.tbl td{padding:12px 16px;border-bottom:1px solid var(--sx-border);color:var(--sx-text);font-size:var(--sx-text-md);vertical-align:middle;overflow-wrap:break-word}
+.tbl tbody tr:hover td{background:var(--sx-row-alt)}
+.tbl tbody tr:nth-child(even) td{background:var(--sx-row-alt)}
+.tbl input[type="checkbox"]{width:20px;height:20px;accent-color:var(--sx-accent-solid);cursor:pointer}
+.time-col{white-space:nowrap;font-family:var(--sx-font-mono);font-size:var(--sx-text-sm)}
+#inbound-table{min-width:640px}
+#inbound-table th,#inbound-table td{text-align:start}
+#inbound-table th:nth-child(8),#inbound-table td:nth-child(8){text-align:center}
+#inbound-table td:nth-child(2),#inbound-table th:nth-child(2),#inbound-table td:nth-child(3),#inbound-table th:nth-child(3){overflow-wrap:anywhere}
+#proxy-lines-table{min-width:640px}
+#logs-table,#login-logs-table{min-width:560px}
+#logs-table th,#logs-tbody td{white-space:normal}
+.scanner-tbl{min-width:480px}
+#doh-ping-table{display:block;overflow-x:auto;-webkit-overflow-scrolling:touch}
+#doh-ping-table table{min-width:560px}
+#login-logs-table th:first-child,#login-logs-table td:first-child{white-space:nowrap}
+#login-logs-table th:nth-child(2),#login-logs-table td:nth-child(2){white-space:nowrap}
+#login-logs-table th:nth-child(3),#login-logs-table td:nth-child(3){white-space:nowrap}
+#login-logs-table th:nth-child(4),#login-logs-table td:nth-child(4){white-space:nowrap}
+#login-logs-table th:nth-child(5),#login-logs-table td:nth-child(5){white-space:nowrap}
+.tbl.scanner-tbl th:first-child,.tbl.scanner-tbl td:first-child{text-align:start}
+.logs-table-container{max-height:480px;overflow-y:auto;overflow-x:auto;-webkit-overflow-scrolling:touch;border:1px solid var(--sx-border);border-radius:var(--sx-radius-lg);background:var(--sx-surface)}
+.logs-table-container .tbl{border:none}
+.addr-list-scroll{max-height:480px;overflow-y:auto;-webkit-overflow-scrolling:touch;border:1px solid var(--sx-border);border-radius:var(--sx-radius-md);padding:14px;background:var(--sx-surface)}
+.addr-list-scroll>div{flex-direction:column !important;align-items:flex-start !important;gap:14px}
+.scan-results-container{max-height:480px;overflow-y:auto;overflow-x:auto;-webkit-overflow-scrolling:touch;border:1px solid var(--sx-border);border-radius:var(--sx-radius-lg);background:var(--sx-surface)}
+.toggle{width:52px;height:30px;border-radius:var(--sx-radius-full);background:var(--sx-surface-3);position:relative;cursor:pointer;transition:background-color var(--sx-transition),border-color var(--sx-transition);border:2px solid var(--sx-border);flex-shrink:0}
+.toggle::after{content:"";position:absolute;width:22px;height:22px;border-radius:50%;background:var(--sx-text-3);top:2px;inset-inline-start:2px;transition:inset-inline-start 150ms ease-out,background-color var(--sx-transition)}
+.toggle.on{background:var(--sx-success);border-color:var(--sx-success)}
+.toggle.on::after{inset-inline-start:calc(52px - 2px - 22px);background:var(--sx-knob-on)}
+.toggle:focus-visible{outline:2px solid var(--sx-focus);outline-offset:2px}
+.adv-toggle{display:inline-flex;align-items:center;gap:8px;padding:8px 12px;border-radius:var(--sx-radius-md);border:1px solid var(--sx-border);background:var(--sx-surface-2);color:var(--sx-text-2);font-size:var(--sx-text-sm);font-weight:600;cursor:pointer}
+.adv-toggle:hover{border-color:var(--sx-accent-border);color:var(--sx-text)}
+.adv-section{border:1px solid var(--sx-border);border-radius:var(--sx-radius-lg);padding:16px;background:var(--sx-surface-2);margin-bottom:14px}
+.act-btn{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;border:1px solid var(--sx-border);background:var(--sx-surface);border-radius:6px;color:var(--sx-text-2);cursor:pointer;transition:background-color var(--sx-transition),color var(--sx-transition),border-color var(--sx-transition)}
+.act-btn:hover{color:var(--sx-text);border-color:var(--sx-accent-border)}
+.act-btn:active{transform:scale(0.95)}
+.act-del{color:var(--sx-danger)}
+.act-del:hover{color:var(--sx-danger);border-color:var(--sx-danger-border);background:var(--sx-danger-soft)}
+.row-act-wrap{display:flex;flex-direction:column;gap:8px}
+.row-act-top{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.row-act-grid{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.row-act-grid .tooltip-container{display:inline-flex;width:32px;height:32px;min-width:32px;min-height:32px}
+.row-act-grid .act-btn{width:32px;height:32px;min-width:32px;min-height:32px;max-width:32px;max-height:32px;padding:0;font-size:0.95rem;line-height:1;justify-content:center;flex-shrink:0;box-sizing:border-box;overflow:hidden;white-space:nowrap}
+.row-act-grid .act-btn-xray{width:auto;max-width:none;padding:0 8px}
+.row-act-grid .act-btn:disabled{opacity:0.4;cursor:not-allowed}
+.row-act-note{font-size:var(--sx-text-sm);color:var(--sx-text-3)}
+.sl-item{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 12px;border:1px solid var(--sx-border);border-radius:var(--sx-radius-md);background:var(--sx-surface-2);margin-bottom:8px}
+.sl-k{font-weight:700;color:var(--sx-text)}
+.sl-v{color:var(--sx-text-2);font-family:var(--sx-font-mono);font-size:var(--sx-text-sm);overflow-wrap:anywhere}
+.pill{display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid var(--sx-border);border-radius:var(--sx-radius-md);background:var(--sx-surface-2);margin-bottom:8px}
+.pill-used{font-weight:700;color:var(--sx-text);white-space:nowrap}
+.pill-bar{flex:1;height:8px;background:var(--sx-border);border-radius:5px;min-width:30px;overflow:hidden}
+.pill-fill{height:100%;background:var(--sx-accent-solid);border-radius:5px;transition:width 300ms ease-out}
+.pill-lim{font-size:var(--sx-text-sm);color:var(--sx-text-3);white-space:nowrap}
+.tooltip-container{position:relative;display:inline-flex}
+.tooltip-text{visibility:hidden;background:var(--sx-surface-3);color:var(--sx-text);text-align:center;border-radius:8px;padding:10px 18px;position:absolute;z-index:100;bottom:140%;left:50%;transform:translateX(-50%);white-space:normal;width:max-content;max-width:min(320px,90vw);border:1px solid var(--sx-border-strong);box-shadow:var(--sx-shadow-lg);opacity:0;transition:opacity var(--sx-transition),transform 150ms ease-out;font-size:0.75rem;pointer-events:none;overflow-wrap:anywhere}
+.tooltip-container:hover .tooltip-text{visibility:visible;opacity:1}
+.qr-box{background:var(--sx-qr);padding:12px;border-radius:var(--sx-radius-lg);display:inline-block}
+.qr-box canvas{display:block;border-radius:8px;max-width:100%;height:auto}
+.bulk-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+.inbound-tools{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+.scan-note{font-size:var(--sx-text-sm);color:var(--sx-text-2);padding:10px 12px;border:1px dashed var(--sx-border-strong);border-radius:var(--sx-radius-md);background:var(--sx-surface-2);margin-bottom:12px}
+.provider-search{width:100%;max-width:320px}
+.scanner-location-filter{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:12px}
+.location-checkbox{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border:1px solid var(--sx-border);border-radius:var(--sx-radius-full);background:var(--sx-surface-2);font-size:var(--sx-text-sm);cursor:pointer}
+.location-checkbox input[type="checkbox"]{width:19px;height:19px;cursor:pointer;accent-color:var(--sx-accent-solid)}
+.railway-hl{background:var(--sx-warning-soft);border:1px solid var(--sx-warning-border);border-radius:var(--sx-radius-md);padding:10px 12px;color:var(--sx-warning-ink)}
+.empty{padding:30px;text-align:center;color:var(--sx-text-3)}
+#login-page{position:relative;z-index:1}
+#dashboard-page{position:relative;z-index:1}
+.mobile-nav{display:none}
+.hamburger{display:none}
+.w3{width:100%}
+.off{opacity:0.55}
+.ok{color:var(--sx-success-ink)}
+.warn{color:var(--sx-warning-ink)}
+.err{color:var(--sx-danger-ink)}
+body[dir="rtl"] .fl,body[dir="rtl"] label{text-align:start}
+body[dir="rtl"] .fi,body[dir="rtl"] select,body[dir="rtl"] input{text-align:start}
+body[dir="rtl"] .fi[dir="auto"],body[dir="rtl"] textarea.fi[dir="auto"],body[dir="rtl"] input[dir="auto"],body[dir="rtl"] textarea[dir="auto"]{text-align:start;direction:ltr}
+body[dir="rtl"] .fl,body[dir="rtl"] .tbl th,body[dir="rtl"] .stat-label,body[dir="rtl"] .tag{text-align:start}
+body[dir="rtl"] .tbl.scanner-tbl th:first-child,body[dir="rtl"] .tbl.scanner-tbl td:first-child{text-align:start}
+body[dir="rtl"] .bulk-actions,body[dir="rtl"] .inbound-tools{justify-content:flex-start}
+body[dir="rtl"] .seg-group{direction:rtl}
+body[dir="rtl"] .row-act-grid{flex-direction:row}
+#addresses-card>div:nth-child(2){flex-wrap:wrap;gap:12px}
+#addresses-card>div:nth-child(2) .btn{flex:1 1 auto;margin-bottom:4px}
+#new-panel-name,#new-panel-url{width:100%}
+#proto-summary .tag{white-space:nowrap}
+.mo-box .fg{flex-wrap:wrap}
+.mo-box input[type="color"]{width:100%;height:44px;padding:4px}
+@media (min-width:1024px){
+.stats-row{gap:16px}
 }
-body.light-mode{
-
-  --bg:#fdfcf8;
-  --surface:#ffffff;
-  --surface-2:#f5f4ef;
-  --surface-3:#edece5;
-  --border:#e3e2db;
-  --border-strong:#cfcec3;
-  --text:#1b1a17;
-  --text-2:#57564e;
-  --text-3:#66655c;
-  --accent:#166534;
-  --accent-hover:#14532d;
-  --accent-ink:#166534;
-  --accent-solid:#15803d;
-  --danger-solid:#b91c1c;
-  --danger-hover:#991b1b;
-  --row-alt:rgba(27,26,23,0.04);
-  --accent-soft:rgba(21,128,61,0.10);
-  --accent-border:rgba(21,128,61,0.35);
-  --on-accent:#ffffff;
-  --success:#166534;
-  --success-soft:#dcfce7;
-  --success-border:#86efac;
-  --warning:#92400e;
-  --warning-soft:#fef3c7;
-  --warning-border:#fcd34d;
-  --danger:#b91c1c;
-  --danger-soft:#fee2e2;
-  --danger-border:#fca5a5;
-  --success-ink:#166534;
-  --warning-ink:#92400e;
-  --danger-ink:#991b1b;
-  --focus:rgba(21,128,61,0.45);
-  --shadow-sm:0 1px 2px rgba(16,24,40,0.06),0 1px 3px rgba(16,24,40,0.10);
-  --shadow-md:0 4px 12px rgba(16,24,40,0.08);
-  --shadow-lg:0 12px 32px rgba(16,24,40,0.12);
-
+@media (max-width:1023px){
+.sx-sidebar{transform:translateX(-105%);transition:transform 200ms ease-out;box-shadow:var(--sx-shadow-lg)}
+[dir="rtl"] .sx-sidebar{transform:translateX(105%)}
+.sx-shell.sx-nav-open .sx-sidebar{transform:translateX(0)}
+.sx-backdrop{display:block;position:fixed;inset:0;background:var(--sx-scrim-soft);z-index:110;opacity:0;pointer-events:none;transition:opacity 200ms ease-out}
+.sx-shell.sx-nav-open .sx-backdrop{opacity:1;pointer-events:auto}
+.sx-burger{display:inline-flex;flex-direction:column;align-items:center;justify-content:center;width:38px;height:38px;border-radius:var(--sx-radius-md);border:1px solid var(--sx-border);background:var(--sx-surface);color:var(--sx-text);cursor:pointer;flex:none}
+.sx-burger span{display:block;width:18px;height:2px;background:currentColor;border-radius:2px;margin:2px 0}
+.sx-shell>.header,.sx-shell>.main,.sx-shell>.footer{margin-inline-start:0}
+.header .logo{display:inline-flex}
+.main{margin-inline-start:0;padding:20px 16px 28px}
+.header{padding:0 16px}
+.header-inner{flex-wrap:wrap;gap:10px}
+#inbound-table{min-width:0}
+.stats-row{grid-template-columns:repeat(auto-fill,minmax(min(100%,240px),1fr));gap:16px}
 }
-body.blue-dark{
-
-  --bg:#0b1120;
-  --surface:#182238;
-  --surface-2:#1f2c47;
-  --surface-3:#2b3a5c;
-  --border:#2b3a4f;
-  --border-strong:#475569;
-  --text:#e2e8f0;
-  --text-2:#a5b4c7;
-  --text-3:#9fb0c3;
-  --accent:#3b82f6;
-  --accent-hover:#2563eb;
-  --accent-ink:#93c5fd;
-  --accent-solid:#2563eb;
-  --danger-solid:#dc2626;
-  --danger-hover:#b91c1c;
-  --row-alt:rgba(255,255,255,0.03);
-  --accent-soft:rgba(59,130,246,0.12);
-  --accent-border:rgba(59,130,246,0.35);
-  --danger:#fca5a5;
-  --on-accent:#ffffff;
-  --focus:rgba(59,130,246,0.55);
-
+@media (max-width:768px){
+#inbound-table thead{display:none}
+#inbound-table tr{display:block;margin-bottom:16px;border:1px solid var(--sx-border-strong);border-radius:var(--sx-radius-lg);padding:16px;background:var(--sx-surface);box-shadow:var(--sx-shadow-md)}
+#inbound-table td{display:flex;align-items:center;justify-content:space-between;padding:12px 0;border-bottom:1px solid var(--sx-border);font-size:0.85rem}
+#inbound-table td:last-child{border-bottom:none}
+#inbound-table td::before{content:attr(data-label);font-weight:700;color:var(--sx-text-3);margin-inline-end:16px;white-space:nowrap}
+#inbound-table td:first-child{display:flex !important;align-items:center;justify-content:flex-start;padding:10px 0;border-bottom:none}
+#inbound-table td:first-child::before{content:"Select";font-weight:700;color:var(--sx-text-3);margin-inline-end:16px}
+#inbound-table td:first-child input[type="checkbox"]{width:22px;height:22px;margin-inline-end:14px}
+#login-logs-table{display:block;overflow-x:auto;-webkit-overflow-scrolling:touch;white-space:nowrap;min-width:650px}
+#login-logs-table thead,#login-logs-table tbody,#login-logs-table tr,#login-logs-table th,#login-logs-table td{white-space:nowrap}
+#login-logs-table td{word-break:normal;overflow-wrap:normal}
 }
-body.light-mode ::selection{ background:var(--accent-solid); color:var(--on-accent); }
-.icon{display: inline-block; width: 1.2em; height: 1.2em; background-color: currentColor; mask-size: contain; mask-repeat: no-repeat; mask-position: center; -webkit-mask-size: contain; -webkit-mask-repeat: no-repeat; -webkit-mask-position: center; vertical-align: middle;}
-.nav-link .nav-icon, .btn-icon .icon, .stat-card .stat-icon, .status-card .status-icon, .header-right .btn-icon .icon{display: inline-block; width: 1.2em; height: 1.2em; background-color: currentColor; mask-size: contain; mask-repeat: no-repeat; mask-position: center; -webkit-mask-size: contain; -webkit-mask-repeat: no-repeat; -webkit-mask-position: center; vertical-align: middle;}
+@media (max-width:500px){
+.stats-row{grid-template-columns:repeat(auto-fill,minmax(min(100%,240px),1fr))}
+.seg-group{flex-direction:column;width:100%}
+.seg-btn{width:100%}
+.page-title{font-size:20px}
+.header-right{gap:4px}
+.btn-icon{padding:6px;font-size:0.95rem}
+.lang-btn{padding:5px 8px;font-size:0.68rem}
+.btn{padding:8px 14px}
+.btn-primary{padding:10px 16px}
+.mo-box{padding:24px 16px;max-width:min(560px,calc(100vw - 32px));border-radius:var(--sx-radius-xl)}
+.toast{padding:14px 20px;font-size:0.85rem;bottom:20px}
+}
+@media (max-width:480px){
+.stat-card{padding:16px}
+.stat-val{font-size:1.5rem}
+#panel-clock{display:none}
+.card{padding:16px 14px}
+.mo-box{max-height:88vh}
+}
 .icon-dashboard{mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Cpath d='M3 9l9-7 9 7v11a2 2 0 01-2 2H5a2 2 0 01-2-2z'/%3E%3Cpolyline points='9 22 9 12 15 12 15 22'/%3E%3C/svg%3E");}
 .icon-inbounds{mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Crect x='3' y='3' width='18' height='18' rx='2'/%3E%3Cline x1='12' y1='8' x2='12' y2='16'/%3E%3C/svg%3E");}
 .icon-cleanip{mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Cpath d='M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71'/%3E%3Cpath d='M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71'/%3E%3C/svg%3E");}
@@ -17939,360 +18054,9 @@ body.light-mode ::selection{ background:var(--accent-solid); color:var(--on-acce
 .icon-stealth{mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Cpath d='M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z'/%3E%3C/svg%3E");}
 .icon-github{mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='currentColor'%3E%3Cpath d='M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z'/%3E%3C/svg%3E");}
 .icon-telegram-link{mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='currentColor'%3E%3Cpath d='M11.944 0A12 12 0 000 12a12 12 0 0012 12 12 12 0 0012-12A12 12 0 0012 0a12 12 0 00-.056 0zm4.962 7.224c.1-.002.321.023.465.14a.506.506 0 01.171.325c.016.093.036.306.02.472-.18 1.898-.962 6.502-1.36 8.627-.168.9-.499 1.201-.82 1.23-.696.065-1.225-.46-1.9-.902-1.056-.693-1.653-1.124-2.678-1.8-1.185-.78-.417-1.21.258-1.91.177-.184 3.247-2.977 3.307-3.23.007-.032.014-.15-.056-.212s-.174-.041-.249-.024c-.106.024-1.793 1.14-5.061 3.345-.48.33-.913.49-1.302.48-.428-.008-1.252-.241-1.865-.44-.752-.245-1.349-.374-1.297-.789.027-.216.325-.437.893-.663 3.498-1.524 5.83-2.529 6.998-3.014 3.332-1.386 4.025-1.627 4.476-1.635z'/%3E%3C/svg%3E");}
-html, body{height: 100%; }
-body{font-family:var(--font-sans); color: var(--text); display: flex; flex-direction: column; background: var(--bg); transition:background-color 120ms ease-out,color 120ms ease-out; position: relative; line-height:1.55; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; -webkit-tap-highlight-color: transparent;}
-.header, .main, .footer, .mo, .toast, #login-page, #dashboard-page{position: relative; z-index: 1;}
-body[dir="rtl"]{direction: rtl; text-align: right;}
-body[dir="rtl"] .fl,
-body[dir="rtl"] label{float: right !important; text-align: right !important; margin-bottom: 6px;}
-body[dir="rtl"] .fi,
-body[dir="rtl"] select,
-body[dir="rtl"] input{direction: ltr !important; text-align: left !important;}
-body[dir="rtl"] .seg-group{direction: rtl !important;}
-a{text-decoration: none; color: inherit;}
-::-webkit-scrollbar{width: 6px; height: 6px;}
-::-webkit-scrollbar-track{background: var(--surface); border-radius: 10px;}
-::-webkit-scrollbar-thumb{background: var(--border-strong); border-radius: 10px; transition:background-color 120ms ease-out;}
-::-webkit-scrollbar-thumb:hover{background: var(--accent-soft);}
-*{scrollbar-width: thin; scrollbar-color: var(--border-strong) var(--surface);}
-::selection{background: var(--accent-solid); color:var(--on-accent);}
-.header{min-height:56px; background:var(--surface); border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: center; padding:0 16px; position: sticky; top: 0; z-index: 101; }
-.header-inner{display: flex; align-items: center; justify-content: space-between; width: 100%; max-width: 1200px; flex-wrap:wrap; gap: 16px;}
-.logo{display:inline-flex;align-items:center;gap:8px;font-family:var(--font-sans);font-size:20px;font-weight:700;color:var(--text);letter-spacing:-0.02em;flex-shrink:0;}
-.logo::before{content:'';width:20px;height:20px;background:var(--accent);border-radius:6px;flex:none;}
-.version-tag{font-family:var(--font-mono);font-size:11px;font-weight:600;background:var(--surface-2);border:1px solid var(--border);color:var(--text-2);border-radius:var(--radius-full);padding:2px 8px;}
-.header-nav{display:flex;flex-wrap:wrap;gap:8px; align-items: center; gap: 8px;}
-.nav-link{display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 10px 20px; border-radius: var(--radius-sm); color: var(--text-3); font-size: 0.88rem; font-weight: 600; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out; border: 1px solid transparent; background: none; cursor: pointer; font-family: inherit; position: relative; overflow: hidden;}
-.nav-link::after{content: ''; position: absolute; bottom: 0; left: 50%; width: 0; height: 2px; background: var(--accent); transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out, width 150ms ease-out; transform: translateX(-50%);}
-.nav-link:hover{color: var(--accent-ink); background: var(--accent-soft); border-color: transparent;}
-.nav-link:hover::after{width: 75%;}
-.nav-link.active{color:var(--accent-ink); background:var(--accent-soft); border-color:var(--accent);}
-.nav-link.active::after{width: 95%;}
-.header-right{display: flex; align-items: center; gap: 10px; flex-wrap: nowrap;}
-.btn-icon{background: var(--surface-3); border: 1px solid var(--border); color: var(--text-3); border-radius: var(--radius-sm); padding: 10px; cursor: pointer; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out, transform 150ms ease-out; font-size: 1.1rem; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0;}
-.btn-icon:hover{color: var(--accent-ink); border-color: var(--accent); background: var(--accent-soft); transform: translateY(-2px);}
-.lang-switch{display: flex; gap: 2px; background: var(--surface-3); border-radius: var(--radius-sm); padding: 3px;}
-.lang-btn{padding: 6px 14px; border: none; background: transparent; color: var(--text-3); font-size: 0.8rem; font-weight: 700; border-radius: 8px; cursor: pointer; font-family: inherit; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out;}
-.lang-btn.active{background: var(--accent-solid); color:var(--on-accent);}
-.hamburger{display: none; background: transparent; border: 1px solid var(--border); color: var(--text-3); font-size: 1.9rem; cursor: pointer; padding: 4px 12px; border-radius: var(--radius-sm);}
-.main{flex: 1; min-height: calc(100vh - 56px - 52px); padding:var(--space-6) var(--space-4); overflow-y: auto; overflow-x: hidden;}
-.page{display: none;}
-.page.active{display: block;}
-.page-header{margin-bottom: var(--space-7); display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: var(--space-4);}
-.page-title{font-size:var(--text-xl); font-weight:600; color:var(--text); letter-spacing:-0.02em; line-height:var(--leading-tight);}
-.page-title[data-fa]{font-family: 'Vazirmatn';}
-.page-sub{font-size: 1rem; color: var(--text-3); margin-top: 6px;}
-.stats-row{display: grid; grid-template-columns:repeat(auto-fill,minmax(min(100%,240px),1fr)); gap:var(--space-4); margin-bottom: var(--space-7);}
-.stat-card{background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-md); padding:var(--space-4); position: relative; overflow: hidden; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out; cursor: default; container-type: inline-size;}
-.stat-card:hover{border-color: var(--border-strong); }
-.stat-label{font-size: 0.75rem; color: var(--text-3); font-weight: 700; text-transform: uppercase; letter-spacing: 0.14em; margin-bottom: 14px;}
-.stat-val{font-size: 2.2rem; font-weight: 800; color: var(--text); transition:color 120ms ease-out;}
-.stat-card:hover .stat-val{color: var(--accent-ink);}
-.stat-unit{font-size: 1rem; font-weight: 400; color: var(--text-3);}
-@container (max-width: 200px) {
-.stat-val{font-size: 1.4rem;}
-}
-.speed-card{background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-md); padding: var(--space-6); display: flex; flex-direction: column; gap: var(--space-4); transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out;}
-.speed-card:hover{border-color: var(--border-strong); box-shadow: var(--shadow-sm), var(--shadow-sm);}
-.speed-row{display: flex; flex-direction: column; gap: 14px;}
-.speed-item{display: flex; justify-content: space-between; align-items: center;}
-.speed-item .stat-label{margin-bottom: 0; font-size: 0.8rem;}
-.speed-item .stat-val{font-size: 1.4rem;}
-.card{background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-md); padding:var(--space-4); margin-bottom: var(--space-5); transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out;}
-.card:hover{border-color: var(--border-strong);}
-.card-hd{display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--space-5);}
-.card-title{font-size: 1.15rem; font-weight: 600; color: var(--text);}
-.chart-container{height: 280px; width: 100%;}
-.btn{font-family: inherit; font-size:var(--text-md); font-weight:600; border-radius:6px; padding:8px 14px; min-height:var(--control-h); cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: 10px; border: none; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out, transform 150ms ease-out; position: relative; overflow: hidden; letter-spacing: 0.01em;}
-.btn:active{transform: scale(0.97);}
-.btn-primary{background:var(--accent-solid); color:var(--on-accent); box-shadow:var(--shadow-sm);}
-.btn-primary:hover{background:var(--accent-hover);}
-.btn-primary:active{transform: translateY(0) scale(0.97);}
-.btn-outline{background:var(--surface); color: var(--text); border:1px solid var(--border-strong);}
-.btn-outline:hover{background: var(--accent-soft); border-color: var(--accent); color: var(--accent-ink);}
-.btn-danger{background:var(--danger-solid); color:#fff; border: 1px solid rgba(248,113,113,0.3);}
-.btn-danger:hover{background:var(--danger-hover);}
-.btn-sm{padding: 6px 18px; font-size: 0.78rem; min-height:var(--control-h-sm);}
-.tbl-wrap{overflow-x: auto; border-radius: var(--radius-sm);}
-.tbl{width: 100%; border-collapse: collapse; table-layout: auto; background: transparent;}
-.tbl th{text-align: center; font-size: 0.78rem; font-weight: 700; color: var(--text-3); padding:12px 16px; text-transform: uppercase; border-bottom: 1px solid var(--border); background: var(--surface-3); letter-spacing: 0.08em; position: sticky; top: 0; z-index: 1;}
-.tbl td{padding:12px 16px; border-bottom: 1px solid var(--border); font-size: 0.9rem; word-break: normal; overflow-wrap: break-word; font-weight: 400; background: none; color: var(--text); transition:background-color 120ms ease-out, color 120ms ease-out; vertical-align: middle; text-align: center;}
-.tbl tbody tr:hover td{background: var(--accent-soft);}
-.tbl tbody tr:nth-child(even) td{background: var(--row-alt);}
-#inbound-table th, #inbound-table td{text-align: center !important;}
-#inbound-table td:first-child, #inbound-table th:first-child{width: 50px;}
-#inbound-table th:nth-child(8), #inbound-table td:nth-child(8){min-width:0;}
-.tbl input[type="checkbox"]{width: 20px; height: 20px; accent-color: var(--accent); cursor: pointer;}
-.time-col{white-space: nowrap;  text-align: center;}
-#login-logs-table{table-layout: fixed; width: 100%; border-collapse: collapse;}
-#login-logs-table th,
-#login-logs-table td{text-align: center; vertical-align: middle; word-break: break-word; overflow-wrap: break-word;}
-#login-logs-table th:first-child,
-#login-logs-table td:first-child{width: 15%;}
-#login-logs-table th:nth-child(2),
-#login-logs-table td:nth-child(2){width: 30%; text-align: start; padding-inline-start: 12px; padding-inline-end: 8px;}
-#login-logs-table th:nth-child(3),
-#login-logs-table td:nth-child(3){width: 15%;}
-#login-logs-table th:nth-child(4),
-#login-logs-table td:nth-child(4){width: 20%;}
-#login-logs-table th:nth-child(5),
-#login-logs-table td:nth-child(5){width: 20%;}
-#logs-table th, #logs-tbody td{text-align: center !important; vertical-align: middle !important;}
-.tbl.scanner-tbl th:first-child,
-.tbl.scanner-tbl td:first-child{width: auto; text-align: left;}
-.tag{display: inline-flex; align-items: center; padding: 5px 14px; border-radius: 10px; font-size: 0.68rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.06em;}
-.tag-vless{background: var(--accent-soft); color: var(--accent-ink); border: 1px solid var(--border);}
-.tag-on{background:var(--success-soft);color:var(--success);border:1px solid var(--success-border);}
-.tag-off{background:var(--danger-soft);color:var(--danger);border:1px solid var(--danger-border);}
-.pill{display: flex; align-items: center; gap: 12px; font-size: 0.9rem;}
-.pill-used{color: var(--text); font-weight: 600;}
-.pill-bar{flex: 1; height: 8px; background: var(--border); border-radius: 5px; min-width: 30px; overflow: hidden;}
-.pill-fill{height: 100%; border-radius: 5px; transition:width 150ms ease-out;}
-.pill-lim{color: var(--text-3); font-size: 0.78rem;}
-.toggle{width: 52px; height: 30px; border-radius: 15px; background: var(--surface-3); position: relative; cursor: pointer; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out; border: 2px solid var(--border); flex-shrink: 0;}
-.toggle::after{content: ''; position: absolute; width: 24px; height: 24px; border-radius: 50%; background: var(--text-3); top: 1px; inset-inline-start: 2px; transition:transform 150ms ease-out, background-color 120ms ease-out;}
-.toggle.on{background: var(--success); border-color: var(--success);}
-.toggle.on::after{transform:translateX(22px); background: var(--knob-on);}
-[dir="rtl"] .toggle.on::after{transform:translateX(-22px);}
-.toggle:focus-visible{outline:2px solid var(--focus); outline-offset:2px;}
-.sys-bar{height: 10px; background: var(--border); border-radius: 6px; overflow: hidden;}
-.hc-spin{display:inline-block; width: 12px; height:12px; border:2px solid var(--border); border-top-color:var(--accent); border-radius:50%; animation:hc-rot 800ms linear infinite; vertical-align:-2px;}
-@keyframes hc-rot { to { transform:rotate(360deg); } }
-.sys-fill{height: 100%; border-radius: 6px; transition:width 150ms ease-out;}
-.sl-item{display: flex; align-items: center; justify-content: space-between; padding: 16px 0; border-bottom: 1px solid var(--border);}
-.sl-k{color: var(--text-3); font-size: 0.98rem;}
-.sl-v{color: var(--text); font-weight: 600; font-size: 0.98rem;}
-.fg{display: flex; flex-direction: column; gap: var(--space-2); margin-bottom: var(--space-6);}
-.fl{font-size:var(--text-xs); font-weight:600; color:var(--text-2); text-transform: uppercase; letter-spacing: 0.07em; line-height:var(--leading-normal);}
-.fi, .fs{padding: 12px 14px; min-height:var(--control-h); border-radius: var(--radius-sm); border: 1px solid var(--border); font-family: inherit; font-size: var(--text-md); outline: none; color: var(--text); background: var(--surface); transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out, box-shadow 120ms ease-out; width: 100%;}
-.fi:focus, .fs:focus{border-color: var(--accent); box-shadow:0 0 0 3px var(--focus);}
-.act-btn{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;border:1px solid var(--border);background:var(--surface);border-radius:6px;color:var(--text-2);cursor:pointer;transition:background-color 120ms ease-out,color 120ms ease-out,border-color 120ms ease-out;}
-.act-btn:active{}
-.btn:focus-visible,.btn-icon:focus-visible,.act-btn:focus-visible,.nav-link:focus-visible,.pill-btn:focus-visible,.chip:focus-visible,.seg-btn:focus-visible,.lang-btn:focus-visible,.mo-close:focus-visible{outline:2px solid var(--focus); outline-offset:2px;}
-.act-del{color:var(--danger);border-color:var(--danger-border);}
-.act-del:hover{background:var(--danger-soft);color:var(--danger);}
-.row-act-wrap{display: flex; flex-direction: column; align-items: flex-start; gap: 8px; min-width: 0; width: 100%; direction: ltr;}
-.row-act-top{display: flex; align-items: center; min-width: 0;}
-.row-act-grid{display: grid; grid-template-columns: repeat(5, 32px); grid-auto-rows: 32px; gap: 6px; justify-content: start; min-width: 0; max-width: 100%; direction: ltr;}
-.row-act-grid .tooltip-container{display: inline-flex; width: 32px; height: 32px; min-width: 32px; min-height: 32px;}
-.row-act-grid .act-btn{width: 32px; height: 32px; min-width: 32px; min-height: 32px; max-width: 32px; max-height: 32px; padding: 0; font-size: 0.95rem; line-height: 1; justify-content: center; flex-shrink: 0; box-sizing: border-box; overflow: hidden; white-space: nowrap;}
-.row-act-grid .act-btn-xray{font-size: 0.85rem; font-weight: 800;}
-body[dir="rtl"] .row-act-grid{direction: ltr;}
-.row-act-grid .act-btn:disabled{opacity: .45; cursor: not-allowed;}
-.row-act-note{color: var(--danger); font-size: 0.8rem; max-width: 220px; text-align: left;}
-.toast{position: fixed; bottom: 40px; left: 50%; transform: translateX(-50%) translateY(20px); background:var(--surface-3); color:var(--text); border:1px solid var(--border-strong); border-radius:8px; padding: 18px 40px; font-size: 1rem; font-weight: 600; opacity: 0; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out; z-index: 999; box-shadow:var(--shadow-md); pointer-events: none; max-width: 90vw; text-align: center;}
-.toast.show{opacity: 1; transform: translateX(-50%) translateY(0); pointer-events: auto;}
-.mo{position: fixed; inset: 0; background:rgba(0,0,0,0.55); z-index: 200; display: none; align-items: flex-start; justify-content: center; animation:fadeIn 150ms ease; padding: 20px 12px; overflow-y: auto; box-sizing: border-box;}
-.mo.show{display: flex;}
-@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
-.mo-box{background: var(--surface-2); border: 1px solid var(--border-strong); border-radius:var(--radius-xl); padding: 42px; width:min(560px,calc(100vw - 32px)); min-width:min(560px,calc(100vw - 32px)); max-width:min(560px,calc(100vw - 32px)); max-height: 90vh; overflow-y: auto; overflow-x: hidden; margin: auto; box-shadow: 0 32px 80px rgba(0,0,0,0.7); position: relative; animation:scaleIn 150ms ease;}
-@keyframes scaleIn { from { transform: scale(0.95); opacity: 0; } to { transform: scale(1); opacity: 1; } }
-.mo-title{font-size: 1.6rem; font-weight: 700; margin-bottom: 28px; color: var(--accent-ink);}
-.mo-close{position: absolute; top: 20px; inset-inline-end: 20px; background: var(--surface-3); border: 1px solid var(--border); color: var(--text-3); width: 40px; height: 40px; border-radius: var(--radius-sm); cursor: pointer; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out; display: flex; align-items: center; justify-content: center; font-size: 1.4rem;}
-.mo-close:hover{color: var(--danger); border-color: var(--danger);}
-.qr-box{text-align: center; padding: 30px; background: var(--surface-3); border-radius: var(--radius-md); border: 1px solid var(--border); margin-top: 18px;}
-.qr-box canvas{display:block;max-width:100%;height:auto;}
-.footer{ display: flex; align-items: center; justify-content: center; font-size: 0.85rem; color: var(--text-3); border-top: 1px solid var(--border); background:var(--surface); margin-top: auto;}
-.footer-inner{display: flex; align-items: center; justify-content: center; gap: 36px; flex-wrap: wrap;}
-.footer-inner a{color: var(--accent-ink); text-decoration: none; font-weight: 600; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out;}
-.footer-inner a:hover{}
-textarea.fi{resize: vertical; min-height: 130px; white-space: pre-wrap; overflow-wrap: break-word; word-break: break-word;}
-.chip{padding: 9px 20px; border-radius: 14px; font-size: 0.82rem; font-weight: 700; color: var(--text-3); cursor: pointer; border: none; background: none; font-family: inherit; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out;}
-.chip:hover{color: var(--accent-ink); background: var(--accent-soft);}
-.chip.active{background:var(--accent-soft); color:var(--accent-ink);}
-.chip:active{transform: scale(0.95);}
-.pill-group{display: flex; flex-wrap: wrap; gap: 14px;}
-.pill-btn{padding: 12px 22px; border-radius: 28px; border: 1px solid var(--border); background: var(--surface-3); color: var(--text-3); cursor: pointer; font-size: 0.86rem; font-weight: 600; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out; font-family: inherit;}
-.pill-btn:hover{border-color: var(--accent); color: var(--accent-ink);}
-.pill-btn.active{background:var(--accent-soft); color:var(--accent-ink); border-color:var(--accent);}
-.pill-btn:active{transform: scale(0.97);}
-.adv-toggle{cursor: pointer; color: var(--accent-ink); font-weight: 600; margin-bottom: 20px; display: inline-flex; align-items: center; gap: 10px; border: none; background: none; font-size: 0.98rem; font-family: inherit; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out;}
-.adv-toggle:hover{opacity: 0.85;}
-.adv-section{display: none; padding: 20px; background: var(--surface); border-radius: var(--radius-sm); border: 1px solid var(--border); margin-top: 14px;}
-.addr-list-scroll{max-height:480px; overflow-y: auto; -webkit-overflow-scrolling: touch; border: 1px solid var(--border); border-radius: var(--radius-md); padding: 14px; background: var(--surface);}
-.logs-table-container{max-height:480px; overflow-y: auto; -webkit-overflow-scrolling: touch;}
-.scan-results-container{max-height:480px; overflow-y: auto; overflow-x: auto; -webkit-overflow-scrolling: touch;}
-#doh-ping-table{display: block; overflow-x: auto; -webkit-overflow-scrolling: touch;}
-.mobile-nav{display: none; position: fixed; bottom: 0; left: 0; right: 0; background: var(--surface); border-top: 1px solid var(--border); z-index: 9999; padding: 12px 0 env(safe-area-inset-bottom, 0);}
-.mobile-nav .nav-items{display: flex; justify-content: space-around; align-items: center; width: 100%;}
-.mobile-nav .nav-item{flex: 1; display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 10px 4px; color: var(--text-3); font-size: 0.72rem; cursor: pointer; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out; border-radius: var(--radius-sm);}
-.mobile-nav .nav-item.active{color: var(--accent-ink); background: var(--accent-soft);}
-.seg-group{display: flex; flex-wrap: wrap; gap: 8px; background:var(--surface-2); border: 1px solid var(--border); padding: 6px; border-radius:6px;}
-.seg-btn{flex: 1; min-width: 90px; background:var(--surface-2); border: none; color: var(--text-3); padding: 14px 20px; border-radius:6px; cursor: pointer; font-weight: 600; font-family: inherit; font-size: 0.86rem; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out;}
-.seg-btn.active{background:var(--surface);border:1px solid var(--border);color:var(--text);}
-.seg-btn:hover:not(.active){background: var(--surface-2); color: var(--text);}
-.seg-btn:active{transform: scale(0.97);}
-.status-cards-grid{display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; margin-top: 18px;}
-#page-settings .status-cards-grid{justify-items: stretch;}
-.status-card{padding: 26px 22px; border-radius:12px; text-align: center; cursor: pointer; font-weight: 700; transition:background-color 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out; user-select: none; display: flex; flex-direction: column; align-items: center; gap: 16px; font-size: 0.9rem; max-width: 100%; background:var(--surface); border:1px solid var(--border); color: var(--text-3);}
-.status-card.active{border-color:var(--accent-border);background:var(--accent-soft);}
-.status-card.inactive{border-color:var(--border);background:var(--surface);}
-.status-card:active{transform: scale(0.97);}
-.railway-hl{background: rgba(168,85,247,0.2) !important; color: var(--accent-ink) !important; border: 1px solid var(--accent) !important; font-weight: 800;}
-.tooltip-container{position: relative; display: inline-flex;}
-.tooltip-text{visibility: hidden; background:var(--surface-3); color:var(--text); text-align: center; border-radius: 12px; padding: 10px 18px; position: absolute; z-index: 100; bottom: 140%; left: 50%; transform: translateX(-50%); white-space: nowrap; width: max-content; max-width: min(320px, 90vw); border: 1px solid rgba(255,255,255,0.2); box-shadow: 0 14px 40px rgba(0,0,0,0.6); opacity: 0; transition:opacity 120ms ease-out, transform 150ms ease-out; font-size: 0.75rem; pointer-events: none;border:1px solid var(--border-strong);border-radius:8px;}
-.tooltip-container:hover .tooltip-text{visibility: visible; opacity: 1; transform: translateX(-50%) translateY(-8px);}
-.num{direction:ltr; unicode-bidi:isolate; white-space:nowrap;}
-bdi{unicode-bidi:isolate;}
-#inbound-table td:nth-child(2),#inbound-table th:nth-child(2),#inbound-table td:nth-child(3),#inbound-table th:nth-child(3){text-align:start !important;}
-body[dir="rtl"] .fl,body[dir="rtl"] .tbl th,body[dir="rtl"] .stat-label,body[dir="rtl"] .tag{text-transform:none; letter-spacing:normal;}
-body[dir="rtl"] .tbl.scanner-tbl th:first-child,body[dir="rtl"] .tbl.scanner-tbl td:first-child{text-align:left; direction:ltr; unicode-bidi:isolate;}
-body[dir="rtl"] .fi[dir="auto"],body[dir="rtl"] textarea.fi[dir="auto"],body[dir="rtl"] input[dir="auto"],body[dir="rtl"] textarea[dir="auto"]{direction:rtl !important; text-align:end;}
-body[dir="rtl"] .bulk-actions,body[dir="rtl"] .inbound-tools{direction:rtl;}
-.bulk-actions{flex-wrap:wrap;}
-.header-nav{flex-wrap:wrap;  scrollbar-width:thin;}
-.nav-link{white-space:nowrap; flex-shrink:0;}
-.nav-link span{white-space:nowrap;}
-.mobile-nav .nav-item span{white-space:nowrap;}
-.scan-note{display:none; background:var(--warning-soft); border:1px solid var(--warning-border); color:var(--text); padding:10px 14px; border-radius:10px; margin-top:10px; font-size:0.85rem; line-height:1.5;}
-.provider-search{width:100%; margin-bottom:8px;}
-.multi-panel-grid{display: flex; flex-wrap: wrap; gap: 20px;}
-.multi-panel-grid .status-card{max-width: 400px; flex: 1 1 340px; text-align: start; align-items: flex-start; gap: 16px; flex-direction: column;}
-.multi-panel-grid .status-card > div:first-child{width: 100%; display: flex; flex-direction: column; gap: 16px;}
-.scanner-location-filter{margin: 18px 0; display: flex; flex-wrap: wrap; gap: 16px; align-items: center;}
-.scanner-location-filter input{flex: 1; padding: 14px 20px; border-radius: 12px; border: 1px solid var(--border); background: var(--surface); color: var(--text);}
-.location-checkbox{display: inline-flex; align-items: center; gap: 6px; font-size: 0.82rem; color: var(--text-2); cursor: pointer;}
-.location-checkbox input[type="checkbox"]{width: 19px; height: 19px; cursor: pointer;}
-@media (min-width: 1024px) {
-.header-inner{flex-wrap:wrap;}
-.main{padding:var(--space-6) var(--space-4);}
-.card{max-width: 100%;}
-.status-cards-grid{grid-template-columns: repeat(2, 1fr);}
-.status-card{max-width: 100%;}
-.btn{width: auto;}
-}
-@media (max-width: 1023px) {
-.header{min-height:56px; padding:0 16px;}
-.header-inner{flex-wrap: wrap; gap: 10px;}
-.header .header-nav{display: none;}
-.mobile-nav{display: block;}
-.main{padding:var(--space-6) var(--space-4);}
-.footer{display: none;}
-.logo{display:inline-flex;align-items:center;gap:8px;font-family:var(--font-sans);font-size:20px;font-weight:700;color:var(--text);letter-spacing:-0.02em;flex-shrink:0;}
-.version-tag{font-family:var(--font-mono);font-size:11px;font-weight:600;background:var(--surface-2);border:1px solid var(--border);color:var(--text-2);border-radius:var(--radius-full);padding:2px 8px;}
-.header-right{gap: 6px; flex-wrap: wrap; justify-content: flex-end;}
-.btn-icon{padding: 8px; font-size: 1.1rem;}
-.lang-switch{flex-direction: row;}
-.lang-btn{padding: 6px 12px; font-size: 0.72rem;}
-.seg-btn{min-width: 70px; padding: 10px; font-size: 0.78rem;}
-.btn{font-size:14px; padding:8px 14px;}
-.btn-primary{padding: 12px 20px;}
-.stats-row{grid-template-columns:repeat(auto-fill,minmax(min(100%,240px),1fr)); gap:16px;}
-.stat-card{padding:16px;}
-.stat-label{font-size: 0.7rem;}
-.stat-val{font-size: 1.6rem;}
-.tbl th, .tbl td{padding: 14px 10px; font-size: 0.8rem;}
-.mo-box{padding: 28px 20px; max-width:min(560px,calc(100vw - 32px)); max-height: 85vh; border-radius:var(--radius-xl);}
-.mo-close{top: 12px; inset-inline-end: 12px; width: 36px; height: 36px; font-size: 1.2rem;}
-.mobile-nav .nav-item{font-size: 0.68rem; padding: 8px 2px;}
-.pill-btn{font-size: 0.78rem; padding: 10px 16px;}
-.fi, .fs{max-width: 100%;}
-#srch{max-width: 160px;}
-.multi-panel-grid .status-card{max-width: 100% !important; flex: 1 1 100% !important; padding: 20px;}
-.multi-panel-grid .status-card > div:first-child{display: flex; flex-direction: column; gap: 14px; width: 100%;}
-#new-panel-name, #new-panel-url{width: 100%; padding: 14px; font-size: 1rem; box-sizing: border-box;}
-#new-panel-url + .btn{width: 100%; margin-top: 6px;}
-.status-card{max-width: 100%; padding: 18px; font-size: 0.82rem;}
-.status-cards-grid{grid-template-columns: repeat(2, 1fr) !important;}
-#inbound-table thead{display: none;}
-#inbound-table tr{display: block; margin-bottom: 20px; border: 1px solid var(--border-strong); border-radius: var(--radius-md); padding: 20px; background: var(--surface); box-shadow: var(--shadow-md);}
-#inbound-table td{display: flex; align-items: center; justify-content: space-between; padding: 14px 0; border-bottom: 1px solid var(--border); font-size: 0.85rem;}
-#inbound-table td:last-child{border-bottom: none;}
-#inbound-table td::before{content: attr(data-label); font-weight: 700; color: var(--text-3); margin-inline-end: 16px; white-space: nowrap;}
-#inbound-table td:first-child{display: flex !important; align-items: center; justify-content: flex-start; padding: 10px 0; border-bottom: none;}
-#inbound-table td:first-child::before{content: "Select"; font-weight: 700; color: var(--text-3); margin-inline-end: 16px;}
-#inbound-table td:first-child input[type="checkbox"]{width: 22px; height: 22px; margin-inline-end: 14px;}
-.addr-list-scroll > div{flex-direction: column !important; align-items: flex-start !important; gap: 14px;}
-#addresses-card > div:nth-child(2){flex-wrap: wrap; gap: 12px;}
-#addresses-card > div:nth-child(2) .btn{flex: 1 1 auto; margin-bottom: 4px;}
-#login-logs-table{display: block; overflow-x: auto; -webkit-overflow-scrolling: touch; white-space: nowrap; min-width: 650px;}
-#login-logs-table thead,
-  #login-logs-table tbody,
-  #login-logs-table tr,
-  #login-logs-table th,
-  #login-logs-table td{white-space: nowrap;}
-#login-logs-table td{word-break: normal; overflow-wrap: normal;}
-#doh-ping-table{display: block; overflow-x: auto; -webkit-overflow-scrolling: touch;}
-#doh-ping-table table{min-width: 560px;}
-}
-@media (max-width: 500px) {
-.stats-row{grid-template-columns:repeat(auto-fill,minmax(min(100%,240px),1fr));}
-.seg-group{flex-direction: column;}
-.seg-btn{width: 100%;}
-.page-title{font-size:20px;}
-.header-right{gap: 4px;}
-.btn-icon{padding: 6px; font-size: 0.95rem;}
-.lang-btn{padding: 5px 8px; font-size: 0.68rem;}
-.btn{padding:8px 14px;}
-.btn-primary{padding: 10px 16px;}
-.mo-box{padding: 24px 16px; max-width:min(560px,calc(100vw - 32px)); border-radius:var(--radius-xl);}
-.toast{padding: 14px 20px; font-size: 0.85rem; bottom: 20px;}
-}
-
-.ic{display:inline-flex;flex:none;width:var(--ic,18px);height:var(--ic,18px);vertical-align:-3px;color:inherit}
-.ic svg{width:100%;height:100%;display:block}
-.cc{font-family:var(--font-mono);font-size:11px;font-weight:600;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:1px 5px;color:var(--text-2)}
-.status{display:inline-flex;align-items:center;gap:6px;font-size:13px}
-.status-dot{width:8px;height:8px;border-radius:9999px;flex:none}
-.status-dot.ok{background:var(--success)}
-.status-dot.warn{background:var(--warning)}
-.status-dot.err{background:var(--danger)}
-.status-dot.off{background:var(--text-3)}
-.hidden{display:none}
-.ltr{direction:ltr;unicode-bidi:isolate}
-[dir="rtl"] .ic-flip{transform:scaleX(-1)}
-@media (prefers-reduced-motion: reduce){*{transition:none!important;animation:none!important}}
-</style>
-<style>
-html, body{}
-.main{display: block; width: 100%; max-width: 1200px; margin-inline-start: auto; margin-inline-end: auto; min-width: 0; padding:var(--space-6) var(--space-4);}
-.page, .card, .stat-card, .tbl-wrap, .logs-table-container, .chart-container{min-width: 0;}
-.page{scroll-margin-top: 84px;}
-html{scroll-padding-top: 84px;}
-.stats-row{grid-template-columns:repeat(auto-fill,minmax(min(100%,240px),1fr));}
-.card{padding:16px;}
-.card-hd{flex-wrap: wrap; gap: 10px;}
-.page-header{flex-wrap: wrap; gap: 12px;}
-.tbl-wrap, .logs-table-container{overflow-x: auto; -webkit-overflow-scrolling: touch;}
-.tbl{border-collapse: collapse; min-width: 560px;}
-.tbl th, .tbl td{overflow-wrap: break-word; word-break: normal; white-space: normal;}
-#inbound-table{min-width: 640px;}
-#proxy-lines-table{min-width: 640px;}
-#logs-table, #login-logs-table{min-width: 560px;}
-.scanner-tbl{min-width: 480px;}
-.act-btn{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;border:1px solid var(--border);background:var(--surface);border-radius:6px;color:var(--text-2);cursor:pointer;transition:background-color 120ms ease-out,color 120ms ease-out,border-color 120ms ease-out;}
-.tooltip-text{white-space: normal; max-width: 220px; overflow-wrap: anywhere;border:1px solid var(--border-strong);border-radius:8px;}
-.mo-box .fg{flex-wrap: wrap;}
-.mo-box input[type="color"]{width: 100%; height: 44px; padding: 4px;}
-.fi, .fs{width: 100%; max-width: 100%;}
-.btn{min-height: 44px;}
-.chart-container{max-width: 100%;}
-.chart-container canvas{max-width: 100%;}
-#proto-summary .tag{white-space: nowrap;}
-@media (min-width: 1024px) {
-.main{padding:var(--space-6) var(--space-4);}
-.stats-row{gap:16px;}
-}
-@media (max-width: 1023px) {
-.nav-item{min-height: 44px;}
-#inbound-table{min-width: 0;}
-.header-nav{flex-wrap: wrap;}
-.stats-row{grid-template-columns:repeat(auto-fill,minmax(min(100%,240px),1fr)); gap:16px;}
-}
-@media (max-width: 480px) {
-.stats-row{grid-template-columns:repeat(auto-fill,minmax(min(100%,240px),1fr)); gap:16px;}
-.stat-card{padding:16px 16px;}
-.stat-val{font-size: 1.5rem;}
-.logo{display:inline-flex;align-items:center;gap:8px;font-family:var(--font-sans);font-size:20px;font-weight:700;color:var(--text);letter-spacing:-0.02em;flex-shrink:0;}
-#panel-clock{display: none;}
-.page-title{font-size:20px;}
-.card{padding:16px 14px;}
-.seg-group{flex-direction: column;}
-.seg-btn{width: 100%;}
-.mo-box{max-height: 88vh;}
-}
 .icon-activity{mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'%3E%3Cpolyline points='22 12 18 12 15 21 9 3 6 12 2 12'/%3E%3C/svg%3E");}
 </style>
+
 </head>
 <body>
 <div class="toast" id="toast"><span class="ic" id="toast-ic"></span><span id="toast-msg"></span></div>
@@ -18333,45 +18097,49 @@ html{scroll-padding-top: 84px;}
   </div>
 </div>
 <div id="dashboard-page" style="display:none;width:100%">
+<div class="sx-shell">
+<aside class="sx-sidebar" aria-label="Navigation">
+<div class="sx-side-brand"><span class="logo">SulgX</span><span class="version-tag">v1.5.8</span></div>
+<nav class="header-nav" id="mainNav">
+<div class="sx-nav-group"><div class="sx-nav-label" data-en="Main" data-fa="اصلی">Main</div><button class="nav-link active" data-page="dashboard">
+            <span class="nav-icon icon-dashboard"></span>
+            <span data-en="Dashboard" data-fa="داشبورد">Dashboard</span>
+          </button><button class="nav-link" data-page="inbounds">
+            <span class="nav-icon icon-inbounds"></span>
+            <span data-en="Inbounds" data-fa="اینباندها">Inbounds</span>
+          </button><button class="nav-link" data-page="active-users">
+            <span class="nav-icon icon-activity"></span>
+            <span data-en="Active Users" data-fa="کاربران فعال">Active Users</span>
+          </button></div>
+<div class="sx-nav-group"><div class="sx-nav-label" data-en="Network" data-fa="شبکه">Network</div><button class="nav-link" data-page="addresses">
+            <span class="nav-icon icon-cleanip"></span>
+            <span data-en="Clean IP" data-fa="آی‌پی تمیز">Clean IP</span>
+          </button><button class="nav-link" data-page="ipscanner">
+            <span class="nav-icon icon-scanner"></span>
+            <span data-en="IP Scanner" data-fa="اسکنر آی‌پی">IP Scanner</span>
+          </button><button class="nav-link" data-page="logs">
+            <span class="nav-icon icon-logs"></span>
+            <span data-en="Logs" data-fa="لاگ‌ها">Logs</span>
+          </button></div>
+<div class="sx-nav-group"><div class="sx-nav-label" data-en="System" data-fa="سیستم">System</div><button class="nav-link" data-page="telegram">
+            <span class="nav-icon icon-telegram"></span>
+            <span data-en="Telegram" data-fa="تلگرام">Telegram</span>
+          </button><button class="nav-link" data-page="settings">
+            <span class="nav-icon icon-settings"></span>
+            <span data-en="Settings" data-fa="تنظیمات">Settings</span>
+          </button></div>
+</nav>
+<div class="sx-side-foot"><span><span class="sx-dot"></span>SulgX Panel</span><span>v1.5.8</span></div>
+</aside>
+<div class="sx-backdrop" onclick="toggleSxNav()"></div>
+
   <header class="header">
     <div class="header-inner">
+      <button class="sx-burger" onclick="toggleSxNav()" aria-label="Menu"><span></span><span></span><span></span></button>
       <div style="display:flex;align-items:center;gap:16px;">
         <span class="logo">SulgX</span><span class="version-tag">v1.5.8</span>
         <span id="panel-clock" style="font-weight:600;color:var(--accent-ink);margin-inline-start:8px;font-size:0.9rem;"></span>
-        <nav class="header-nav" id="mainNav">
-          <button class="nav-link active" data-page="dashboard">
-            <span class="nav-icon icon-dashboard"></span>
-            <span data-en="Dashboard" data-fa="داشبورد">Dashboard</span>
-          </button>
-          <button class="nav-link" data-page="inbounds">
-            <span class="nav-icon icon-inbounds"></span>
-            <span data-en="Inbounds" data-fa="اینباندها">Inbounds</span>
-          </button>
-          <button class="nav-link" data-page="active-users">
-            <span class="nav-icon icon-activity"></span>
-            <span data-en="Active Users" data-fa="کاربران فعال">Active Users</span>
-          </button>
-          <button class="nav-link" data-page="addresses">
-            <span class="nav-icon icon-cleanip"></span>
-            <span data-en="Clean IP" data-fa="آی‌پی تمیز">Clean IP</span>
-          </button>
-          <button class="nav-link" data-page="ipscanner">
-            <span class="nav-icon icon-scanner"></span>
-            <span data-en="IP Scanner" data-fa="اسکنر آی‌پی">IP Scanner</span>
-          </button>
-          <button class="nav-link" data-page="logs">
-            <span class="nav-icon icon-logs"></span>
-            <span data-en="Logs" data-fa="لاگ‌ها">Logs</span>
-          </button>
-          <button class="nav-link" data-page="telegram">
-            <span class="nav-icon icon-telegram"></span>
-            <span data-en="Telegram" data-fa="تلگرام">Telegram</span>
-          </button>
-          <button class="nav-link" data-page="settings">
-            <span class="nav-icon icon-settings"></span>
-            <span data-en="Settings" data-fa="تنظیمات">Settings</span>
-          </button>
-        </nav>
+        
       </div>
       <div class="header-right">
   <button class="btn-icon" onclick="showQuickAdd()" title="Quick Add" data-en-title="Quick Add" data-fa-title="ساخت سریع">
@@ -18851,6 +18619,7 @@ example.com
     </div>
   </footer>
 </div>
+</div>
 <div class="mo" id="mo-add" onclick="if(event.target===this) this.classList.remove('show')">
   <div class="mo-box">
     <button class="mo-close" onclick="document.getElementById('mo-add').classList.remove('show')"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></span></button>
@@ -18915,7 +18684,7 @@ example.com
       <div class="fg" id="fg-ass-password"><label class="fl" data-en="Password / Key" data-fa="گذرواژه / کلید">Password / Key</label><input class="fi" id="ass-password" placeholder="Leave empty for auto-generate" data-ph-en="Leave empty for auto-generate" data-ph-fa="برای تولید خودکار خالی بگذارید"><div style="font-size:0.85rem;color:var(--text-3);">For 2022 methods this must be a base64 key of the right length. For classic methods it is the password.</div></div>
       <div class="fg" id="fg-aproxy-username"><label class="fl" data-en="Username" data-fa="نام کاربری">Username</label><input class="fi" id="aproxy-username" placeholder="Leave empty for auto-generate" data-ph-en="Leave empty for auto-generate" data-ph-fa="برای تولید خودکار خالی بگذارید"></div>
       <div class="fg" id="fg-aproxy-password"><label class="fl" data-en="Password" data-fa="گذرواژه">Password</label><div style="display:flex;gap:6px;"><input class="fi" id="aproxy-password" placeholder="Leave empty for auto-generate" data-ph-en="Leave empty for auto-generate" data-ph-fa="برای تولید خودکار خالی بگذارید" style="flex:1;"><button class="btn btn-outline btn-sm" onclick="generateProxyAuth('create')"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="15.5" cy="15.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="15.5" cy="8.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="8.5" cy="15.5" r="1.4" fill="currentColor" stroke="none"/></svg></span><span data-en="Generate" data-fa="تولید">Generate</span></button></div><div style="font-size:0.85rem;color:var(--text-3);">Leave both empty for an auto-generated code, or type any username and password (username: no : @ / ? # or spaces; password: no spaces).</div></div>
-      <div class="fg" id="fg-aproxy-port"><label class="fl" data-en="Port" data-fa="پورت">Port</label><input class="fi" id="aproxy-port" type="number" min="1" max="65535" value="1080"><div style="font-size:0.85rem;color:var(--text-3);">Each proxy inbound needs its own port. Defaults: SOCKS5 1080, HTTP 3128, MTProto 8443.</div></div>
+      <div class="fg" id="fg-aproxy-port"><label class="fl" data-en="Port" data-fa="پورت">Port</label><input class="fi" id="aproxy-port" type="number" min="1" max="65535" value="1080"><div style="font-size:0.85rem;color:var(--text-3);">One port serves every protocol: the multiplexer routes SOCKS5, HTTP and MTProto, and forwards panel, WebSocket and WEB traffic to the panel. Set the port to the published port (443 on a single-port host); the multiplexer serves each inbound on every port it binds. Defaults: SOCKS5 1080, HTTP 3128, MTProto 8443.</div></div>
       <div class="fg" id="fg-amtproto-variant"><label class="fl" data-en="MTProto Variant" data-fa="نوع MTProto">MTProto Variant</label>
       <select class="fs" id="amtproto-variant" onchange="toggleProxyFields('create')">
       <option value="dd" data-en="dd (recommended, obfuscated2)" data-fa="dd (پیشنهادی، obfuscated2)">dd (recommended, obfuscated2)</option>
@@ -19101,7 +18870,7 @@ example.com
       <div class="fg" id="fg-ess-password"><label class="fl" data-en="Password / Key" data-fa="گذرواژه / کلید">Password / Key</label><input class="fi" id="ess-password" placeholder="Leave empty to keep the current key" data-ph-en="Leave empty to keep the current key" data-ph-fa="برای حفظ کلید فعلی خالی بگذارید"></div>
       <div class="fg" id="fg-eproxy-username"><label class="fl" data-en="Username" data-fa="نام کاربری">Username</label><input class="fi" id="eproxy-username" readonly></div>
       <div class="fg" id="fg-eproxy-password"><label class="fl" data-en="Password" data-fa="گذرواژه">Password</label><input class="fi" id="eproxy-password" readonly><div style="font-size:0.85rem;color:var(--text-3);">Per-inbound credentials: a generated code when left empty at create time, or the values typed at create time.</div></div>
-      <div class="fg" id="fg-eproxy-port"><label class="fl" data-en="Port" data-fa="پورت">Port</label><input class="fi" id="eproxy-port" type="number" min="1" max="65535" value="1080"><div style="font-size:0.85rem;color:var(--text-3);">Each proxy inbound needs its own port. Defaults: SOCKS5 1080, HTTP 3128, MTProto 8443.</div></div>
+      <div class="fg" id="fg-eproxy-port"><label class="fl" data-en="Port" data-fa="پورت">Port</label><input class="fi" id="eproxy-port" type="number" min="1" max="65535" value="1080"><div style="font-size:0.85rem;color:var(--text-3);">One port serves every protocol: the multiplexer routes SOCKS5, HTTP and MTProto, and forwards panel, WebSocket and WEB traffic to the panel. Set the port to the published port (443 on a single-port host); the multiplexer serves each inbound on every port it binds. Defaults: SOCKS5 1080, HTTP 3128, MTProto 8443.</div></div>
       <div class="fg" id="fg-emtproto-variant"><label class="fl" data-en="MTProto Variant" data-fa="نوع MTProto">MTProto Variant</label>
       <select class="fs" id="emtproto-variant" onchange="toggleProxyFields('edit')">
       <option value="dd" data-en="dd (recommended, obfuscated2)" data-fa="dd (پیشنهادی، obfuscated2)">dd (recommended, obfuscated2)</option>
@@ -19113,7 +18882,7 @@ example.com
       <div class="fg" id="fg-ewebproxy-port"><label class="fl" data-en="WEB Proxy Port (shared 443, per-user link)" data-fa="پورت WEB Proxy (443 مشترک، لینک جدا برای هر کاربر)">WEB Proxy Port (shared 443, per-user link)</label>
       <input class="fi" id="ewebproxy-port" type="number" min="1" max="65535" value="443">
       <div class="hint" style="color:var(--text-3);font-size:0.85rem;" data-en="Port 443 is shared — each user gets their own link with its own token and secret." data-fa="پورت 443 مشترک است — هر کاربر لینک جدا با توکن و سکرت خودش دارد.">Port 443 is shared — each user gets their own link with its own token and secret.</div></div>
-      <div class="fg" id="fg-ewebproxy-secret"><label class="fl" data-en="Secret" data-fa="سکرت">Secret</label><div style="display:flex;gap:6px;"><input class="fi" id="ewebproxy-secret" placeholder="Leave empty to keep the current secret" data-ph-en="Leave empty to keep the current secret" data-ph-fa="برای حفظ سکرت فعلی خالی بگذارید" style="flex:1;"><button class="btn btn-outline btn-sm" onclick="generateWebproxySecret('edit')"><span data-en="Generate" data-fa="تولید">Generate</span></button></div><div style="font-size:0.85rem;color:var(--text-3);">Leave empty to keep the current secret, or type a new one: 32 hex characters (optionally prefixed with dd).</div></div>
+      <div class="fg" id="fg-ewebproxy-secret"><label class="fl" data-en="Secret" data-fa="سکرت">Secret</label><div style="display:flex;gap:6px;"><input class="fi" id="ewebproxy-secret" placeholder="Leave empty to keep the current secret" data-ph-en="Leave empty to keep the current secret" data-ph-fa="برای حفظ سکرت فعلی خالی بگذارید" style="flex:1;"><button class="btn btn-outline btn-sm" onclick="generateWebproxySecret('edit')"><span data-en="Generate" data-fa="تولید">Generate</span></button></div><div style="font-size:0.85rem;color:var(--text-3);">Current secret is shown above. Clear the field to keep it unchanged, or type a new one to rotate it: 32 hex characters (optionally prefixed with dd).</div></div>
       <div class="fg" id="fg-ewebproxy-token"><label class="fl" data-en="Routing Token" data-fa="توکن مسیریابی">Routing Token</label><input class="fi" id="ewebproxy-token" readonly placeholder="Assigned by token routing" data-ph-en="Assigned by token routing" data-ph-fa="توسط مسیریابی توکن اختصاص می‌یابد"></div>
     </div>
     <div id="proxy-fields-edit" style="display:none;">
@@ -19351,7 +19120,7 @@ example.com
       <input class="fi" id="quick-webproxy-port" type="number" min="1" max="65535" value="443">
       <div class="hint" style="color:var(--text-3);font-size:0.85rem;" data-en="Port 443 is shared — each user gets their own link with its own token and secret." data-fa="پورت 443 مشترک است — هر کاربر لینک جدا با توکن و سکرت خودش دارد.">Port 443 is shared — each user gets their own link with its own token and secret.</div></div>
     <div class="fg" id="fg-quick-webproxy-secret" style="display:none;"><label class="fl" data-en="Secret" data-fa="سکرت">Secret</label><div style="display:flex;gap:6px;"><input class="fi" id="quick-webproxy-secret" placeholder="Leave empty for auto-generate" data-ph-en="Leave empty for auto-generate" data-ph-fa="برای تولید خودکار خالی بگذارید" style="flex:1;"><button class="btn btn-outline btn-sm" onclick="generateWebproxySecret('quick')"><span data-en="Generate" data-fa="تولید">Generate</span></button></div></div>
-    <div class="fg" id="fg-quick-proxy-port" style="display:none;"><label class="fl" data-en="Port" data-fa="پورت">Port</label><input class="fi" id="quick-proxy-port" type="number" min="1" max="65535" value="1080"><div style="font-size:0.85rem;color:var(--text-3);">Each proxy inbound needs its own port. Defaults: SOCKS5 1080, HTTP 3128, MTProto 8443.</div></div>
+    <div class="fg" id="fg-quick-proxy-port" style="display:none;"><label class="fl" data-en="Port" data-fa="پورت">Port</label><input class="fi" id="quick-proxy-port" type="number" min="1" max="65535" value="1080"><div style="font-size:0.85rem;color:var(--text-3);">One port serves every protocol: the multiplexer routes SOCKS5, HTTP and MTProto, and forwards panel, WebSocket and WEB traffic to the panel. Set the port to the published port (443 on a single-port host); the multiplexer serves each inbound on every port it binds. Defaults: SOCKS5 1080, HTTP 3128, MTProto 8443.</div></div>
     <div class="fg" id="fg-quick-proxy-note" style="display:none;"><div class="hint" style="color:var(--text-3);font-size:0.85rem;" data-en="Username and password are auto-generated when left empty." data-fa="نام کاربری و گذرواژه در صورت خالی ماندن به‌صورت خودکار ساخته می‌شوند.">Username and password are auto-generated when left empty.</div></div>
     <div class="fg" id="fg-quick-secret-note" style="display:none;"><div class="hint" style="color:var(--text-3);font-size:0.85rem;" data-en="MTProto secret is derived per inbound after creation. WEB secret is auto-generated unless you type one in the Secret field." data-fa="سکرت MTProto پس از ایجاد برای هر اینباند ساخته می‌شود. سکرت WEB به‌صورت خودکار ساخته می‌شود مگر اینکه در فیلد سکرت بنویسید.">MTProto secret is derived per inbound after creation. WEB secret is auto-generated unless you type one in the Secret field.</div></div>
     <div class="fg"><label class="fl" data-en="Traffic (GB)" data-fa="حجم (گیگ)">Traffic (GB)</label><input class="fi" type="number" id="quick-limit" value="0"></div>
@@ -21705,7 +21474,7 @@ async function doLogout(){
     const prefix = window.panelPrefix ? '/' + window.panelPrefix : '';
     window.location.href = prefix + '/login';
 }
-document.querySelectorAll('.nav-link[data-page]').forEach(el=>el.addEventListener('click',()=>{switchPage(el.dataset.page);document.getElementById('mainNav').classList.remove('open');}));
+document.querySelectorAll('.nav-link[data-page]').forEach(el=>el.addEventListener('click',()=>{switchPage(el.dataset.page);document.getElementById('mainNav').classList.remove('open');var sh=document.querySelector('.sx-shell');if(sh)sh.classList.remove('sx-nav-open');}));
 async function fetchJsonTimeout(url,ms){
   const ctrl=new AbortController();
   const timer=setTimeout(()=>ctrl.abort(),ms||15000);
@@ -22410,14 +22179,13 @@ async function createLink(){
   const webproxySecret=$m('awebproxy-secret') ? $m('awebproxy-secret').value.trim() : '';
   const uuidRe=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   if(protocol==='webproxy' && webproxySecret && !/^(dd)?[0-9a-fA-F]{32}$/.test(webproxySecret)){ toast('WEB proxy secret must be 32 hex characters, optionally prefixed with dd', true); return; }
-  if(['socks5','mtproto','http-proxy','webproxy'].includes(protocol)){
-    const newPort = protocol==='webproxy' ? webproxyPort : (proxyPort || {'socks5':1080,'http-proxy':3128,'mtproto':8443}[protocol]);
-    const clash = (allLinks||[]).find(l => l.active && Number(l.port) === newPort && !(protocol==='webproxy' && (l.protocol||'')==='webproxy' && newPort===443));
-    if(clash){ toast('Port ' + newPort + ' is already used by inbound "' + (clash.label||'') + '"', true); return; }
-  }
   if(protocol==='trojan-ws' && credPassword && !uuidRe.test(credPassword)){ toast(t('trojanPasswordUuid'), true); return; }
   if((protocol==='socks5' || protocol==='http-proxy') && (credProxyUser || credProxyPass) && (!credProxyUser || !credProxyPass)){ toast(t('proxyUserPassBoth'), true); return; }
   if((protocol==='socks5' || protocol==='http-proxy') && credProxyUser && /[:@\/?#\s]/.test(credProxyUser)){ toast(t('proxyUserChars'), true); return; }
+  if((protocol==='socks5' || protocol==='http-proxy') && credProxyUser){
+    const userClash = (allLinks||[]).find(l => (l.proxy_username||'')===credProxyUser || (l.uuid||l.uid||'')===credProxyUser);
+    if(userClash){ toast('Proxy username "' + credProxyUser + '" is already used by inbound "' + (userClash.label||'') + '"', true); return; }
+  }
   if((protocol==='socks5' || protocol==='http-proxy') && credProxyPass && /\s/.test(credProxyPass)){ toast(t('proxyPassSpaces'), true); return; }
   const outboundMode=$m('aoutbound-mode').value||'auto';
   const gamingProfile=$m('agaming-profile').value||'off';
@@ -22491,6 +22259,8 @@ async function createLink(){
 }
 
 function proxySecretFromLink(link){ try{ const u = new URL(link); return u.searchParams.get('secret') || ''; }catch(e){ return ''; } }
+function webproxySecretHexFromB64(secretB64){ try{ const norm=String(secretB64||'').replace(/-/g,'+').replace(/_/g,'/'); const bin=atob(norm); if(bin.length!==18||bin.charCodeAt(0)!==0x70||bin.charCodeAt(1)!==0xdd) return ''; let hex=''; for(let i=2;i<bin.length;i++){ hex+=bin.charCodeAt(i).toString(16).padStart(2,'0'); } return hex; }catch(e){ return ''; } }
+function webproxySecretHex(l){ if(!l) return ''; const direct=String(l.webproxy_secret||'').trim().toLowerCase(); if(/^[0-9a-f]{32}$/.test(direct)) return direct; if(l.proxy&&l.proxy.secret) return webproxySecretHexFromB64(l.proxy.secret); const link=l.vless_link||(l.proxy&&l.proxy.protocol_link)||''; if(link){ const s=proxySecretFromLink(link); if(s) return webproxySecretHexFromB64(s); } return ''; }
 async function showEditMo(uid) {
   const l = allLinks.find(x => x.uuid === uid);
   if (!l) return;
@@ -22559,7 +22329,7 @@ async function showEditMo(uid) {
   if($m('eproxy-password')) $m('eproxy-password').value = l.proxy_password || l.uuid || '';
   if($m('ess-password')) $m('ess-password').value = '';
   if($m('emtproto-secret')) $m('emtproto-secret').value = (l.proxy && l.proxy.variants && l.proxy.variants.dd) ? proxySecretFromLink(l.proxy.variants.dd) : '';
-  if($m('ewebproxy-secret')) $m('ewebproxy-secret').value = '';
+  if($m('ewebproxy-secret')) $m('ewebproxy-secret').value = webproxySecretHex(l);
   toggleProxyFields('edit');
   $m('ess-method').value = l.ss_method || '2022-blake3-aes-256-gcm';
   if($m('evmess-security')) $m('evmess-security').value = l.vmess_security || 'auto';
@@ -22691,11 +22461,6 @@ async function saveEdit() {
   const proxyLine = $m('proxy-line-text-edit').value.trim();
   if (proxyLine && !parseProxyLine(proxyLine)) { toast(t('invalidProxyLine'), true); return; }
   if (protocol === 'webproxy' && webproxySecretEdit && !/^(dd)?[0-9a-fA-F]{32}$/.test(webproxySecretEdit)) { toast('WEB proxy secret must be 32 hex characters, optionally prefixed with dd', true); return; }
-  if (['socks5', 'mtproto', 'http-proxy', 'webproxy'].includes(protocol)) {
-    const newPortEdit = protocol === 'webproxy' ? webproxyPort : (proxyPortEdit || {'socks5': 1080, 'http-proxy': 3128, 'mtproto': 8443}[protocol]);
-    const clashEdit = (allLinks || []).find(l => l.uuid !== uid && l.active && Number(l.port) === newPortEdit && !(protocol === 'webproxy' && (l.protocol || '') === 'webproxy' && newPortEdit === 443));
-    if (clashEdit) { toast('Port ' + newPortEdit + ' is already used by inbound "' + (clashEdit.label || '') + '"', true); return; }
-  }
   const fpSel = $m('efingerprint-sel').value; const fingerprint = fpSel === 'custom' ? ($m('efingerprint-custom').value.trim().toLowerCase() || '') : fpSel === 'none' ? '' : fpSel;
   const alpnSel = $m('ealpn-sel').value; const alpn = alpnSel === 'custom' ? $m('ealpn-custom').value.trim() : (alpnSel || '');
   const port = protocol === 'webproxy' ? webproxyPort : parseInt($m('eport').value) || 443;
@@ -24679,6 +24444,8 @@ document.addEventListener('keydown', function(e) {
         document.querySelectorAll('.mo.show').forEach(m => m.classList.remove('show'));
     }
 });
+
+function toggleSxNav(){var s=document.querySelector('.sx-shell');if(s)s.classList.toggle('sx-nav-open');}
 </script>
 </body>
 </html>"""
@@ -25477,7 +25244,7 @@ if __name__ == "__main__":
     logger.info(f"Starting SulgX Panel on port {port}")
     uvicorn.run(
         app,
-        host="0.0.0.0",
+        host=os.environ.get("PANEL_BIND_HOST", "0.0.0.0"),
         port=port,
         workers=1,
         ws_per_message_deflate=False,
