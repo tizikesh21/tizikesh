@@ -163,10 +163,14 @@ def is_telegram_ip(ip_str):
     return False
 
 
-async def _read_exact(reader, n):
+async def _read_exact(reader, n, timeout=10.0):
     data = b""
+    deadline = time.monotonic() + timeout
     while len(data) < n:
-        chunk = await reader.read(n - len(data))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise asyncio.TimeoutError("read timed out")
+        chunk = await asyncio.wait_for(reader.read(n - len(data)), timeout=remaining)
         if not chunk:
             raise ConnectionError("connection closed while reading")
         data += chunk
@@ -232,6 +236,8 @@ class _PrefixedReader:
                 out = bytes(self._buf[:end])
                 del self._buf[:end]
                 return out
+            if len(self._buf) > 65536:
+                raise asyncio.LimitOverrunError("header exceeds 65536 bytes", len(self._buf))
             chunk = await self._reader.read(65536)
             if not chunk:
                 raise asyncio.IncompleteReadError(bytes(self._buf), None)
@@ -255,12 +261,12 @@ def _looks_socks5(prefix):
     if prefix[0] != 0x05:
         return False
     count = prefix[1]
-    if count < 1 or count > 4:
+    if count < 1:
         return False
     for byte in prefix[2:2 + count]:
-        if byte not in (0x00, 0x01, 0x02):
-            return False
-    return True
+        if byte in (0x00, 0x01, 0x02):
+            return True
+    return False
 
 
 def _could_be_http_or_socks5(prefix):
@@ -273,12 +279,14 @@ def _could_be_http_or_socks5(prefix):
         if len(prefix) < 2:
             return True
         count = prefix[1]
-        if count < 1 or count > 4:
+        if count < 1:
             return False
+        if len(prefix) < 2 + count:
+            return True
         for byte in prefix[2:2 + count]:
-            if byte not in (0x00, 0x01, 0x02):
-                return False
-        return True
+            if byte in (0x00, 0x01, 0x02):
+                return True
+        return False
     return False
 
 
@@ -726,7 +734,7 @@ async def _handle_http_proxy(reader, writer):
     try:
         try:
             head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=10.0)
-        except (asyncio.IncompleteReadError, asyncio.TimeoutError, ConnectionError, OSError):
+        except (asyncio.IncompleteReadError, asyncio.TimeoutError, asyncio.LimitOverrunError, ConnectionError, OSError):
             writer.close()
             return
         text = head.decode("iso-8859-1", "ignore")
@@ -1114,7 +1122,7 @@ def _web_config_text(fields):
         "[[web.vhosts]]",
         'host = "' + _toml_escape(fields["host"]) + '"',
         'base_path = "' + _toml_escape(base_path) + '"',
-        'public_addr = "' + _toml_escape(fields["public_ip"]) + ':443"',
+        'public_addr = "' + _toml_escape(_telemt_public_addr(fields["public_ip"])) + '"',
         "",
         "[web.vhosts.decoy]",
         'mode = "static_directory"',
@@ -1146,7 +1154,7 @@ def _web_root_vhost(fields, enabled):
     return {
         "host": fields["host"],
         "base_path": "" if enabled else fields["web_token"],
-        "public_addr": fields["public_ip"] + ":443",
+        "public_addr": _telemt_public_addr(fields["public_ip"]),
         "decoy": {"mode": "static_directory", "directory": _ensure_decoy_dir(), "index": "index.html"},
         "profiles": [{"user": _telemt_username(fields["uid"]), "secret_mode": "dd", "max_sessions": fields["max_sessions"], "max_streams": fields["max_streams"], "max_streams_per_session": 64}],
     }
@@ -1202,7 +1210,7 @@ async def _telemt_api_async(api_port, token, method, path, body=None, timeout=8.
 
 async def _resolve_public_ip(host):
     try:
-        infos = await asyncio.to_thread(socket.getaddrinfo, host, 443, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        infos = await asyncio.to_thread(socket.getaddrinfo, host, 443, socket.AF_INET, socket.SOCK_STREAM)
     except (OSError, UnicodeError):
         return None
     for info in infos or []:
@@ -1210,6 +1218,17 @@ async def _resolve_public_ip(host):
         if sockaddr:
             return str(sockaddr[0])
     return None
+
+
+def _telemt_public_addr(ip_text):
+    text = str(ip_text or "").strip()
+    try:
+        parsed = ipaddress.ip_address(text)
+    except ValueError:
+        parsed = ipaddress.ip_address("127.0.0.1")
+    if isinstance(parsed, ipaddress.IPv6Address):
+        return "[" + str(parsed) + "]:443"
+    return str(parsed) + ":443"
 
 
 def _redact_log_line(text):
@@ -1726,7 +1745,11 @@ async def telemt_start_web(uid, token, secret_hex, host, max_sessions=8, max_str
         except asyncio.TimeoutError:
             resolved_ip = None
         if not resolved_ip:
-            resolved_ip = host
+            resolved_ip = "127.0.0.1"
+    try:
+        ipaddress.ip_address(resolved_ip)
+    except ValueError:
+        resolved_ip = "127.0.0.1"
     async with _telemt_lock("web:" + key):
         entry = _TELEMT_WEB.get(key)
         if entry is not None and entry.get("proc") is not None and entry["proc"].returncode is None and entry.get("ready"):
@@ -1789,9 +1812,14 @@ async def _web_patch_root(entry, enabled):
     if not replaced:
         new_vhosts.append(_web_root_vhost(fields, enabled))
     patched = False
+    patch_ok = False
     status, payload = None, {}
     for attempt in range(5):
         status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "PATCH", "/v1/config?reload=instant", {"web": {"vhosts": new_vhosts}})
+        if status == 200 and payload.get("ok"):
+            patched = True
+            patch_ok = True
+            break
         if status == 202 and payload.get("ok"):
             patched = True
             break
@@ -1802,6 +1830,8 @@ async def _web_patch_root(entry, enabled):
     if not patched:
         _LOG.warning("telemt WEB root PATCH failed for uid %s: %s", entry["key"], _telemt_api_error(payload))
         return False
+    if patch_ok:
+        return True
     reload_id = None
     try:
         reload_id = ((payload.get("data") or {}).get("reload") or {}).get("reload_id")
@@ -1874,14 +1904,16 @@ async def telemt_web_status(uid):
     ingress = data.get("ingress") or {}
     healthy = data.get("lifecycle") == "running" and ingress.get("accepting_connections") is True
     sessions = 0
+    session_rows = []
     status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "GET", "/v1/runtime/web/sessions?limit=200", timeout=5.0)
     if status == 200 and payload.get("ok"):
         rows = (payload.get("data") or {}).get("sessions") or []
-        sessions = len(rows)
+        session_rows = rows if isinstance(rows, list) else []
+        sessions = len(session_rows)
     error = ""
     if not healthy:
         error = str(data.get("reason") or data.get("lifecycle") or "WEB runtime is not running")
-    return {"enabled": True, "port": port, "error": error, "sessions": sessions, "healthy": healthy}
+    return {"enabled": True, "port": port, "error": error, "sessions": sessions, "session_rows": session_rows, "healthy": healthy}
 
 
 async def telemt_stop_all():
