@@ -1310,6 +1310,16 @@ def _telemt_api_error(payload):
         if code:
             return code + ": " + str(message)
         return str(message)
+    if isinstance(error, str) and error:
+        return error
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if isinstance(data, dict):
+        detail = data.get("error") or data.get("message") or ""
+        if detail:
+            state = data.get("state") or ""
+            if state:
+                return "reload " + str(state) + ": " + str(detail)
+            return str(detail)
     return "telemt API error"
 
 
@@ -1836,7 +1846,7 @@ async def telemt_mtproto_user_stats(uid):
         return {}
 
 
-async def telemt_start_web(uid, token, secret_hex, host, max_sessions=8, max_streams=512, public_ip=None):
+async def telemt_start_web(uid, token, secret_hex, host, max_sessions=8, max_streams=512, public_ip=None, root_enabled=False):
     key = str(uid)
     if not telemt_available():
         return {"enabled": False, "port": 0, "api_port": 0, "error": "telemt binary not found at " + _telemt_binary()}
@@ -1871,7 +1881,7 @@ async def telemt_start_web(uid, token, secret_hex, host, max_sessions=8, max_str
         entry = _TELEMT_WEB.get(key)
         if entry is not None and entry.get("proc") is not None and entry["proc"].returncode is None and entry.get("ready"):
             fields = entry["fields"]
-            if fields.get("web_token") == token and fields.get("secret_hex") == secret_hex.lower() and fields.get("host") == host and fields.get("public_ip") == resolved_ip and fields.get("max_sessions") == max_sessions and fields.get("max_streams") == max_streams and not fields.get("root_enabled"):
+            if fields.get("web_token") == token and fields.get("secret_hex") == secret_hex.lower() and fields.get("host") == host and fields.get("public_ip") == resolved_ip and fields.get("max_sessions") == max_sessions and fields.get("max_streams") == max_streams and bool(fields.get("root_enabled")) == bool(root_enabled):
                 return {"enabled": True, "port": entry["port"], "api_port": entry["api_port"], "error": ""}
         if entry is not None:
             await _stop_entry(entry)
@@ -1883,7 +1893,7 @@ async def telemt_start_web(uid, token, secret_hex, host, max_sessions=8, max_str
         port = _free_loopback_port()
         api_port = _free_loopback_port()
         bearer = _random_bearer()
-        fields = {"uid": key, "web_token": token, "secret_hex": secret_hex.lower(), "host": host, "public_ip": resolved_ip, "max_sessions": max_sessions, "max_streams": max_streams, "root_enabled": False}
+        fields = {"uid": key, "web_token": token, "secret_hex": secret_hex.lower(), "host": host, "public_ip": resolved_ip, "max_sessions": max_sessions, "max_streams": max_streams, "root_enabled": bool(root_enabled)}
         entry = _new_telemt_entry("web", key, run_dir, config_path, port, api_port, bearer)
         entry["fields"] = fields
         _TELEMT_WEB[key] = entry
@@ -1907,11 +1917,13 @@ async def telemt_stop_web(uid):
 async def _web_patch_root(entry, enabled):
     status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "GET", "/v1/config")
     if status != 200 or not payload.get("ok"):
+        entry["root_error"] = "telemt config read failed: " + _telemt_api_error(payload)
         _LOG.warning("telemt WEB root PATCH aborted for uid %s: config read failed: %s", entry["key"], _telemt_api_error(payload))
         return False
     try:
         vhosts = list(((payload.get("data") or {}).get("web") or {}).get("vhosts") or [])
     except (AttributeError, TypeError):
+        entry["root_error"] = "telemt config has no web vhosts"
         _LOG.warning("telemt WEB root PATCH aborted for uid %s: config has no web vhosts", entry["key"])
         return False
     fields = entry["fields"]
@@ -1945,9 +1957,11 @@ async def _web_patch_root(entry, enabled):
             continue
         break
     if not patched:
+        entry["root_error"] = "telemt config PATCH failed: " + _telemt_api_error(payload)
         _LOG.warning("telemt WEB root PATCH failed for uid %s: %s", entry["key"], _telemt_api_error(payload))
         return False
     if patch_ok:
+        entry["root_error"] = ""
         return True
     reload_id = None
     try:
@@ -1955,6 +1969,7 @@ async def _web_patch_root(entry, enabled):
     except (AttributeError, TypeError):
         reload_id = None
     if reload_id is None:
+        entry["root_error"] = "telemt config PATCH failed: reload id missing"
         _LOG.warning("telemt WEB root PATCH failed for uid %s: reload id missing", entry["key"])
         return False
     deadline = time.monotonic() + 30.0
@@ -1963,11 +1978,14 @@ async def _web_patch_root(entry, enabled):
         if status == 200 and payload.get("ok"):
             state = (payload.get("data") or {}).get("state")
             if state == "succeeded":
+                entry["root_error"] = ""
                 return True
             if state in ("failed", "rolled_back"):
+                entry["root_error"] = "telemt config reload " + str(state) + ": " + _telemt_api_error(payload)
                 _LOG.warning("telemt WEB root reload %s for uid %s: %s", state, entry["key"], _telemt_api_error(payload))
                 return False
         await asyncio.sleep(0.5)
+    entry["root_error"] = "telemt config reload timed out after 30s (reload stayed in preparing state)"
     _LOG.warning("telemt WEB root reload timed out for uid %s", entry["key"])
     return False
 
@@ -1981,9 +1999,51 @@ async def _web_restart_with_root(key, enabled):
     _TELEMT_WEB.pop(key, None)
     fresh = _new_telemt_entry("web", key, entry["run_dir"], entry["config_path"], entry["port"], entry["api_port"], entry["token"])
     fresh["fields"] = entry["fields"]
+    fresh["root_error"] = ""
     _TELEMT_WEB[key] = fresh
     fresh["task"] = asyncio.create_task(_supervise_entry(fresh))
-    return await _wait_entry_ready(fresh, timeout=30.0)
+    ready = await _wait_entry_ready(fresh, timeout=30.0)
+    if not ready:
+        fresh["root_error"] = "telemt WEB child did not become ready within 30s after restart: " + str(fresh.get("error") or "")
+        return False
+    base_path, base_err = await telemt_web_base_path(key)
+    if base_err:
+        fresh["root_error"] = "telemt WEB child is ready but its root vhost could not be verified: " + str(base_err)
+        return False
+    if bool(enabled) and base_path != "":
+        fresh["root_error"] = "telemt WEB child is ready but its vhost base_path is still " + repr(base_path) + " instead of root"
+        return False
+    if not bool(enabled) and base_path == "":
+        fresh["root_error"] = "telemt WEB child is ready but its vhost is still at the root instead of its token path"
+        return False
+    fresh["root_error"] = ""
+    return True
+
+
+async def telemt_web_base_path(uid):
+    key = str(uid)
+    entry = _TELEMT_WEB.get(key)
+    if entry is None:
+        return None, "no telemt WEB child for uid " + key
+    status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "GET", "/v1/config", timeout=5.0)
+    if status != 200 or not payload.get("ok"):
+        return None, "telemt WEB config read failed: " + _telemt_api_error(payload)
+    try:
+        vhosts = list(((payload.get("data") or {}).get("web") or {}).get("vhosts") or [])
+    except (AttributeError, TypeError):
+        return None, "telemt WEB config has no web vhosts"
+    host = str(entry["fields"].get("host", "")).lower()
+    for vhost in vhosts:
+        if isinstance(vhost, dict) and str(vhost.get("host", "")).lower() == host:
+            return str(vhost.get("base_path", "")), ""
+    return None, "telemt WEB config has no vhost for host " + str(entry["fields"].get("host", ""))
+
+
+def telemt_web_root_error(uid):
+    entry = _TELEMT_WEB.get(str(uid))
+    if entry is None:
+        return ""
+    return str(entry.get("root_error") or "")
 
 
 async def telemt_web_set_root(uid, enabled):
@@ -1993,7 +2053,10 @@ async def telemt_web_set_root(uid, enabled):
         return False
     async with _telemt_lock("web:" + key):
         entry = _TELEMT_WEB.get(key)
-        if entry is None or not entry.get("ready"):
+        if entry is None:
+            return False
+        if not entry.get("ready"):
+            entry["root_error"] = "telemt WEB child is not ready yet, root vhost cannot be enabled"
             return False
         fields = entry["fields"]
         if bool(fields.get("root_enabled")) == bool(enabled):
