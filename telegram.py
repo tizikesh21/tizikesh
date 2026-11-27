@@ -1,10 +1,11 @@
 """SulgX Telegram proxy layer.
 
-SOCKS5 and HTTP CONNECT stay in this module and only accept Telegram
-destinations. MTProto and WEB proxying are delegated to the telemt binary:
-one shared telemt child serves classic MTProto for every inbound, and one
-telemt child per WEB inbound serves that inbound token. The panel never
-implements the MTProto or WEB wire protocols itself any more.
+SOCKS5 and HTTP CONNECT are general-purpose authenticated relays in this
+module: any TCP destination is allowed, credentials are checked per link.
+MTProto and WEB proxying stay Telegram-only and are delegated to the telemt
+binary: one shared telemt child serves classic MTProto for every inbound,
+and one telemt child per WEB inbound serves that inbound token. The panel
+never implements the MTProto or WEB wire protocols itself any more.
 """
 import asyncio
 import base64
@@ -37,24 +38,6 @@ except Exception:
     _AES_CTR = None
 
 _LOG = logging.getLogger("sulgx.telegram")
-
-TG_NETWORKS = [
-    ipaddress.ip_network("91.108.4.0/22"),
-    ipaddress.ip_network("91.108.8.0/22"),
-    ipaddress.ip_network("91.108.12.0/22"),
-    ipaddress.ip_network("91.108.16.0/22"),
-    ipaddress.ip_network("91.108.20.0/22"),
-    ipaddress.ip_network("91.108.56.0/22"),
-    ipaddress.ip_network("149.154.160.0/20"),
-    ipaddress.ip_network("185.76.151.0/24"),
-    ipaddress.ip_network("95.161.64.0/20"),
-    ipaddress.ip_network("91.105.192.0/18"),
-    ipaddress.ip_network("2001:67c:4e8::/48"),
-    ipaddress.ip_network("2001:b28:f23c::/48"),
-    ipaddress.ip_network("2001:b28:f23d::/48"),
-    ipaddress.ip_network("2001:b28:f23f::/48"),
-    ipaddress.ip_network("2a0a:f280::/32"),
-]
 
 TELEMT_VERSION = "3.5.17"
 _TELEMT_DEFAULT_BIN = "/usr/local/bin/telemt"
@@ -199,27 +182,20 @@ def _bind_error_text(port, exc):
     return text
 
 
-def is_telegram_ip(ip_str):
-    try:
-        ip = ipaddress.ip_address(ip_str)
-    except ValueError:
-        return False
-    for net in TG_NETWORKS:
-        if ip in net:
-            return True
-    return False
-
-
-def _telegram_targets(ips):
+def _ordered_targets(ips):
     targets = []
     for ip in ips or []:
-        if is_telegram_ip(ip):
+        try:
+            ipaddress.ip_address(ip)
+        except ValueError:
+            continue
+        if ip not in targets:
             targets.append(ip)
     targets.sort(key=lambda item: ipaddress.ip_address(item).version)
     return targets
 
 
-async def _connect_telegram(targets, port):
+async def _connect_target(targets, port):
     for target_ip in targets:
         try:
             return await asyncio.wait_for(asyncio.open_connection(target_ip, port), timeout=10)
@@ -774,9 +750,9 @@ async def _handle_socks5(reader, writer):
             writer.close()
             return
         port = struct.unpack(">H", await _read_exact(reader, 2))[0]
-        targets = _telegram_targets(ips)
+        targets = _ordered_targets(ips)
         if not targets:
-            writer.write(b"\x05\x02\x00\x01\x00\x00\x00\x00\x00\x00")
+            writer.write(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")
             await writer.drain()
             writer.close()
             return
@@ -787,7 +763,7 @@ async def _handle_socks5(reader, writer):
                 await writer.drain()
                 writer.close()
                 return
-        target_reader, target_writer = await _connect_telegram(targets, port)
+        target_reader, target_writer = await _connect_target(targets, port)
         if target_writer is None:
             writer.write(b"\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00")
             await writer.drain()
@@ -968,13 +944,13 @@ async def _handle_http_proxy(reader, writer):
             await writer.drain()
             writer.close()
             return
-        targets = _telegram_targets(ips)
+        targets = _ordered_targets(ips)
         if not targets:
-            writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             await writer.drain()
             writer.close()
             return
-        target_reader, target_writer = await _connect_telegram(targets, port)
+        target_reader, target_writer = await _connect_target(targets, port)
         if target_writer is None:
             writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             await writer.drain()
@@ -1237,6 +1213,23 @@ def _mtproto_config_text(api_port, token, port, bootstrap_secret, users=None):
 def _web_config_text(fields):
     username = _telemt_username(fields["uid"])
     base_path = "" if fields.get("root_enabled") else fields["web_token"]
+    profiles = fields.get("profiles")
+    if profiles:
+        profile_rows = []
+        for item in profiles:
+            profile_rows.append({
+                "user": _telemt_username(str(item.get("uid") or "")),
+                "secret_hex": str(item.get("secret_hex") or "").lower(),
+                "max_sessions": int(item.get("max_sessions") or 8),
+                "max_streams": int(item.get("max_streams") or 512),
+            })
+    else:
+        profile_rows = [{
+            "user": username,
+            "secret_hex": str(fields["secret_hex"]).lower(),
+            "max_sessions": int(fields["max_sessions"]),
+            "max_streams": int(fields["max_streams"]),
+        }]
     lines = [
         "[general]",
         "use_middle_proxy = false",
@@ -1282,13 +1275,18 @@ def _web_config_text(fields):
         'directory = "' + _toml_escape(_ensure_decoy_dir()) + '"',
         'index = "index.html"',
         "",
-        "[[web.vhosts.profiles]]",
-        'user = "' + _toml_escape(username) + '"',
-        'secret_mode = "dd"',
-        "max_sessions = " + str(fields["max_sessions"]),
-        "max_streams = " + str(fields["max_streams"]),
-        "max_streams_per_session = 64",
-        "",
+    ]
+    for row in profile_rows:
+        lines.extend([
+            "[[web.vhosts.profiles]]",
+            'user = "' + _toml_escape(row["user"]) + '"',
+            'secret_mode = "dd"',
+            "max_sessions = " + str(row["max_sessions"]),
+            "max_streams = " + str(row["max_streams"]),
+            "max_streams_per_session = 64",
+            "",
+        ])
+    lines.extend([
         "[censorship]",
         'tls_domain = "www.google.com"',
         "mask = true",
@@ -1298,18 +1296,23 @@ def _web_config_text(fields):
         "attempt_timeout_ms = 2000",
         "",
         "[access.users]",
-        '"' + _toml_escape(username) + '" = "' + fields["secret_hex"] + '"',
-    ]
+    ])
+    for row in profile_rows:
+        lines.append('"' + _toml_escape(row["user"]) + '" = "' + row["secret_hex"] + '"')
     return "\n".join(lines) + "\n"
 
 
-def _web_root_vhost(fields, enabled):
+def _web_root_vhost(fields, enabled, profiles=None):
+    if profiles:
+        profile_rows = [{"user": _telemt_username(str(item.get("uid") or "")), "secret_mode": "dd", "max_sessions": int(item.get("max_sessions") or 8), "max_streams": int(item.get("max_streams") or 512), "max_streams_per_session": 64} for item in profiles]
+    else:
+        profile_rows = [{"user": _telemt_username(fields["uid"]), "secret_mode": "dd", "max_sessions": fields["max_sessions"], "max_streams": fields["max_streams"], "max_streams_per_session": 64}]
     return {
         "host": fields["host"],
         "base_path": "" if enabled else fields["web_token"],
         "public_addr": _telemt_public_addr(fields["public_ip"]),
         "decoy": {"mode": "static_directory", "directory": _ensure_decoy_dir(), "index": "index.html"},
-        "profiles": [{"user": _telemt_username(fields["uid"]), "secret_mode": "dd", "max_sessions": fields["max_sessions"], "max_streams": fields["max_streams"], "max_streams_per_session": 64}],
+        "profiles": profile_rows,
     }
 
 
@@ -1748,31 +1751,21 @@ def mtproto_counted_bytes(uid):
     return total
 
 
-async def _telemt_mtproto_upsert_api(entry, username, body):
-    path = "/v1/users/" + _url_path_quote(username, safe="")
-    status, payload = None, {}
-    for attempt in range(5):
-        status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "GET", path)
-        if status == 200 and payload.get("ok"):
-            status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "PATCH", path, body)
-            if status == 409 and _telemt_error_code(payload) == "reload_in_progress":
-                await asyncio.sleep(1.0)
-                continue
-            return status in (200, 202) and bool(payload.get("ok"))
+async def _telemt_mtproto_wait_user_gone(entry, username, timeout=12.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "GET", "/v1/users/" + _url_path_quote(username, safe=""))
         if status == 404:
-            create = {"username": username}
-            create.update(body)
-            status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "POST", "/v1/users", create)
-            if status == 409 and _telemt_error_code(payload) == "reload_in_progress":
-                await asyncio.sleep(1.0)
-                continue
-            return status in (200, 201, 202) and bool(payload.get("ok"))
-        if status == 409 and _telemt_error_code(payload) == "reload_in_progress":
-            await asyncio.sleep(1.0)
-            continue
-        break
-    _LOG.warning("telemt MTProto upsert failed for user %s: %s", username, _telemt_api_error(payload))
+            return True
+        if status is None:
+            return False
+        await asyncio.sleep(0.5)
     return False
+
+
+async def _telemt_mtproto_reload(entry):
+    status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "POST", "/v1/system/reload")
+    return status in (200, 202) and bool(payload.get("ok"))
 
 
 async def _telemt_mtproto_wait_live(entry, username, timeout=10.0):
@@ -1795,12 +1788,9 @@ async def telemt_mtproto_upsert_user(uid, secret_hex, variant="dd", domain="www.
     if not _valid_secret_hex(secret_hex):
         _LOG.warning("telemt MTProto upsert refused for uid %s: secret must be 32 hex characters", uid)
         return False
-    body = {"secret": secret_hex.lower()}
     try:
-        if max_conns and int(max_conns) > 0:
-            body["max_tcp_conns"] = int(max_conns)
-        if limit_bytes and int(limit_bytes) > 0:
-            body["data_quota_bytes"] = int(limit_bytes)
+        int(max_conns or 0)
+        int(limit_bytes or 0)
     except (TypeError, ValueError):
         return False
     expires_text = None
@@ -1808,7 +1798,6 @@ async def telemt_mtproto_upsert_user(uid, secret_hex, variant="dd", domain="www.
         expires_text = _rfc3339(expires_at)
         if expires_text is None:
             return False
-        body["expiration_rfc3339"] = expires_text
     username = _telemt_username(uid)
     async with _telemt_lock("mtproto-upsert"):
         _TELEMT_MTPROTO_USERS[username] = {"uid": str(uid), "secret_hex": secret_hex.lower(), "max_conns": int(max_conns or 0), "limit_bytes": int(limit_bytes or 0), "expires_at": expires_text}
@@ -1823,9 +1812,12 @@ async def telemt_mtproto_upsert_user(uid, secret_hex, variant="dd", domain="www.
             _write_mtproto_config(entry)
         except OSError:
             pass
-        if await _telemt_mtproto_upsert_api(entry, username, body):
-            return await _telemt_mtproto_wait_live(entry, username)
-        _LOG.warning("telemt MTProto API upsert failed for user %s; restarting the MTProto child so the user is live from its config", username)
+        if await _telemt_mtproto_wait_live(entry, username, timeout=12.0):
+            return True
+        await _telemt_mtproto_reload(entry)
+        if await _telemt_mtproto_wait_live(entry, username, timeout=8.0):
+            return True
+        _LOG.warning("telemt MTProto user %s did not go live from the config; restarting the MTProto child so the user is live from its config", username)
         if not await _restart_mtproto_entry(entry):
             return False
         return await _telemt_mtproto_wait_live(_TELEMT_MTPROTO, username)
@@ -1843,27 +1835,18 @@ async def telemt_mtproto_remove_user(uid):
         except OSError:
             pass
         if not entry.get("ready"):
-            return await _restart_mtproto_entry(entry)
-        path = "/v1/users/" + _url_path_quote(username, safe="")
-        status, payload = None, {}
-        for attempt in range(5):
-            status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "DELETE", path)
-            if status in (200, 202) and payload.get("ok"):
-                return True
-            if status == 404:
-                return True
-            if status == 409:
-                if _telemt_error_code(payload) == "reload_in_progress":
-                    await asyncio.sleep(1.0)
-                    continue
-                status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "POST", path + "/disable")
-                if status in (200, 202) and payload.get("ok"):
-                    _LOG.warning("telemt refused to delete the last MTProto user %s; disabled it instead", uid)
-                    return True
+            if not await _restart_mtproto_entry(entry):
                 return False
-            break
-        _LOG.warning("telemt MTProto remove failed for user %s: %s; restarting the MTProto child so the user is gone from its config", uid, _telemt_api_error(payload))
-        return await _restart_mtproto_entry(entry)
+            return await _telemt_mtproto_wait_user_gone(_TELEMT_MTPROTO, username, timeout=10.0)
+        if await _telemt_mtproto_wait_user_gone(entry, username, timeout=12.0):
+            return True
+        await _telemt_mtproto_reload(entry)
+        if await _telemt_mtproto_wait_user_gone(entry, username, timeout=8.0):
+            return True
+        _LOG.warning("telemt MTProto user %s did not go away from the config; restarting the MTProto child so the user is gone from its config", uid)
+        if not await _restart_mtproto_entry(entry):
+            return False
+        return await _telemt_mtproto_wait_user_gone(_TELEMT_MTPROTO, username, timeout=10.0)
 
 
 async def telemt_mtproto_user_stats(uid):
@@ -1882,7 +1865,7 @@ async def telemt_mtproto_user_stats(uid):
         return {}
 
 
-async def telemt_start_web(uid, token, secret_hex, host, max_sessions=8, max_streams=512, public_ip=None, root_enabled=False):
+async def telemt_start_web(uid, token, secret_hex, host, max_sessions=8, max_streams=512, public_ip=None, root_enabled=False, profiles=None):
     key = str(uid)
     if not telemt_available():
         return {"enabled": False, "port": 0, "api_port": 0, "error": "telemt binary not found at " + _telemt_binary()}
@@ -1899,6 +1882,20 @@ async def telemt_start_web(uid, token, secret_hex, host, max_sessions=8, max_str
         return {"enabled": False, "port": 0, "api_port": 0, "error": "max_sessions and max_streams must be integers"}
     if max_sessions <= 0 or max_streams <= 0:
         return {"enabled": False, "port": 0, "api_port": 0, "error": "max_sessions and max_streams must be positive"}
+    wanted_profiles = None
+    if profiles:
+        wanted_profiles = []
+        for item in sorted(profiles, key=lambda entry: str(entry.get("uid") or "")):
+            item_secret = str(item.get("secret_hex") or "").lower()
+            if not _valid_secret_hex(item_secret):
+                return {"enabled": False, "port": 0, "api_port": 0, "error": "WEB secret for uid " + str(item.get("uid") or "") + " is invalid: WEB secret must be 32 hex characters"}
+            item_sessions = int(item.get("max_sessions") or 0)
+            if item_sessions <= 0:
+                item_sessions = 8
+            item_streams = int(item.get("max_streams") or 0)
+            if item_streams <= 0:
+                item_streams = 512
+            wanted_profiles.append({"uid": str(item.get("uid") or ""), "secret_hex": item_secret, "max_sessions": item_sessions, "max_streams": item_streams})
     host = str(host).strip().lower()
     if public_ip is not None:
         resolved_ip = str(public_ip).strip()
@@ -1917,7 +1914,7 @@ async def telemt_start_web(uid, token, secret_hex, host, max_sessions=8, max_str
         entry = _TELEMT_WEB.get(key)
         if entry is not None and entry.get("proc") is not None and entry["proc"].returncode is None and entry.get("ready"):
             fields = entry["fields"]
-            if fields.get("web_token") == token and fields.get("secret_hex") == secret_hex.lower() and fields.get("host") == host and fields.get("public_ip") == resolved_ip and fields.get("max_sessions") == max_sessions and fields.get("max_streams") == max_streams and bool(fields.get("root_enabled")) == bool(root_enabled):
+            if fields.get("web_token") == token and fields.get("secret_hex") == secret_hex.lower() and fields.get("host") == host and fields.get("public_ip") == resolved_ip and fields.get("max_sessions") == max_sessions and fields.get("max_streams") == max_streams and bool(fields.get("root_enabled")) == bool(root_enabled) and fields.get("profiles") == wanted_profiles:
                 return {"enabled": True, "port": entry["port"], "api_port": entry["api_port"], "error": ""}
         if entry is not None:
             await _stop_entry(entry)
@@ -1929,7 +1926,7 @@ async def telemt_start_web(uid, token, secret_hex, host, max_sessions=8, max_str
         port = _free_loopback_port()
         api_port = _free_loopback_port()
         bearer = _random_bearer()
-        fields = {"uid": key, "web_token": token, "secret_hex": secret_hex.lower(), "host": host, "public_ip": resolved_ip, "max_sessions": max_sessions, "max_streams": max_streams, "root_enabled": bool(root_enabled)}
+        fields = {"uid": key, "web_token": token, "secret_hex": secret_hex.lower(), "host": host, "public_ip": resolved_ip, "max_sessions": max_sessions, "max_streams": max_streams, "root_enabled": bool(root_enabled), "profiles": wanted_profiles}
         entry = _new_telemt_entry("web", key, run_dir, config_path, port, api_port, bearer)
         entry["fields"] = fields
         _TELEMT_WEB[key] = entry
@@ -2104,6 +2101,202 @@ async def telemt_web_set_root(uid, enabled):
         return await _web_restart_with_root(key, bool(enabled))
 
 
+def _web_profile_row(item):
+    return {"user": _telemt_username(str(item.get("uid") or "")), "secret_mode": "dd", "max_sessions": int(item.get("max_sessions") or 8), "max_streams": int(item.get("max_streams") or 512), "max_streams_per_session": 64}
+
+
+async def _telemt_web_upsert_api(entry, username, body):
+    path = "/v1/users/" + _url_path_quote(username, safe="")
+    status, payload = None, {}
+    for attempt in range(5):
+        status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "GET", path)
+        if status == 200 and payload.get("ok"):
+            status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "PATCH", path, body)
+            if status == 409 and _telemt_error_code(payload) == "reload_in_progress":
+                await asyncio.sleep(1.0)
+                continue
+            return status in (200, 202) and bool(payload.get("ok"))
+        if status == 404:
+            create = {"username": username}
+            create.update(body)
+            status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "POST", "/v1/users", create)
+            if status == 409 and _telemt_error_code(payload) == "reload_in_progress":
+                await asyncio.sleep(1.0)
+                continue
+            return status in (200, 201, 202) and bool(payload.get("ok"))
+        if status == 409 and _telemt_error_code(payload) == "reload_in_progress":
+            await asyncio.sleep(1.0)
+            continue
+        break
+    _LOG.warning("telemt WEB upsert failed for user %s: %s", username, _telemt_api_error(payload))
+    return False
+
+
+async def _telemt_web_wait_live(entry, username, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "GET", "/v1/users/" + _url_path_quote(username, safe=""))
+        if status is None:
+            return False
+        if status == 404:
+            return False
+        if status == 200 and payload.get("ok"):
+            data = payload.get("data") or {}
+            if data.get("in_runtime", True):
+                return True
+        await asyncio.sleep(0.5)
+    return False
+
+
+async def _web_patch_vhosts(entry, new_vhosts):
+    patched = False
+    patch_ok = False
+    status, payload = None, {}
+    for attempt in range(5):
+        status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "PATCH", "/v1/config?reload=instant", {"web": {"vhosts": new_vhosts}})
+        if status == 200 and payload.get("ok"):
+            patched = True
+            patch_ok = True
+            break
+        if status == 202 and payload.get("ok"):
+            patched = True
+            break
+        if status == 409 and _telemt_error_code(payload) in ("reload_in_progress", "runtime_conflict"):
+            await asyncio.sleep(1.0)
+            continue
+        break
+    if not patched:
+        entry["root_error"] = "telemt WEB vhost PATCH failed: " + _telemt_api_error(payload)
+        _LOG.warning("telemt WEB vhost PATCH failed for uid %s: %s", entry["key"], _telemt_api_error(payload))
+        return False
+    if patch_ok:
+        entry["root_error"] = ""
+        return True
+    reload_id = None
+    try:
+        reload_id = ((payload.get("data") or {}).get("reload") or {}).get("reload_id")
+    except (AttributeError, TypeError):
+        reload_id = None
+    if reload_id is None:
+        entry["root_error"] = "telemt WEB vhost PATCH failed: reload id missing"
+        _LOG.warning("telemt WEB vhost PATCH failed for uid %s: reload id missing", entry["key"])
+        return False
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline:
+        status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "GET", "/v1/system/reload/" + str(reload_id))
+        if status == 200 and payload.get("ok"):
+            state = (payload.get("data") or {}).get("state")
+            if state == "succeeded":
+                entry["root_error"] = ""
+                return True
+            if state == "failed":
+                policy = (payload.get("data") or {}).get("failure_policy") or ""
+                if policy == "keep_new":
+                    entry["root_error"] = ""
+                    return True
+                entry["root_error"] = "telemt WEB vhost reload " + str(state) + ": " + _telemt_api_error(payload)
+                _LOG.warning("telemt WEB vhost reload %s for uid %s: %s", state, entry["key"], _telemt_api_error(payload))
+                return False
+            if state == "rolled_back":
+                entry["root_error"] = "telemt WEB vhost reload " + str(state) + ": " + _telemt_api_error(payload)
+                _LOG.warning("telemt WEB vhost reload %s for uid %s: %s", state, entry["key"], _telemt_api_error(payload))
+                return False
+        await asyncio.sleep(0.5)
+    entry["root_error"] = "telemt WEB vhost reload timed out after 30s (reload stayed in preparing state)"
+    _LOG.warning("telemt WEB vhost reload timed out for uid %s", entry["key"])
+    return False
+
+
+async def telemt_web_sync_profiles(uid, profiles, host):
+    key = str(uid)
+    entry = _TELEMT_WEB.get(key)
+    if entry is None:
+        return False
+    async with _telemt_lock("web:" + key):
+        entry = _TELEMT_WEB.get(key)
+        if entry is None or not entry.get("ready"):
+            entry["root_error"] = "telemt WEB child is not ready yet, shared profiles cannot be synced" if entry is not None else "no telemt WEB child for uid " + key
+            return False
+        wanted = []
+        for item in sorted(profiles or [], key=lambda row: str(row.get("uid") or "")):
+            item_secret = str(item.get("secret_hex") or "").lower()
+            if not _valid_secret_hex(item_secret):
+                entry["root_error"] = "WEB secret for uid " + str(item.get("uid") or "") + " is invalid: WEB secret must be 32 hex characters"
+                return False
+            item_sessions = int(item.get("max_sessions") or 0)
+            if item_sessions <= 0:
+                item_sessions = 8
+            item_streams = int(item.get("max_streams") or 0)
+            if item_streams <= 0:
+                item_streams = 512
+            wanted.append({"uid": str(item.get("uid") or ""), "secret_hex": item_secret, "max_sessions": item_sessions, "max_streams": item_streams})
+        wanted_users = {}
+        for item in wanted:
+            wanted_users[_telemt_username(item["uid"])] = item
+        for username in sorted(wanted_users):
+            item = wanted_users[username]
+            if not await _telemt_web_upsert_api(entry, username, {"secret": item["secret_hex"]}):
+                return False
+        status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "GET", "/v1/config")
+        if status != 200 or not payload.get("ok"):
+            entry["root_error"] = "telemt config read failed: " + _telemt_api_error(payload)
+            _LOG.warning("telemt WEB profile sync aborted for uid %s: config read failed: %s", entry["key"], _telemt_api_error(payload))
+            return False
+        try:
+            vhosts = list(((payload.get("data") or {}).get("web") or {}).get("vhosts") or [])
+        except (AttributeError, TypeError):
+            entry["root_error"] = "telemt config has no web vhosts"
+            _LOG.warning("telemt WEB profile sync aborted for uid %s: config has no web vhosts", entry["key"])
+            return False
+        fields = entry["fields"]
+        current_users = set()
+        new_vhosts = []
+        replaced = False
+        for vhost in vhosts:
+            if isinstance(vhost, dict) and str(vhost.get("host", "")).lower() == str(host).strip().lower():
+                for row in vhost.get("profiles") or []:
+                    if isinstance(row, dict) and row.get("user"):
+                        current_users.add(str(row.get("user")))
+                item = dict(vhost)
+                item["base_path"] = ""
+                item["profiles"] = [_web_profile_row(row) for row in wanted]
+                new_vhosts.append(item)
+                replaced = True
+            else:
+                new_vhosts.append(vhost)
+        if not replaced:
+            new_vhosts.append(_web_root_vhost(fields, True, profiles=wanted))
+        if not await _web_patch_vhosts(entry, new_vhosts):
+            return False
+        for stale_user in sorted(current_users - set(wanted_users)):
+            try:
+                await _telemt_api_async(entry["api_port"], entry["token"], "DELETE", "/v1/users/" + _url_path_quote(stale_user, safe=""))
+            except Exception:
+                pass
+        for username in sorted(wanted_users):
+            if not await _telemt_web_wait_live(entry, username):
+                entry["root_error"] = "telemt WEB user " + username + " did not become live after the profile sync"
+                return False
+        status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "GET", "/v1/config")
+        if status == 200 and payload.get("ok"):
+            try:
+                live_vhosts = list(((payload.get("data") or {}).get("web") or {}).get("vhosts") or [])
+            except (AttributeError, TypeError):
+                live_vhosts = []
+            live_users = set()
+            for vhost in live_vhosts:
+                if isinstance(vhost, dict) and str(vhost.get("host", "")).lower() == str(host).strip().lower():
+                    for row in vhost.get("profiles") or []:
+                        if isinstance(row, dict) and row.get("user"):
+                            live_users.add(str(row.get("user")))
+            if live_users != set(wanted_users):
+                entry["root_error"] = "telemt WEB profile sync verification failed: live profiles are " + ",".join(sorted(live_users)) + " instead of " + ",".join(sorted(wanted_users))
+                return False
+        fields["profiles"] = wanted
+        entry["root_error"] = ""
+        return True
+
+
 async def telemt_web_status(uid):
     key = str(uid)
     entry = _TELEMT_WEB.get(key)
@@ -2149,12 +2342,19 @@ async def telemt_health():
     error = ""
     if not available:
         error = "telemt binary not found at " + _telemt_binary()
-    mtproto = {"enabled": False, "port": 0, "api_port": 0, "error": error or "telemt MTProto child is not running", "healthy": False}
+    mtproto = {"enabled": False, "port": 0, "api_port": 0, "error": error or "telemt MTProto child is not running", "healthy": False, "users_live": 0, "users_total": len(_TELEMT_MTPROTO_USERS)}
     entry = _TELEMT_MTPROTO
     if entry is not None and entry.get("proc") is not None and entry["proc"].returncode is None:
         status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "GET", "/v1/health", timeout=5.0)
         healthy = status == 200 and bool(payload.get("ok"))
-        mtproto = {"enabled": True, "port": entry["port"], "api_port": entry["api_port"], "error": "" if healthy else (entry.get("error") or "telemt MTProto API did not answer"), "healthy": healthy}
+        mtproto = {"enabled": True, "port": entry["port"], "api_port": entry["api_port"], "error": "" if healthy else (entry.get("error") or "telemt MTProto API did not answer"), "healthy": healthy, "users_live": 0, "users_total": len(_TELEMT_MTPROTO_USERS)}
+        if healthy:
+            live = 0
+            for username in list(_TELEMT_MTPROTO_USERS):
+                user_status, user_payload = await _telemt_api_async(entry["api_port"], entry["token"], "GET", "/v1/users/" + _url_path_quote(username, safe=""), timeout=2.0)
+                if user_status == 200 and (user_payload.get("data") or {}).get("in_runtime"):
+                    live += 1
+            mtproto["users_live"] = live
     elif entry is not None and entry.get("error"):
         mtproto["error"] = entry["error"]
     web = {}
