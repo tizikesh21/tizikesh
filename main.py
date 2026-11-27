@@ -16,7 +16,7 @@ import ipaddress
 import socket
 import uuid as uuid_lib
 from datetime import UTC, datetime, timedelta
-from urllib.parse import quote, unquote, urljoin, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin, urlparse
 try:
     from cryptography.fernet import Fernet
 except ImportError:
@@ -125,7 +125,6 @@ SINGLE_PORT_HOST = not SOCKS_PORT and not TG_PROXY_PORT and not HTTP_PROXY_PORT
 WEBPROXY_STATE = {"configure_error": "", "startup_lane_check": {"ok": False, "detail": "not run yet"}, "child_errors": {}}
 _WEB_BASE_SECRET_HEX = ""
 _WEB_BASE_SECRET_SOURCE = ""
-_TELEMT_WEB_HOSTS = {}
 TELEMT_HEALTH = {"available": False, "mtproto": False, "web": False, "error": ""}
 _TELEMT_WEB_STATUS_CACHE = {}
 _TELEMT_PROVISIONED = {"web": set(), "mtproto": set()}
@@ -226,18 +225,10 @@ async def _ensure_web_base_secret():
         return _WEB_BASE_SECRET_HEX
 
 
-def _web_token_secret_bytes(token):
+def _web_legacy_token_secret_bytes(token):
     base = _web_base_secret_bytes()
     material = hashlib.sha256(b"proxygosha-web-token-secret-v1\n" + base + b"\n" + str(token).strip().lower().encode("ascii")).digest()
     return material[:16]
-
-
-def _web_token_secret_hex(token):
-    return _web_token_secret_bytes(token).hex()
-
-
-def _web_token_link_secret(token):
-    return _b64u_encode(b"\x70\xdd" + _web_token_secret_bytes(token))
 
 
 def _webproxy_validate_secret(value):
@@ -268,10 +259,29 @@ def _web_secret_bytes_for_link(link):
                 parsed = b""
             if len(parsed) == 16:
                 return parsed
-    token = str(link.get("webproxy_token") or "").strip().lower()
-    if token:
-        return _web_token_secret_bytes(token)
-    raise ValueError("WEB inbound has no token and no stored secret")
+    raise ValueError("WEB inbound has no stored secret")
+
+
+async def _web_migrate_legacy_secret(link):
+    try:
+        _web_secret_bytes_for_link(link)
+        return
+    except ValueError:
+        pass
+    token = str((link or {}).get("webproxy_token") or "").strip().lower()
+    if not token:
+        return
+    try:
+        enc = encrypt_proxy_password(_web_legacy_token_secret_bytes(token).hex())
+    except Exception:
+        return
+    if not enc:
+        return
+    try:
+        await db_execute("UPDATE links SET webproxy_secret_enc = ? WHERE uid = ?", "UPDATE links SET webproxy_secret_enc = $1 WHERE uid = $2", (enc, str(link.get("uid", ""))))
+    except Exception:
+        return
+    link["webproxy_secret_enc"] = enc
 
 
 def _web_secret_hex_for_link(link):
@@ -285,12 +295,7 @@ def _web_secret_hex_or_empty(link):
         return ""
 
 
-def _web_link_secret_for_link(link):
-    return _b64u_encode(b"\x70\xdd" + _web_secret_bytes_for_link(link))
-
-
-def _web_link_server(host, token, link=None, port=None):
-    token = str(token or "").strip().lower()
+def _web_link_use_port(link=None, port=None):
     use_port = 443
     if port is not None:
         try:
@@ -304,6 +309,18 @@ def _web_link_server(host, token, link=None, port=None):
             use_port = 443
     if not use_port:
         use_port = 443
+    return use_port
+
+
+def _web_link_secret_for_link(link, port=None):
+    if _web_link_use_port(link, port) == 443:
+        return "dd" + _web_secret_bytes_for_link(link).hex()
+    return _b64u_encode(b"\x70\xdd" + _web_secret_bytes_for_link(link))
+
+
+def _web_link_server(host, token, link=None, port=None):
+    token = str(token or "").strip().lower()
+    use_port = _web_link_use_port(link, port)
     server = str(host)
     if use_port != 443:
         server += ":" + str(use_port)
@@ -316,13 +333,12 @@ def _web_link(host, token, link=None, port=None):
     token = str(token or "").strip().lower()
     if not token:
         return ""
-    if link is not None:
-        try:
-            secret = _web_link_secret_for_link(link)
-        except ValueError:
-            return ""
-    else:
-        secret = _web_token_link_secret(token)
+    if link is None:
+        return ""
+    try:
+        secret = _web_link_secret_for_link(link, port)
+    except ValueError:
+        return ""
     return "tg://webproxy?server=" + _web_link_server(host, token, link, port) + "&secret=" + secret
 
 
@@ -330,26 +346,149 @@ def _web_link_https(host, token, link=None, port=None):
     token = str(token or "").strip().lower()
     if not token:
         return ""
-    if link is not None:
-        try:
-            secret = _web_link_secret_for_link(link)
-        except ValueError:
-            return ""
-    else:
-        secret = _web_token_link_secret(token)
+    if link is None:
+        return ""
+    try:
+        secret = _web_link_secret_for_link(link, port)
+    except ValueError:
+        return ""
     return "https://t.me/webproxy?server=" + _web_link_server(host, token, link, port) + "&secret=" + secret
 
 
-def _web_capability(host, token, link=None):
-    secret = _web_secret_bytes_for_link(link) if link is not None else _web_token_secret_bytes(token)
-    mac = hmac_mod.new(b"\xdd" + secret, ("tdesktop-web-proxy-bridge-v2\n" + str(host).strip().lower() + "\n" + str(token).strip().lower()).encode("utf-8"), hashlib.sha256).digest()
+def _web_capability_for_client_secret(host, base_path, client_secret):
+    host = str(host).strip().lower()
+    base_path = str(base_path or "").strip().lower()
+    if base_path:
+        context = "tdesktop-web-proxy-bridge-v2\n" + host + "\n" + base_path
+    else:
+        context = "tdesktop-web-proxy-bridge-v1\n" + host
+    mac = hmac_mod.new(bytes(client_secret), context.encode("utf-8"), hashlib.sha256).digest()
     return _b64u_encode(mac)
 
 
-def _web_capability_v1(host, token, link=None):
-    secret = _web_secret_bytes_for_link(link) if link is not None else _web_token_secret_bytes(token)
-    mac = hmac_mod.new(b"\xdd" + secret, ("tdesktop-web-proxy-bridge-v1\n" + str(host).strip().lower()).encode("utf-8"), hashlib.sha256).digest()
-    return _b64u_encode(mac)
+def _web_capability(host, token, link):
+    return _web_capability_for_client_secret(host, token, b"\xdd" + _web_secret_bytes_for_link(link))
+
+
+def _web_capability_v1(host, token, link):
+    return _web_capability_for_client_secret(host, "", b"\xdd" + _web_secret_bytes_for_link(link))
+
+
+def _webproxy_parse_client_link(link_text):
+    text = str(link_text or "").strip()
+    parsed_url = urlparse(text)
+    scheme = str(parsed_url.scheme or "").lower()
+    if scheme == "tg":
+        if str(parsed_url.netloc or "").lower() != "webproxy":
+            raise ValueError("link is not a tg://webproxy link")
+    elif scheme == "https":
+        if str(parsed_url.netloc or "").lower() != "t.me" or str(parsed_url.path or "").strip("/") != "webproxy":
+            raise ValueError("link is not a https://t.me/webproxy link")
+    else:
+        raise ValueError("link is not a tg://webproxy or https://t.me/webproxy link")
+    query = parse_qs(parsed_url.query, keep_blank_values=True)
+    servers = query.get("server") or []
+    secrets = query.get("secret") or []
+    if len(servers) != 1 or len(secrets) != 1 or not servers[0] or not secrets[0]:
+        raise ValueError("link must carry exactly one server and one secret parameter")
+    server = unquote(str(servers[0]))
+    secret_param = str(secrets[0])
+    if "/" in server:
+        hostport, base_path = server.split("/", 1)
+        hostport = str(hostport or "").strip().lower()
+        base_path = str(base_path or "").strip()
+        if not hostport or not base_path or "/" in base_path:
+            raise ValueError("path-form link server must be host/base with a single base segment")
+        link_port = 443
+        if ":" in hostport:
+            host, port_text = hostport.rsplit(":", 1)
+            host = str(host or "").strip().lower()
+            try:
+                link_port = int(port_text)
+            except (TypeError, ValueError):
+                raise ValueError("path-form link server port is not a number")
+            if link_port <= 0 or link_port > 65535:
+                raise ValueError("path-form link server port is out of range")
+        else:
+            host = hostport
+        try:
+            raw = base64.urlsafe_b64decode(secret_param + "=" * (-len(secret_param) % 4))
+        except Exception:
+            raise ValueError("path-form link secret is not valid unpadded base64url")
+        if len(raw) < 17 or raw[0] != 0x70:
+            raise ValueError("path-form link secret must be unpadded base64url of 0x70 followed by the client secret")
+        client_secret = raw[1:]
+        if len(client_secret) == 17 and client_secret[0] == 0xDD:
+            secret_bytes = bytes(client_secret[1:])
+        elif len(client_secret) == 16:
+            secret_bytes = bytes(client_secret)
+        else:
+            raise ValueError("path-form link client secret must be 16 bytes, optionally prefixed with 0xdd")
+        return {"host": host, "port": link_port, "base_path": base_path, "form": "path", "client_secret": bytes(client_secret), "secret_bytes": secret_bytes}
+    host = str(server or "").strip().lower()
+    if not host or ":" in host:
+        raise ValueError("root-form link server must be a bare host with no port and no path")
+    lowered = secret_param.lower()
+    if len(lowered) == 34 and lowered.startswith("dd") and all(c in "0123456789abcdef" for c in lowered[2:]):
+        secret_bytes = bytes.fromhex(lowered[2:])
+        return {"host": host, "port": 443, "base_path": "", "form": "root", "client_secret": b"\xdd" + secret_bytes, "secret_bytes": secret_bytes}
+    if len(lowered) == 32 and all(c in "0123456789abcdef" for c in lowered):
+        secret_bytes = bytes.fromhex(lowered)
+        return {"host": host, "port": 443, "base_path": "", "form": "root", "client_secret": secret_bytes, "secret_bytes": secret_bytes}
+    raise ValueError("root-form link secret must be 32 hex characters, optionally prefixed with dd")
+
+
+def _webproxy_capability_for_parsed(parsed):
+    return _web_capability_for_client_secret(parsed["host"], parsed["base_path"], parsed["client_secret"])
+
+
+def _webproxy_assert_emitted_link(link_text, host, port, token):
+    parsed = _webproxy_parse_client_link(link_text)
+    expected_host = str(host or "").strip().lower()
+    if parsed["host"] != expected_host:
+        raise ValueError("emitted link server host is " + parsed["host"] + " instead of " + expected_host)
+    use_port = int(port or 443)
+    if use_port == 443:
+        if parsed["form"] != "root" or parsed["base_path"] != "":
+            raise ValueError("a port 443 link must be the bare-domain root form with a dd-prefixed hex secret")
+        if len(parsed["client_secret"]) != 17 or parsed["client_secret"][0] != 0xDD:
+            raise ValueError("a port 443 root link must carry the dd-mode hex secret")
+    else:
+        if parsed["form"] != "path":
+            raise ValueError("a non-443 link must be the token-path form with a marked base64url secret")
+        if int(parsed.get("port") or 443) != use_port:
+            raise ValueError("token-path link server port does not match this inbound port")
+        if parsed["base_path"] != str(token or "").strip().lower():
+            raise ValueError("token-path link base does not match this inbound token")
+        if len(parsed["client_secret"]) != 17 or parsed["client_secret"][0] != 0xDD:
+            raise ValueError("a token-path link must carry the dd-mode marked secret")
+    return parsed
+
+
+def _web_rewrite_bridge_query(query, capability):
+    params = parse_qs(query.decode("latin-1"), keep_blank_values=True)
+    replaced = False
+    for key in ("bridge", "capability", "cap"):
+        if key in params:
+            params[key] = [capability]
+            replaced = True
+    if not replaced:
+        return query
+    return urlencode(params, doseq=True).encode("latin-1")
+
+
+def _web_verify_token_bridge(request, token, link):
+    capability = request.query_params.get("bridge", "") or request.query_params.get("capability", "") or request.query_params.get("cap", "") or request.headers.get("x-tgweb-capability", "")
+    if not capability:
+        return None
+    host = get_domain(request)
+    try:
+        expected_v2 = _web_capability(host, token, link)
+    except ValueError:
+        return False
+    if not hmac_mod.compare_digest(capability, expected_v2):
+        return False
+    return _web_capability_v1(host, token, link)
 
 
 def _gen_proxy_code(n=12):
@@ -469,21 +608,28 @@ def _telemt_web_sessions_value(status):
     return 0
 
 
-async def _telemt_refresh_web_status(uid=None):
-    targets = []
-    if uid:
-        link = LINKS.get(uid)
-        if link is not None and (link.get("protocol") or "") == "webproxy":
-            targets = [link]
-    else:
-        targets = [l for l in LINKS.values() if (l.get("protocol") or "") == "webproxy" and l.get("active")]
-    for link in targets:
-        try:
-            status = await _tg_call("telemt_web_status", link.get("uid", ""))
-        except Exception:
-            status = None
-        if isinstance(status, dict):
-            _TELEMT_WEB_STATUS_CACHE[link.get("uid", "")] = (status, time.monotonic())
+async def _telemt_refresh_web_status():
+    try:
+        status = await _tg_call("telemt_web_status", _TELEMT_ROOT_CHILD_UID)
+    except Exception:
+        status = None
+    if isinstance(status, dict):
+        _TELEMT_WEB_STATUS_CACHE[_TELEMT_ROOT_CHILD_UID] = (status, time.monotonic())
+
+
+def _web_sessions_for_uid(uid):
+    status = _telemt_web_status_cached(_TELEMT_ROOT_CHILD_UID)
+    rows = _telemt_web_sessions_value(status)
+    if isinstance(rows, int):
+        active = [l for l in LINKS.values() if (l.get("protocol") or "") == "webproxy" and l.get("active")]
+        return rows if len(active) == 1 else 0
+    if not isinstance(rows, list):
+        return []
+    username_fn = _tg_fn("telemt_web_username")
+    username = str(username_fn(uid)) if username_fn is not None else ""
+    if not username:
+        return []
+    return [row for row in rows if isinstance(row, dict) and str(row.get("user") or "") == username]
 
 
 async def _telemt_root_child_is_rooted():
@@ -597,31 +743,47 @@ async def _telemt_sync_root_vhost():
         logger.error("telemt shared WEB child failed: " + err)
 
 
-async def _telemt_provision_web(link):
-    await _ensure_web_base_secret()
-    uid = str(link.get("uid", ""))
-    token = str(link.get("webproxy_token") or "").strip().lower()
-    if not token:
-        raise ValueError("WEB inbound has no token")
-    secret_hex = _web_secret_hex_for_link(link)
-    host = get_domain()
-    public_ip = None
+def _telemt_valid_tls_host(host):
+    if not isinstance(host, str):
+        return False
+    text = host.strip().lower()
+    if not text or text.startswith((".", "-")) or text.endswith((".", "-")) or ".." in text:
+        return False
+    for ch in text:
+        if ch.isspace() or ch in ("/", "\\"):
+            return False
     try:
-        resolved = await resolve_domain_to_ip(host)
-        if resolved:
-            public_ip = resolved
-    except Exception:
-        public_ip = None
-    max_sessions = int(link.get("max_connections") or 0)
-    if max_sessions <= 0:
-        max_sessions = 8
-    result = await _tg_call("telemt_start_web", uid, token, secret_hex, host, max_sessions=max_sessions, max_streams=512, public_ip=public_ip)
-    if isinstance(result, dict) and not result.get("enabled"):
-        raise ValueError(str(result.get("error") or "telemt WEB child did not start"))
-    if result is None and _tg_fn("telemt_start_web") is None:
-        raise ValueError("telemt WEB start is not available in the telegram module")
-    _TELEMT_PROVISIONED["web"].add(uid)
-    _TELEMT_WEB_HOSTS[uid] = host
+        parsed = urlparse("https://" + text + "/")
+    except ValueError:
+        return False
+    return bool(parsed.hostname)
+
+
+def _telemt_mtproto_default_domain(request=None):
+    host = get_domain(request)
+    if not isinstance(host, str):
+        return "www.google.com"
+    host = host.strip().lower()
+    if not host or host == "localhost":
+        return "www.google.com"
+    if _telemt_valid_tls_host(host):
+        return host
+    return "www.google.com"
+
+
+def _telemt_mtproto_tls_wanted(rows=None):
+    primary = _telemt_mtproto_default_domain()
+    extras = {"www.google.com"}
+    if rows is None:
+        rows = list(LINKS.values())
+    for link in rows:
+        if (link.get("protocol") or "") != "mtproto" or not link.get("active"):
+            continue
+        dom = str(link.get("mtproto_domain") or "").strip().lower()
+        if _telemt_valid_tls_host(dom):
+            extras.add(dom)
+    extras.discard(primary)
+    return primary, sorted(extras)
 
 
 async def _telemt_provision_mtproto(link):
@@ -639,23 +801,13 @@ async def _telemt_provision_mtproto(link):
     max_conns = int(link.get("max_connections") or 0)
     limit_bytes = int(link.get("limit_bytes") or 0)
     expires_at = link.get("expires_at") or None
-    result = await _tg_call("telemt_mtproto_upsert_user", uid, secret_hex, variant=variant, domain=domain, max_conns=max_conns, limit_bytes=limit_bytes, expires_at=expires_at)
+    tls_primary, tls_extras = _telemt_mtproto_tls_wanted()
+    result = await _tg_call("telemt_mtproto_upsert_user", uid, secret_hex, variant=variant, domain=domain, max_conns=max_conns, limit_bytes=limit_bytes, expires_at=expires_at, tls_domain=tls_primary, tls_domains=tls_extras)
     if result is False:
         raise ValueError("telemt MTProto user provisioning was rejected")
     if result is None and _tg_fn("telemt_mtproto_upsert_user") is None:
         raise ValueError("telemt MTProto provisioning is not available in the telegram module")
     _TELEMT_PROVISIONED["mtproto"].add(uid)
-
-
-async def _telemt_remove_web(uid):
-    uid = str(uid or "")
-    try:
-        await _tg_call("telemt_stop_web", uid)
-    except Exception:
-        pass
-    _TELEMT_PROVISIONED["web"].discard(uid)
-    _TELEMT_WEB_HOSTS.pop(uid, None)
-    _TELEMT_WEB_STATUS_CACHE.pop(uid, None)
 
 
 async def _telemt_remove_mtproto(uid):
@@ -677,16 +829,14 @@ async def _telemt_sync_link(link, previous=None):
     now_active = bool(link.get("active"))
     if prev_protocol and prev_protocol != protocol:
         if prev_protocol == "webproxy":
-            await _telemt_remove_web(uid)
+            await _telemt_sync_root_vhost()
         elif prev_protocol == "mtproto":
             await _telemt_remove_mtproto(uid)
         previous = None
         prev_active = None
     if not now_active:
         if prev_active or previous is None:
-            if protocol == "webproxy":
-                await _telemt_remove_web(uid)
-            elif protocol == "mtproto":
+            if protocol == "mtproto":
                 await _telemt_remove_mtproto(uid)
         if protocol == "webproxy":
             await _telemt_sync_root_vhost()
@@ -701,20 +851,8 @@ async def _telemt_sync_link(link, previous=None):
             if str((previous or {}).get(key) or "") != str(link.get(key) or ""):
                 changed = True
                 break
-    if protocol == "webproxy" and uid in _TELEMT_WEB_HOSTS and _TELEMT_WEB_HOSTS.get(uid) != get_domain():
-        changed = True
     if protocol == "webproxy":
-        provisioned = uid in _TELEMT_PROVISIONED["web"] and _telemt_web_port_for_uid(uid) is not None
-        if changed or not provisioned:
-            try:
-                if provisioned:
-                    await _telemt_remove_web(uid)
-                await _telemt_provision_web(link)
-            except Exception as exc:
-                WEBPROXY_STATE["child_errors"][uid] = str(exc)
-                logger.error("telemt WEB provisioning failed for " + uid + ": " + str(exc))
-            else:
-                WEBPROXY_STATE["child_errors"].pop(uid, None)
+        await _web_migrate_legacy_secret(link)
         await _telemt_sync_root_vhost()
     elif protocol == "mtproto":
         provisioned = uid in _TELEMT_PROVISIONED["mtproto"]
@@ -828,7 +966,11 @@ def validate_patch_protocol_fields(link, body):
         _raw_secret = str(body.pop("webproxy_secret") or "").strip()
         if _raw_secret:
             if _patch_effective_proto == "webproxy":
-                body["webproxy_secret_enc"] = encrypt_proxy_password(_webproxy_validate_secret(_raw_secret))
+                _patch_secret_hex = _webproxy_validate_secret(_raw_secret)
+                _secret_conflict = _webproxy_secret_conflict(_patch_secret_hex, str(link.get("uid", "")))
+                if _secret_conflict is not None:
+                    raise HTTPException(status_code=400, detail="WEB proxy secret is already used by inbound '" + str(_secret_conflict.get("label", "")) + "' (" + str(_secret_conflict.get("uid", "")) + "). Each WEB proxy inbound needs its own secret: telemt rejects a vhost where two profiles share one client capability.")
+                body["webproxy_secret_enc"] = encrypt_proxy_password(_patch_secret_hex)
     validate_transport_fields(body)
     protocol = body.get("protocol") or link.get("protocol", "")
     if protocol not in VALID_PROTOCOLS:
@@ -1259,9 +1401,9 @@ def get_inbound_definitions():
         {"tag": "ws-random-in", "type": "websocket", "path": "/{random}/ws/{uuid}", "protocols": ["vless-ws", "vmess-ws", "trojan-ws", "ss-ws"], "port": "PORT env", "tls": "terminated by platform"},
         {"tag": "ws-custom-in", "type": "websocket", "path": "link custom_path, {uid} replaced with the link UUID", "protocols": ["vless-ws", "vmess-ws", "trojan-ws", "ss-ws"], "port": "PORT env", "tls": "terminated by platform", "note": "served by the catch-all WS route, path must match the link custom_path exactly, one leading random segment allowed when random_path is on"},
         {"tag": "xhttp-in", "type": "xhttp", "path": "/xhttp/{session}", "protocols": ["xhttp-packet-up", "xhttp-stream-up", "xhttp-stream-one", "xhttp-auto"], "port": "PORT env", "tls": "terminated by platform"},
-        {"tag": "socks5-in", "type": "socks5", "path": "Shared multiplexer listener on the inbound port (default 1080); the same port can also serve WebSocket, WEB proxy and the panel through the multiplexer front door", "protocols": ["socks5"], "port": "per-inbound, default 1080, may be shared with other SOCKS5, HTTP and MTProto inbounds", "tls": "none, username/password auth per link uid", "note": "SOCKS5, raw TCP listener, TCP CONNECT only, general-purpose relay to any TCP destination, authenticated, no UDP associate. Several inbounds may share one port: the multiplexer routes by protocol and by login, so each SOCKS5 or HTTP inbound needs its own username. Cannot be exposed on single-port PaaS (Cloady/Render expose one HTTPS port only); needs a VPS or Railway TCP Proxy."},
+        {"tag": "socks5-in", "type": "socks5", "path": "Shared multiplexer listener on the inbound port (default 1080); the same port can also serve WebSocket, WEB proxy and the panel through the multiplexer front door", "protocols": ["socks5"], "port": "per-inbound, default 1080, may be shared with other SOCKS5, HTTP and MTProto inbounds", "tls": "none, username/password auth per link uid", "note": "SOCKS5, raw TCP listener, general-purpose relay to any TCP destination, authenticated, plus UDP associate (RFC 1928) for UDP traffic such as voice/video calls. Several inbounds may share one port: the multiplexer routes by protocol and by login, so each SOCKS5 or HTTP inbound needs its own username. Cannot be exposed on single-port PaaS (Cloady/Render expose one HTTPS port only); TCP needs a VPS or Railway TCP Proxy, UDP associate needs a VPS with a published UDP port (a TCP Proxy cannot carry UDP)."},
         {"tag": "mtproxy-in", "type": "mtproxy", "path": "Shared multiplexer listener on the inbound port (default 8443); the same port can also serve WebSocket, WEB proxy and the panel through the multiplexer front door", "protocols": ["mtproto"], "port": "per-inbound, default 8443, may be shared with other SOCKS5, HTTP and MTProto inbounds", "tls": "obfuscated2 / fake-tls", "note": "Telegram MTProto proxy, raw TCP listener, per-link secret derived from the panel secret, variants plain / dd / fake-TLS. Several inbounds may share one port: the multiplexer routes each connection by its secret to the shared telemt child. Cannot be exposed on single-port PaaS (Cloady/Render expose one HTTPS port only); needs a VPS or Railway TCP Proxy."},
-        {"tag": "http-proxy-in", "type": "http-proxy", "path": "Shared multiplexer listener on the inbound port (default 3128); the same port can also serve WebSocket, WEB proxy and the panel through the multiplexer front door", "protocols": ["http-proxy"], "port": "per-inbound, default 3128, may be shared with other SOCKS5, HTTP and MTProto inbounds", "tls": "none, Basic auth per link uid, CONNECT only", "note": "HTTP CONNECT proxy, raw TCP listener, general-purpose relay to any TCP destination, authenticated. Several inbounds may share one port: the multiplexer routes by protocol and by login, so each SOCKS5 or HTTP inbound needs its own username. Cannot be exposed on single-port PaaS (Cloady/Render expose one HTTPS port only); needs a VPS or Railway TCP Proxy."},
+        {"tag": "http-proxy-in", "type": "http-proxy", "path": "Shared multiplexer listener on the inbound port (default 3128); the same port can also serve WebSocket, WEB proxy and the panel through the multiplexer front door", "protocols": ["http-proxy"], "port": "per-inbound, default 3128, may be shared with other SOCKS5, HTTP and MTProto inbounds", "tls": "none, Basic auth per link uid, CONNECT + absolute-URI (GET http://...)", "note": "HTTP proxy, raw TCP listener, general-purpose relay to any TCP destination, authenticated, CONNECT tunnels plus absolute-URI requests. Several inbounds may share one port: the multiplexer routes by protocol and by login, so each SOCKS5 or HTTP inbound needs its own username. Cannot be exposed on single-port PaaS (Cloady/Render expose one HTTPS port only); needs a VPS or Railway TCP Proxy."},
         {"tag": "webproxy-in", "type": "webproxy", "path": "panel HTTPS port, bridge at /tgweb and at / with a valid capability", "protocols": ["webproxy"], "port": "443 public, rides the panel HTTPS port or any shared multiplexer port", "tls": "terminated by platform, per-inbound secret", "note": "Telegram WEB proxy (Direct-DC), rides the panel HTTPS port so it works on Cloady, Render and Railway. Port 443 is shared: each link uses the bare panel domain as its server and its own per-inbound secret identifies its user, so many users share 443 with different links; older token links (server with a /token path) keep working. Any other port is per-inbound: on a multiplexer port the token-routed panel serves it, otherwise the token-routed bridge serves on that port. On a single-port host only the public port 443 is reachable, so only port-443 links work there."},
     ]
 
@@ -1321,7 +1463,7 @@ def _proxy_session_count(uid):
     except Exception:
         pass
     try:
-        sessions = _telemt_web_sessions_value(_telemt_web_status_cached(uid))
+        sessions = _web_sessions_for_uid(uid)
         if isinstance(sessions, list):
             total += len(sessions)
         elif isinstance(sessions, int):
@@ -1373,7 +1515,7 @@ def _session_limit_reason(link, uuid, client_ip, exclude_conn_id=None):
                     pass
                 try:
                     for member_uid in uids:
-                        sessions = _telemt_web_sessions_value(_telemt_web_status_cached(member_uid))
+                        sessions = _web_sessions_for_uid(member_uid)
                         if isinstance(sessions, list):
                             n += len(sessions)
                         elif isinstance(sessions, int):
@@ -3077,6 +3219,19 @@ def _webproxy_token_conflict(token, exclude_uid=""):
     return None
 
 
+def _webproxy_secret_conflict(secret_hex, exclude_uid=""):
+    secret_hex = str(secret_hex or "").strip().lower()
+    if secret_hex.startswith("dd"):
+        secret_hex = secret_hex[2:]
+    if not secret_hex:
+        return None
+    for _l in LINKS.values():
+        if (_l.get("protocol") or "") == "webproxy" and str(_l.get("uid", "")) != str(exclude_uid or ""):
+            if _web_secret_hex_or_empty(_l) == secret_hex:
+                return _l
+    return None
+
+
 def _webproxy_new_token(exclude_uid=""):
     for _attempt in range(64):
         token = secrets.token_hex(6)
@@ -3278,7 +3433,20 @@ def _web_bridge_running(port):
     return task is not None and not task.done()
 
 
-def _proxy_inbound_enabled(link):
+def _web_child_healthy_cached():
+    status = _telemt_web_status_cached(_TELEMT_ROOT_CHILD_UID)
+    if not status:
+        return _TELEMT_ROOT_CHILD_UID in _TELEMT_PROVISIONED.get("web", set())
+    if status.get("error"):
+        return False
+    if status.get("enabled") and status.get("healthy") is not False:
+        return True
+    if _TELEMT_ROOT_CHILD_UID in _TELEMT_PROVISIONED.get("web", set()) and status.get("enabled"):
+        return True
+    return False
+
+
+def _proxy_listener_locally_ready(link):
     if link is None:
         return False
     protocol = link.get("protocol") or ""
@@ -3287,16 +3455,14 @@ def _proxy_inbound_enabled(link):
     if not link.get("active"):
         return False
     if protocol == "webproxy":
-        if not _proxy_listener_enabled("webproxy"):
-            return False
         try:
             port = int(link.get("port") or 443)
         except (TypeError, ValueError):
             port = 443
         if port == int(WEBPROXY_PUBLIC_PORT):
+            return _web_child_healthy_cached()
+        if _web_port_is_fronted(port):
             return True
-        if _is_single_port_host():
-            return False
         return _web_bridge_running(port)
     try:
         port = int(link.get("port") or 0)
@@ -3306,11 +3472,103 @@ def _proxy_inbound_enabled(link):
         return False
     if _PROXY_MUX_BIND_ERRORS.get(port):
         return False
-    if not _proxy_mux_bound(port):
+    return _proxy_mux_bound(port)
+
+
+def _listener_verdict_for_link(link, domain=""):
+    if link is None:
+        return ""
+    protocol = link.get("protocol") or ""
+    if protocol in PROXY_PROTOCOLS:
+        try:
+            fresh = _CARD_USABILITY and (time.monotonic() - _CARD_USABILITY_AT) < _CARD_USABILITY_TTL
+        except NameError:
+            fresh = False
+        if fresh:
+            cached_domain = str(_CARD_USABILITY.get("_domain") or "")
+            if not domain or not cached_domain or cached_domain == domain:
+                first = None
+                for row in LINKS.values():
+                    if (row.get("protocol") or "") == protocol and row.get("active"):
+                        first = row
+                        break
+                if first is not None and str(first.get("uid") or "") == str(link.get("uid") or ""):
+                    entry = _CARD_USABILITY.get(protocol)
+                    if isinstance(entry, tuple) and len(entry) >= 2:
+                        code = str(entry[1] or "")
+                        if code == "running":
+                            return "pass"
+                        if code == "local_only":
+                            return "local_only"
+                        if code == "listener_failed":
+                            return "fail"
+                        return "not_available"
+    verdict = str(link.get("last_test_verdict") or "").strip()
+    if verdict in ("pass", "local_only", "fail", "not_available"):
+        return verdict
+    return ""
+
+
+def _proxy_web_remote_ready(link):
+    try:
+        port = int(link.get("port") or 443)
+    except (TypeError, ValueError):
+        port = 443
+    if port == int(WEBPROXY_PUBLIC_PORT):
+        return True
+    if _web_port_is_fronted(port):
+        return True
+    if _is_single_port_host():
+        return False
+    return _web_bridge_running(port)
+
+
+def _proxy_remote_link_allowed(link):
+    if link is None:
+        return False
+    protocol = link.get("protocol") or ""
+    if protocol not in PROXY_PROTOCOLS:
+        return True
+    if not link.get("active"):
+        return False
+    if protocol == "webproxy":
+        return _proxy_web_remote_ready(link)
+    verdict = _listener_verdict_for_link(link)
+    if verdict == "pass":
+        return True
+    if verdict in ("local_only", "fail", "not_available"):
         return False
     if _is_single_port_host():
         return False
-    return True
+    return _proxy_listener_locally_ready(link)
+
+
+def _proxy_remote_link_disabled_reason(link):
+    if link is None:
+        return ""
+    verdict = _listener_verdict_for_link(link)
+    if verdict == "fail":
+        detail = str(link.get("last_test_detail") or "")
+        if detail:
+            return detail
+        return _proxy_inbound_disabled_reason(link)
+    return _proxy_inbound_disabled_reason(link)
+
+
+def _proxy_inbound_enabled(link):
+    if link is None:
+        return False
+    protocol = link.get("protocol") or ""
+    if protocol not in PROXY_PROTOCOLS:
+        return True
+    if not link.get("active"):
+        return False
+    verdict = _listener_verdict_for_link(link)
+    if verdict in ("pass", "local_only"):
+        return True
+    if verdict in ("fail", "not_available"):
+        return False
+    return _proxy_listener_locally_ready(link)
 
 
 def _proxy_inbound_disabled_reason(link):
@@ -3319,10 +3577,14 @@ def _proxy_inbound_disabled_reason(link):
     protocol = link.get("protocol") or ""
     if protocol not in PROXY_PROTOCOLS:
         return ""
+    if str(link.get("last_test_verdict") or "") == "fail":
+        detail = str(link.get("last_test_detail") or "")
+        if detail:
+            return detail
     if protocol == "webproxy":
-        own_err = _webproxy_child_error_for_uid(link.get("uid", ""))
+        own_err = _webproxy_child_error()
         if own_err:
-            return "WEB proxy child failed for this inbound: " + own_err
+            return "WEB proxy child failed: " + own_err
         try:
             port = int(link.get("port") or 443)
         except (TypeError, ValueError):
@@ -3361,7 +3623,12 @@ def _proxy_inbound_warning(link):
     if protocol not in PROXY_PROTOCOLS:
         return ""
     if _proxy_inbound_enabled(link):
-        return ""
+        if _proxy_remote_link_allowed(link):
+            return ""
+        reason = _proxy_remote_link_disabled_reason(link)
+        if protocol in ("socks5", "mtproto", "http-proxy"):
+            return reason + " Use the WEB proxy instead: create a Telegram WEB proxy inbound on port 443, it rides the panel HTTPS port and works on this host."
+        return reason
     reason = _proxy_inbound_disabled_reason(link)
     if protocol in ("socks5", "mtproto", "http-proxy"):
         return reason + " Use the WEB proxy instead: create a Telegram WEB proxy inbound on port 443, it rides the panel HTTPS port and works on this host."
@@ -3369,32 +3636,22 @@ def _proxy_inbound_warning(link):
 
 
 def _proxy_listener_enabled(protocol):
-    if protocol == "socks5":
-        return bool(SOCKS_PORT) and bool(TG_PROXY_STATUS.get("socks", {}).get("enabled"))
-    if protocol == "mtproto":
-        return bool(TG_PROXY_PORT) and bool(TG_PROXY_STATUS.get("mtproxy", {}).get("enabled"))
-    if protocol == "http-proxy":
-        return bool(HTTP_PROXY_PORT) and bool(TG_PROXY_STATUS.get("http", {}).get("enabled"))
-    if protocol == "webproxy":
-        return bool(TG_PROXY_STATUS.get("webproxy", {}).get("enabled"))
+    for row in LINKS.values():
+        if (row.get("protocol") or "") == protocol and row.get("active"):
+            return _proxy_inbound_enabled(row)
     return False
 
 
-def _webproxy_child_error_for_uid(uid):
+def _webproxy_child_error():
     child_errors = WEBPROXY_STATE.get("child_errors") or {}
-    if uid and str(uid) in child_errors:
-        return str(child_errors.get(str(uid)) or "")
-    return ""
+    return str(child_errors.get(_TELEMT_ROOT_CHILD_UID) or "")
 
 
 def _proxy_disabled_reason(protocol):
     if protocol == "webproxy":
-        child_errors = WEBPROXY_STATE.get("child_errors") or {}
-        if child_errors:
-            own = [str(v) for k, v in child_errors.items() if k != _TELEMT_ROOT_CHILD_UID]
-            if own:
-                return "WEB proxy child failed: " + str(own[0])
-            return "WEB proxy shared bare-domain child failed: " + str(next(iter(child_errors.values()))) + " (token links are unaffected; only bare-domain links need the shared child)"
+        root_err = _webproxy_child_error()
+        if root_err:
+            return "WEB proxy child failed: " + root_err
         err = (TG_PROXY_STATUS.get("webproxy", {}) or {}).get("error", "") or ""
         if err:
             return "WEB proxy is not configured: " + err
@@ -3458,7 +3715,7 @@ async def _card_raw_tcp_usable(pid, domain, port, uid, variant="", tls_domain=""
 async def _card_web_usable(domain):
     if tgproxy is None:
         return False, "not_configured", ""
-    if not _proxy_listener_enabled("webproxy"):
+    if not _proxy_listener_enabled("webproxy") and not _web_child_healthy_cached():
         return False, "not_configured", ""
     async with LINKS_LOCK:
         rows = list(LINKS.values())
@@ -3470,19 +3727,11 @@ async def _card_web_usable(domain):
     if link is None:
         return False, "no_inbound", ""
     uid = str(link.get("uid") or "")
-    await _telemt_refresh_web_status(uid)
-    status = _telemt_web_status_cached(uid)
-    if not status:
-        _web_healthy = uid in _TELEMT_PROVISIONED.get("web", set())
-    elif status.get("error"):
+    await _telemt_refresh_web_status()
+    status = _telemt_web_status_cached(_TELEMT_ROOT_CHILD_UID)
+    if status and status.get("error"):
         return False, "listener_failed", str(status.get("error") or "")
-    elif status.get("enabled") and status.get("healthy") is not False:
-        _web_healthy = True
-    elif uid in _TELEMT_PROVISIONED.get("web", set()) and status.get("enabled"):
-        _web_healthy = True
-    else:
-        _web_healthy = False
-    if not _web_healthy:
+    if not _web_child_healthy_cached():
         return False, "listener_failed", ""
     if str(link.get("last_test_verdict") or "") == "fail":
         return False, "listener_failed", str(link.get("last_test_detail") or "the last WEB proxy test failed")
@@ -3522,7 +3771,7 @@ async def _card_usability(domain):
                 _port = int(_link.get("port") or _env_port or _default_port)
             except (TypeError, ValueError):
                 _port = int(_env_port or _default_port)
-            _on = _proxy_inbound_enabled(_link)
+            _on = _proxy_listener_locally_ready(_link)
             if not _on:
                 if not _port:
                     result[_pid] = (False, "no_port", "")
@@ -3548,6 +3797,12 @@ async def _card_usability(domain):
                 result[_cid] = (False, "listener_failed", "")
             else:
                 result[_cid] = _res
+        for _pid, _key in (("socks5", "socks"), ("mtproto", "mtproxy"), ("http-proxy", "http"), ("webproxy", "webproxy")):
+            _entry = result.get(_pid)
+            if _entry is not None:
+                _status_entry = TG_PROXY_STATUS.get(_key)
+                if _status_entry is not None:
+                    _status_entry["enabled"] = bool(_entry[0])
         _CARD_USABILITY = result
         _CARD_USABILITY_AT = time.monotonic()
         return result
@@ -3629,7 +3884,15 @@ async def _probe_raw_listener(port, protocol):
             if resp == b"\x05\x02":
                 return True, ""
             return False, "listener on 127.0.0.1:" + str(port) + " rejected the SOCKS5 greeting"
-        return True, ""
+        try:
+            writer.write(b"CONNECT 127.0.0.1:9 HTTP/1.1\r\nHost: 127.0.0.1:9\r\n\r\n")
+            await writer.drain()
+            resp = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=1.0)
+        except (asyncio.TimeoutError, asyncio.IncompleteReadError, asyncio.LimitOverrunError, ConnectionError, OSError):
+            return False, "listener on 127.0.0.1:" + str(port) + " did not answer the HTTP proxy probe, the multiplexer accepts TCP but the HTTP handler does not respond"
+        if resp.startswith(b"HTTP/1.1 407"):
+            return True, ""
+        return False, "listener on 127.0.0.1:" + str(port) + " did not answer the HTTP proxy probe with 407, got: " + resp.decode("iso-8859-1", "ignore").split("\r\n")[0]
     except (asyncio.TimeoutError, OSError):
         return False, "listener on 127.0.0.1:" + str(port) + " did not answer the probe"
     finally:
@@ -3698,9 +3961,10 @@ async def refresh_proxy_listener_status(force=False):
                 entry["ports"] = live_ports
                 entry["failed_ports"] = failed_ports
             else:
-                entry["enabled"] = bool(live_ports)
+                _status_protocol = {"socks": "socks5", "mtproxy": "mtproto", "http": "http-proxy"}.get(key, "")
+                entry["enabled"] = any(_proxy_inbound_enabled(link) for link in _status_rows if (link.get("protocol") or "") == _status_protocol and link.get("active"))
                 entry["port"] = int(live_ports[0]) if live_ports else int(ports[0])
-                entry["error"] = "" if live_ports else "; ".join(str(p) + ": " + str(e) for p, e in failed_ports.items())
+                entry["error"] = "" if entry["enabled"] else "; ".join(str(p) + ": " + str(e) for p, e in failed_ports.items())
                 entry["ports"] = live_ports
                 entry["failed_ports"] = failed_ports
             entry["verified_at"] = verified_at
@@ -3766,26 +4030,24 @@ async def refresh_proxy_listener_status(force=False):
         if web_entry.get("enabled"):
             async with LINKS_LOCK:
                 web_rows = [link for link in LINKS.values() if (link.get("protocol") or "") == "webproxy" and link.get("active")]
-            if web_rows:
-                any_healthy = False
-                own_errors = []
-                for link in web_rows:
-                    status = _telemt_web_status_cached(str(link.get("uid", "")))
-                    if status.get("enabled") and not status.get("error"):
-                        any_healthy = True
-                        break
-                    own = _webproxy_child_error_for_uid(link.get("uid", ""))
-                    if own:
-                        own_errors.append(own)
-                if not any_healthy:
-                    web_entry["enabled"] = False
-                    if own_errors:
-                        web_entry["error"] = str(own_errors[0])
-                    elif root_err:
-                        web_entry["error"] = "WEB proxy token children are not running; legacy root child also failed: " + root_err
+            if not web_rows:
+                web_entry["enabled"] = False
+                web_entry["error"] = "no WEB proxy inbound is configured"
+                TG_PROXY_STATUS["webproxy"] = web_entry
+            elif not any(_proxy_inbound_enabled(link) for link in web_rows):
+                web_entry["enabled"] = False
+                if not _web_child_healthy_cached():
+                    if root_err:
+                        web_entry["error"] = "telemt WEB child is not running for the active WEB inbound: " + root_err
                     else:
                         web_entry["error"] = "telemt WEB child is not running for the active WEB inbound"
-                    TG_PROXY_STATUS["webproxy"] = web_entry
+                else:
+                    failed = [link for link in web_rows if str(link.get("last_test_verdict") or "") == "fail"]
+                    if failed and str(failed[0].get("last_test_detail") or ""):
+                        web_entry["error"] = str(failed[0].get("last_test_detail") or "")
+                    else:
+                        web_entry["error"] = "telemt WEB child is not running for the active WEB inbound"
+                TG_PROXY_STATUS["webproxy"] = web_entry
         _invalidate_card_usability()
         _PROXY_LISTENER_PROBE_AT = time.monotonic()
         return TG_PROXY_STATUS
@@ -3798,16 +4060,12 @@ async def _telemt_retry_web_children():
         return
     async with LINKS_LOCK:
         rows = [link for link in LINKS.values() if (link.get("protocol") or "") == "webproxy" and link.get("active")]
+    if not rows:
+        return
     child_errors = WEBPROXY_STATE.get("child_errors") or {}
-    for link in rows:
-        uid = str(link.get("uid", ""))
-        needs = uid not in _TELEMT_PROVISIONED.get("web", set()) or uid in child_errors or _telemt_web_port_for_uid(uid) is None or _TELEMT_WEB_HOSTS.get(uid) != get_domain()
-        if not needs:
-            continue
-        try:
-            await _telemt_sync_link(link, previous=dict(link))
-        except Exception:
-            pass
+    needs = _TELEMT_ROOT_CHILD_UID not in _TELEMT_PROVISIONED.get("web", set()) or _TELEMT_ROOT_CHILD_UID in child_errors or _telemt_web_port_for_uid(_TELEMT_ROOT_CHILD_UID) is None
+    if not needs:
+        return
     try:
         await _telemt_sync_root_vhost()
     except Exception:
@@ -3888,6 +4146,7 @@ async def _ensure_web_bridge_port(port):
         _WEB_BRIDGE_ERRORS[port] = "WEB bridge port " + str(port) + " is the panel port, it cannot listen on its own port as well"
         return False
     probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         probe.bind(("0.0.0.0", port))
     except OSError as exc:
@@ -4096,6 +4355,16 @@ async def _telemt_mtproto_sync_once():
                 await consume_quota_partial(uid, residual)
             except Exception:
                 pass
+    try:
+        _tls_primary, _tls_extras = _telemt_mtproto_tls_wanted(rows)
+        _current_tls = await _tg_call("telemt_mtproto_tls")
+        if isinstance(_current_tls, (list, tuple)) and len(_current_tls) == 2:
+            _cur_primary = str(_current_tls[0] or "")
+            _cur_extras = sorted(str(item) for item in (_current_tls[1] or []))
+            if _cur_primary != _tls_primary or _cur_extras != sorted(_tls_extras):
+                await _tg_call("telemt_mtproto_set_tls", _tls_primary, _tls_extras)
+    except Exception:
+        pass
 
 
 def proxy_link_for_uid(uid, protocol, host, port, variant="dd", domain="www.google.com", token=""):
@@ -4107,10 +4376,7 @@ def proxy_link_for_uid(uid, protocol, host, port, variant="dd", domain="www.goog
     if protocol in PROXY_PROTOCOLS:
         merged = dict(stored)
         merged["port"] = use_port
-        if protocol == "webproxy":
-            if not stored.get("active"):
-                return ""
-        elif not _proxy_inbound_enabled(merged):
+        if not _proxy_remote_link_allowed(merged):
             return ""
     if protocol == "socks5":
         user, pw = _proxy_creds_for_link(stored)
@@ -4141,14 +4407,21 @@ def proxy_links_for_link(link, host):
     port = int(link.get("port") or 443)
     token = str(link.get("webproxy_token") or "").strip().lower()
     _link_enabled = _proxy_inbound_enabled(link) if protocol in PROXY_PROTOCOLS else True
-    out = {"protocol_link": proxy_link_for_uid(uid, protocol, host, port, variant, domain, token), "enabled": _link_enabled, "reason": "" if _link_enabled else _proxy_inbound_disabled_reason(link)}
+    _remote_allowed = _proxy_remote_link_allowed(link) if protocol in PROXY_PROTOCOLS else True
+    if _link_enabled and not _remote_allowed:
+        _link_reason = _proxy_remote_link_disabled_reason(link)
+    elif _link_enabled:
+        _link_reason = ""
+    else:
+        _link_reason = _proxy_inbound_disabled_reason(link)
+    out = {"protocol_link": proxy_link_for_uid(uid, protocol, host, port, variant, domain, token), "enabled": _link_enabled, "reason": _link_reason}
     if protocol == "mtproto" and tgproxy is not None:
-        out["variants"] = tgproxy.mtproxy_links_for_uid(host, port, uid, domain) if _link_enabled else {"plain": "", "dd": "", "faketls": ""}
+        out["variants"] = tgproxy.mtproxy_links_for_uid(host, port, uid, domain) if _remote_allowed else {"plain": "", "dd": "", "faketls": ""}
         out["variant"] = variant
     if protocol == "webproxy":
         if token and link.get("active"):
             try:
-                out["all_ports"] = [{"port": port, "token": token, "secret": _web_link_secret_for_link(link), "link": _web_link(host, token, link, port), "link_https": _web_link_https(host, token, link, port)}]
+                out["all_ports"] = [{"port": port, "token": token, "secret": _web_link_secret_for_link(link, port), "link": _web_link(host, token, link, port), "link_https": _web_link_https(host, token, link, port)}]
             except ValueError:
                 out["all_ports"] = []
         else:
@@ -4163,7 +4436,7 @@ def proxy_links_for_link(link, host):
         out["webproxy_token"] = token
         if token and link.get("active"):
             try:
-                out["secret"] = _web_link_secret_for_link(link)
+                out["secret"] = _web_link_secret_for_link(link, port)
                 out["link_https"] = _web_link_https(host, token, link, port)
             except ValueError:
                 out["secret"] = ""
@@ -5474,7 +5747,8 @@ async def lifespan(app: FastAPI):
             TELEMT_HEALTH["available"] = True
             TELEMT_HEALTH["error"] = ""
             try:
-                _mt_result = await _tg_call("telemt_start_mtproto")
+                _mt_tls_primary, _mt_tls_extras = _telemt_mtproto_tls_wanted()
+                _mt_result = await _tg_call("telemt_start_mtproto", _mt_tls_primary, _mt_tls_extras)
             except Exception as exc:
                 _mt_result = None
                 logger.error("telemt MTProto child failed to start: " + str(exc))
@@ -7196,7 +7470,7 @@ def _forwarder_headers(request, host, client_ip):
     return headers
 
 
-async def _forward_http_to_telemt(request, uid, upstream_path, upstream_query=b"", body=b""):
+async def _forward_http_to_telemt(request, uid, upstream_path, upstream_query=b"", body=b"", quota_uid=None):
     host = get_domain(request)
     client_ip = _forwarder_client_ip(request)
     port = _telemt_web_port_for_uid(uid)
@@ -7236,14 +7510,14 @@ async def _forward_http_to_telemt(request, uid, upstream_path, upstream_query=b"
                 pass
             if total["down"]:
                 try:
-                    await consume_quota_partial(uid, total["down"])
+                    await consume_quota_partial(quota_uid or uid, total["down"])
                 except Exception:
                     pass
 
     return StreamingResponse(_forward_gen(), status_code=status, headers=resp_headers)
 
 
-async def _forward_ws_to_telemt(websocket, uid, upstream_path):
+async def _forward_ws_to_telemt(websocket, uid, upstream_path, quota_uid=None):
     host = get_domain(websocket)
     client_ip = _forwarder_client_ip(websocket)
     port = _telemt_web_port_for_uid(uid)
@@ -7334,12 +7608,12 @@ async def _forward_ws_to_telemt(websocket, uid, upstream_path):
         pass
     try:
         if up_total:
-            await consume_quota_partial(uid, up_total)
+            await consume_quota_partial(quota_uid or uid, up_total)
     except Exception:
         pass
     try:
         if down_total:
-            await consume_quota_partial(uid, down_total)
+            await consume_quota_partial(quota_uid or uid, down_total)
     except Exception:
         pass
 
@@ -7363,17 +7637,16 @@ async def _root_bridge_response(request):
     for candidate in sorted([l for l in LINKS.values() if (l.get("protocol") or "") == "webproxy" and l.get("active")], key=lambda l: str(l.get("created_at") or "")):
         token = str(candidate.get("webproxy_token") or "").strip().lower()
         try:
-            expected_v2 = _web_capability(host, token, candidate)
             expected_v1 = _web_capability_v1(host, token, candidate)
         except ValueError:
             continue
-        if hmac_mod.compare_digest(capability, expected_v2) or hmac_mod.compare_digest(capability, expected_v1):
+        if hmac_mod.compare_digest(capability, expected_v1):
             matched = candidate
             break
     if matched is None:
-        return Response(content="no active WEB proxy inbound for this bridge capability", status_code=404, media_type="text/plain")
+        return Response(content="no active WEB proxy inbound for this bridge capability", status_code=404, media_type="text/plain", headers={"Cache-Control": "no-store"})
     query = request.url.query.encode("latin-1") if request.url.query else b""
-    return await _forward_http_to_telemt(request, _TELEMT_ROOT_CHILD_UID, "/", query, body=b"")
+    return await _forward_http_to_telemt(request, _TELEMT_ROOT_CHILD_UID, "/", query, body=b"", quota_uid=str(matched.get("uid", "")))
 
 
 @app.api_route("/", methods=["GET", "HEAD"])
@@ -8597,11 +8870,9 @@ async def create_link(request: Request, _=Depends(require_auth)):
     mtproto_variant = str(body.get("mtproto_variant") or "dd").strip().lower()
     if mtproto_variant not in MTPROTO_VARIANTS:
         mtproto_variant = "dd"
-    mtproto_domain = str(body.get("mtproto_domain") or "www.google.com").strip() or "www.google.com"
-    if not re.match(r"^[a-zA-Z0-9.-]+$", mtproto_domain) or ".." in mtproto_domain:
+    mtproto_domain = str(body.get("mtproto_domain") or "").strip() or _telemt_mtproto_default_domain(request)
+    if not _telemt_valid_tls_host(mtproto_domain):
         raise HTTPException(status_code=400, detail="Invalid fake-TLS domain")
-    if mtproto_variant == "faketls" and mtproto_domain != "www.google.com":
-        raise HTTPException(status_code=400, detail="FakeTLS works only with domain www.google.com: the Telegram proxy accepts no other SNI domain")
     _web_token = ""
     _web_secret_hex = ""
     _web_secret_enc = ""
@@ -8621,6 +8892,9 @@ async def create_link(request: Request, _=Depends(require_auth)):
         _raw_secret = str(body.get("webproxy_secret") or "").strip()
         if _raw_secret:
             _web_secret_hex = _webproxy_validate_secret(_raw_secret)
+            _secret_conflict = _webproxy_secret_conflict(_web_secret_hex)
+            if _secret_conflict is not None:
+                raise HTTPException(status_code=400, detail="WEB proxy secret is already used by inbound '" + str(_secret_conflict.get("label", "")) + "' (" + str(_secret_conflict.get("uid", "")) + "). Each WEB proxy inbound needs its own secret: telemt rejects a vhost where two profiles share one client capability.")
         else:
             _web_secret_hex = _webproxy_new_secret_hex()
         _web_secret_enc = encrypt_proxy_password(_web_secret_hex)
@@ -8982,7 +9256,7 @@ async def list_protocols(_=Depends(require_auth)):
         "xhttp-stream-one": "VLESS over XHTTP stream-one mode on the panel HTTPS port (TCP only, no UDP, no mux)",
         "xhttp-stream-up": "VLESS over XHTTP stream-up mode on the panel HTTPS port (TCP only, no UDP, no mux)",
         "xhttp-packet-up": "VLESS over XHTTP packet-up mode on the panel HTTPS port (TCP only, no UDP, no mux)",
-        "socks5": "SOCKS5 (shared multiplexer listener on the inbound port; TCP CONNECT only, no UDP associate; several inbounds may share one port, each with its own login; one port can also serve WebSocket, WEB proxy and the panel itself through the multiplexer front door; unreachable from outside on a single-port PaaS host)",
+        "socks5": "SOCKS5 (shared multiplexer listener on the inbound port; TCP CONNECT plus UDP associate; several inbounds may share one port, each with its own login; one port can also serve WebSocket, WEB proxy and the panel itself through the multiplexer front door; unreachable from outside on a single-port PaaS host)",
         "mtproto": "Telegram MTProto proxy (shared multiplexer listener on the inbound port; per-link secret, plain / dd / fake-TLS variants; several inbounds may share one port, routed by secret; one port can also serve WebSocket, WEB proxy and the panel itself through the multiplexer front door; unreachable from outside on a single-port PaaS host)",
         "webproxy": "Telegram WEB proxy (Direct-DC, rides the panel HTTPS port or any shared multiplexer port, port 443 shared with a per-user token and secret in each link; the only Telegram proxy that works on a single-port PaaS host)",
         "http-proxy": "HTTP CONNECT proxy (shared multiplexer listener on the inbound port; Basic auth = link UUID, general-purpose relay to any TCP destination; several inbounds may share one port, each with its own login; one port can also serve WebSocket, WEB proxy and the panel itself through the multiplexer front door; unreachable from outside on a single-port PaaS host)"
@@ -9156,7 +9430,7 @@ async def telegram_proxy_status(request: Request, _=Depends(require_auth)):
             try:
                 web_link_443 = _web_link(domain, _tok0, _oldest_web, 443)
                 web_link_https_443 = _web_link_https(domain, _tok0, _oldest_web, 443)
-                web_links = [{"port": 443, "token": _tok0, "secret": _web_link_secret_for_link(_oldest_web), "link": web_link_443, "link_https": web_link_https_443}]
+                web_links = [{"port": 443, "token": _tok0, "secret": _web_link_secret_for_link(_oldest_web, 443), "link": web_link_443, "link_https": web_link_https_443}]
             except ValueError:
                 web_links = []
                 web_link_443 = ""
@@ -9211,7 +9485,7 @@ async def telegram_proxy_status(request: Request, _=Depends(require_auth)):
         "deployment_notes": [
             "Cloady / Render expose a single public HTTPS port, so only the WEB proxy works there. SOCKS5, MTProto and HTTP proxy need their own raw TCP ports and stay disabled.",
             "Railway: expose SOCKS_PORT and TG_PROXY_PORT with a TCP Proxy in Networking settings; Railway gives a host like monorail.proxy.rlwy.net:PORT, use that host and port in your client.",
-            "SOCKS5 is TCP CONNECT only: TCP traffic works, voice/video calls need UDP associate which a TCP Proxy cannot carry, so calls bypass the proxy unless you run on a VPS.",
+            "SOCKS5 supports TCP CONNECT and UDP associate: voice/video calls work through UDP associate on a VPS with a published UDP port; a Railway TCP Proxy carries TCP only, so calls bypass the proxy there.",
             "Keep use personal and light: running a public circumvention proxy may breach the host fair-use policy."
         ]
     }
@@ -9393,8 +9667,7 @@ def active_sessions_snapshot():
             })
     for _wlink in [l for l in LINKS.values() if (l.get("protocol") or "") == "webproxy" and l.get("active")]:
         _wuid = str(_wlink.get("uid", ""))
-        _wstatus = _telemt_web_status_cached(_wuid)
-        _wsessions = _telemt_web_sessions_value(_wstatus)
+        _wsessions = _web_sessions_for_uid(_wuid)
         if isinstance(_wsessions, list):
             web_sessions = _wsessions
         elif isinstance(_wsessions, int) and _wsessions > 0:
@@ -9764,6 +10037,11 @@ async def import_links(request: Request, _=Depends(require_auth)):
                     failed += 1
                     errors.append({"index": index, "error": "WEB proxy token " + _import_token + " is already used by inbound '" + str(_token_conflict.get("label", "")) + "' (" + str(_token_conflict.get("uid", "")) + ")"})
                     continue
+                _secret_conflict = _webproxy_secret_conflict(_web_secret_hex_or_empty(new_link))
+                if _secret_conflict is not None:
+                    failed += 1
+                    errors.append({"index": index, "error": "WEB proxy secret is already used by inbound '" + str(_secret_conflict.get("label", "")) + "' (" + str(_secret_conflict.get("uid", "")) + ")"})
+                    continue
             if protocol in PROXY_PROTOCOLS and active:
                 _conflict = _proxy_port_conflict(port, protocol)
                 if _conflict is not None:
@@ -9845,9 +10123,7 @@ async def batch_links(request: Request, _=Depends(require_auth)):
         if current is not None:
             await _telemt_sync_link(current, previous=prev)
     for uid, proto in removed:
-        if proto == "webproxy":
-            await _telemt_remove_web(uid)
-        elif proto == "mtproto":
+        if proto == "mtproto":
             await _telemt_remove_mtproto(uid)
     if removed and any(p == "webproxy" for _u, p in removed):
         await _telemt_sync_root_vhost()
@@ -9884,9 +10160,7 @@ async def regenerate_uuid(uid: str, _=Depends(require_auth)):
                 link["proxy_username"] = new_uid
                 link["proxy_password"] = new_uid
                 await db_execute("UPDATE links SET proxy_username = ?, proxy_password = ? WHERE uid = ?", "UPDATE links SET proxy_username = $1, proxy_password = $2 WHERE uid = $3", (new_uid, new_uid, new_uid))
-        if (link.get("protocol") or "") == "webproxy":
-            await _telemt_remove_web(uid)
-        elif (link.get("protocol") or "") == "mtproto":
+        if (link.get("protocol") or "") == "mtproto":
             await _telemt_remove_mtproto(uid)
         await _telemt_sync_link(link, previous=None)
         log_event("Inbound", f"UUID regenerated for {link['label']}: {uid} -> {new_uid}")
@@ -10001,13 +10275,9 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
         raise HTTPException(status_code=400, detail="Invalid mtproto_variant")
     if "mtproto_domain" in body:
         _dom = str(body["mtproto_domain"] or "www.google.com").strip() or "www.google.com"
-        if not re.match(r"^[a-zA-Z0-9.-]+$", _dom) or ".." in _dom:
+        if not _telemt_valid_tls_host(_dom):
             raise HTTPException(status_code=400, detail="Invalid fake-TLS domain")
         body["mtproto_domain"] = _dom
-    _patch_variant = str(body.get("mtproto_variant") or link.get("mtproto_variant") or "dd").strip().lower()
-    _patch_domain = str(body.get("mtproto_domain") or link.get("mtproto_domain") or "www.google.com").strip() or "www.google.com"
-    if _patch_variant == "faketls" and _patch_domain != "www.google.com":
-        raise HTTPException(status_code=400, detail="FakeTLS works only with domain www.google.com: the Telegram proxy accepts no other SNI domain")
     if "webproxy_token" in body:
         _patch_token = str(body.get("webproxy_token") or "").strip().lower()
         if _patch_token and not _webproxy_valid_token(_patch_token):
@@ -10199,7 +10469,6 @@ async def delete_link(uid: str, _=Depends(require_auth)):
     async with LINKS_LOCK:
         LINKS.pop(uid, None)
     if (link or {}).get("protocol") == "webproxy":
-        await _telemt_remove_web(uid)
         await _telemt_sync_root_vhost()
         try:
             await _release_web_bridge_port_if_unused(int((link or {}).get("port") or 443))
@@ -13435,14 +13704,14 @@ async def _test_webproxy_lane_ws(ws_url, session_token, header, parsed, dc_timeo
                 pass
 
 
-async def _test_webproxy_lane_https(loopback, token, domain, session_token, header, parsed, dc_timeout, port, dc=1, lane_id=1, window_timeout=WEBPROXY_TEST_WINDOW_TIMEOUT, https_state=None):
+async def _test_webproxy_lane_https(loopback, base_prefix, domain, session_token, header, parsed, dc_timeout, port, dc=1, lane_id=1, window_timeout=WEBPROXY_TEST_WINDOW_TIMEOUT, https_state=None):
     if https_state is None:
         https_state = {"up_seq": 1, "down_cursor": 0}
     state = _webproxy_lane_new_state(lane_id, dc, parsed["write_key"], parsed["write_iv"])
     auth_headers = {"Host": domain, "Authorization": "Bearer " + session_token}
 
     async def _up(client, frames):
-        resp = await client.post(loopback + "/" + token + "/api/v1/up", content=frames, headers=dict(auth_headers, **{"Content-Type": "application/octet-stream", "X-Up-Seq": str(https_state["up_seq"])}))
+        resp = await client.post(loopback + base_prefix + "/api/v1/up", content=frames, headers=dict(auth_headers, **{"Content-Type": "application/octet-stream", "X-Up-Seq": str(https_state["up_seq"])}))
         if resp.status_code == 204:
             https_state["up_seq"] += 1
             return
@@ -13454,7 +13723,7 @@ async def _test_webproxy_lane_https(loopback, token, domain, session_token, head
         while time.time() < deadline:
             remaining = max(0.5, deadline - time.time())
             try:
-                resp = await client.post(loopback + "/" + token + "/api/v1/down", content=b"", headers=dict(auth_headers, **{"X-Down-Cursor": str(https_state["down_cursor"])}), timeout=min(per_poll_timeout, remaining))
+                resp = await client.post(loopback + base_prefix + "/api/v1/down", content=b"", headers=dict(auth_headers, **{"X-Down-Cursor": str(https_state["down_cursor"])}), timeout=min(per_poll_timeout, remaining))
             except httpx.TimeoutException:
                 return b"", False
             cursor_header = resp.headers.get("X-Down-Cursor", "")
@@ -13516,48 +13785,72 @@ async def _test_webproxy_real_session(link, domain, port, dc_timeout=WEBPROXY_TE
     panel_port = int(os.environ.get("PORT", CONFIG.get("port", 8000)))
     loopback = "http://127.0.0.1:" + str(panel_port)
     ws_base = "ws://127.0.0.1:" + str(panel_port)
-    headers = {"Host": domain}
     token = str(link.get("webproxy_token") or "").strip().lower()
     if not token:
         return False, "not_available", "WEB proxy inbound has no token"
+    emitted_link = _web_link(domain, token, link, port)
+    if not emitted_link:
+        return False, "fail", "WEB proxy inbound emits no link for port " + str(port)
     try:
-        capability = _web_capability(domain, token, link)
+        link_parsed = _webproxy_assert_emitted_link(emitted_link, domain, port, token)
     except ValueError as exc:
-        return False, "fail", "WEB proxy capability could not be built: " + str(exc)
+        return False, "fail", "WEB proxy emitted link is not a form any Telegram client accepts: " + str(exc) + " (link-form assertion failed for " + emitted_link + ")"
+    link_host = str(link_parsed["host"])
+    link_form = str(link_parsed["form"])
+    base_prefix = "" if link_form == "root" else "/" + str(link_parsed["base_path"])
+    form_note = " (tested from the emitted " + link_form + "-form link, host " + link_host + ")"
+    secret = bytes(link_parsed["secret_bytes"])
+    capability = _webproxy_capability_for_parsed(link_parsed)
+    headers = {"Host": link_host}
+    fallback_note = ""
+    if link_form == "root":
+        try:
+            fallback_capability = _web_capability(domain, token, link)
+            async with httpx.AsyncClient(timeout=10.0, trust_env=False) as _fallback_client:
+                _fallback_resp = await _fallback_client.get(loopback + "/" + token + "/?bridge=" + fallback_capability, headers=headers)
+            if _fallback_resp.status_code == 200 and "tproxy-init" in _fallback_resp.text:
+                fallback_note = " Token-path fallback bridge also answers."
+            else:
+                fallback_note = " Token-path fallback bridge did not answer (HTTP " + str(_fallback_resp.status_code) + "); the emitted bare-domain link is the working form."
+        except Exception as exc:
+            fallback_note = " Token-path fallback bridge could not be probed: " + str(exc)
     bootstrap = ""
     session_token = ""
     carrier = ""
     negotiated = False
     try:
         async with httpx.AsyncClient(timeout=10.0, trust_env=False) as client:
-            bridge_path = "/" + token + "/?bridge=" + capability
+            bridge_path = base_prefix + "/?bridge=" + capability
             resp = await client.get(loopback + bridge_path, headers=headers)
             if resp.status_code != 200 or "tproxy-init" not in resp.text:
-                return False, "fail", "WEB proxy bridge did not serve a session page for a valid capability (HTTP " + str(resp.status_code) + "); the bridge is not configured for this host and port"
+                return False, "fail", "WEB proxy bridge did not serve a session page for a valid capability derived from the emitted link (HTTP " + str(resp.status_code) + "); the bridge is not configured for this host and port" + form_note + fallback_note
             found = re.search(r"bootstrap=\"([^\"]+)\"", resp.text)
             if not found:
-                return False, "fail", "WEB proxy bridge page has no session bootstrap token"
+                return False, "fail", "WEB proxy bridge page has no session bootstrap token" + form_note + fallback_note
             bootstrap = found.group(1)
-            session_resp = await client.post(loopback + "/" + token + "/api/v1/session", content=WEBPROXY_HANDSHAKE, headers={"Host": domain, "Authorization": "Bearer " + bootstrap, "Content-Type": "application/octet-stream", "X-Carrier-Capabilities": WEBPROXY_CARRIER_CAPABILITIES, "X-Carrier-Attempt": "1", "X-Telemt-Up-Window": "4"})
+            session_resp = await client.post(loopback + base_prefix + "/api/v1/session", content=WEBPROXY_HANDSHAKE, headers={"Host": link_host, "Authorization": "Bearer " + bootstrap, "Content-Type": "application/octet-stream", "X-Carrier-Capabilities": WEBPROXY_CARRIER_CAPABILITIES, "X-Carrier-Attempt": "1", "X-Telemt-Up-Window": "4"})
             if session_resp.status_code != 200:
-                return False, "fail", "WEB proxy session creation rejected (HTTP " + str(session_resp.status_code) + ")"
+                return False, "fail", "WEB proxy session creation rejected (HTTP " + str(session_resp.status_code) + ")" + form_note + fallback_note
             session_token = session_resp.headers.get("X-Session-Token", "")
             if not session_token:
-                return False, "fail", "WEB proxy session creation returned no session token"
+                return False, "fail", "WEB proxy session creation returned no session token" + form_note + fallback_note
             carrier = (session_resp.headers.get("X-Carrier-Mode", "") or "").strip().lower()
             negotiated = bool((session_resp.headers.get("X-Carrier-Attempt", "") or "").strip())
     except Exception as exc:
-        return False, "fail", "WEB proxy bridge/session step failed: " + str(exc)
+        return False, "fail", "WEB proxy bridge/session step failed: " + str(exc) + form_note + fallback_note
     if port != int(WEBPROXY_PUBLIC_PORT):
         try:
             async with httpx.AsyncClient(timeout=10.0, trust_env=False) as _port_client:
-                _port_resp = await _port_client.get("http://127.0.0.1:" + str(port) + "/" + token + "/?bridge=" + capability, headers={"Host": domain})
-            if _port_resp.status_code != 200 or "tproxy-init" not in _port_resp.text:
-                return False, "fail", "WEB bridge on port " + str(port) + " did not serve a session page for a valid capability (HTTP " + str(_port_resp.status_code) + "); the bridge is not serving on the chosen port"
+                _port_resp = await _port_client.get("http://127.0.0.1:" + str(port) + base_prefix + "/?bridge=" + capability, headers={"Host": link_host})
+                _port_first_status = _port_resp.status_code
+                if _port_resp.status_code != 200 or "tproxy-init" not in _port_resp.text:
+                    await asyncio.sleep(2.0)
+                    _port_resp = await _port_client.get("http://127.0.0.1:" + str(port) + base_prefix + "/?bridge=" + capability, headers={"Host": link_host})
+                if _port_resp.status_code != 200 or "tproxy-init" not in _port_resp.text:
+                    return False, "fail", "WEB bridge on port " + str(port) + " did not serve a session page for a valid capability derived from the emitted link (HTTP " + str(_port_first_status) + " then " + str(_port_resp.status_code) + "); the bridge is not serving on the chosen port" + form_note
         except Exception as exc:
-            return False, "fail", "WEB bridge on port " + str(port) + " is not reachable: " + str(exc)
+            return False, "fail", "WEB bridge on port " + str(port) + " is not reachable: " + str(exc) + form_note
     try:
-        secret = _web_secret_bytes_for_link(link)
         https_state = {"up_seq": 1, "down_cursor": 0}
         ws_state = {"committed": False}
         lane_deadline = time.time() + WEBPROXY_TEST_LANE_DEADLINE
@@ -13575,23 +13868,23 @@ async def _test_webproxy_real_session(link, domain, port, dc_timeout=WEBPROXY_TE
             parsed = _webproxy_parse_obfs_header(header, secret)
             lane_id = attempt_index + 1
             if carrier.startswith("websocket"):
-                ok, verdict, detail, got_data, retry_dc = await _test_webproxy_lane_ws(ws_base + "/" + token + "/api/v1/ws", session_token, header, parsed, dc_budget, port, token, dc=dc, carrier=carrier, negotiated=negotiated, lane_id=lane_id, window_timeout=window_budget, ws_state=ws_state)
+                ok, verdict, detail, got_data, retry_dc = await _test_webproxy_lane_ws(ws_base + base_prefix + "/api/v1/ws", session_token, header, parsed, dc_budget, port, token, dc=dc, carrier=carrier, negotiated=negotiated, lane_id=lane_id, window_timeout=window_budget, ws_state=ws_state)
             elif carrier.startswith("https"):
-                ok, verdict, detail, got_data, retry_dc = await _test_webproxy_lane_https(loopback, token, domain, session_token, header, parsed, dc_budget, port, dc=dc, lane_id=lane_id, window_timeout=window_budget, https_state=https_state)
+                ok, verdict, detail, got_data, retry_dc = await _test_webproxy_lane_https(loopback, base_prefix, link_host, session_token, header, parsed, dc_budget, port, dc=dc, lane_id=lane_id, window_timeout=window_budget, https_state=https_state)
             else:
-                return False, "fail", "WEB proxy session carrier is not recognized: " + (carrier or "(empty)") + " (bridge and session work, but the lane test cannot run)"
+                return False, "fail", "WEB proxy session carrier is not recognized: " + (carrier or "(empty)") + " (bridge and session work, but the lane test cannot run)" + form_note + fallback_note
             if ok:
-                return True, "pass", detail
+                return True, "pass", detail + form_note + fallback_note
             last_verdict = verdict
             last_detail = detail
             if not retry_dc:
-                return False, verdict, detail
-        return False, last_verdict, last_detail
+                return False, verdict, detail + form_note + fallback_note
+        return False, last_verdict, last_detail + form_note + fallback_note
     finally:
         if session_token:
             try:
                 async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
-                    await client.request("DELETE", loopback + "/" + token + "/api/v1/session", headers={"Host": domain, "Authorization": "Bearer " + session_token})
+                    await client.request("DELETE", loopback + base_prefix + "/api/v1/session", headers={"Host": link_host, "Authorization": "Bearer " + session_token})
             except Exception:
                 pass
 
@@ -13692,6 +13985,7 @@ async def test_inbound(uid: str, request: Request, _=Depends(require_auth)):
     verdict = "fail"
     detail = ""
     ok = False
+    mtproto_forms = None
     try:
         if proto in PROXY_PROTOCOLS:
             if tgproxy is None:
@@ -13700,10 +13994,10 @@ async def test_inbound(uid: str, request: Request, _=Depends(require_auth)):
                 target = target_host
             elif proto == "webproxy":
                 _test_token = str(link.get("webproxy_token") or "").strip().lower()
-                target = base + "/" + _test_token + "/" if _test_token else base + "/"
                 port = int(link.get("port") or 443)
+                target = base + "/" if port == 443 else base + "/" + _test_token + "/" if _test_token else base + "/"
                 await refresh_proxy_listener_status()
-                if not _proxy_listener_enabled("webproxy"):
+                if not _proxy_listener_enabled("webproxy") and not _web_child_healthy_cached():
                     verdict = "not_available"
                     detail = _proxy_disabled_reason("webproxy")
                 elif _is_single_port_host() and port != 443:
@@ -13746,13 +14040,26 @@ async def test_inbound(uid: str, request: Request, _=Depends(require_auth)):
                     verdict = "not_available"
                     detail = _proxy_inbound_disabled_reason(link) + " " + _PAAS_TCP_NOTE
                 else:
-                    if variant == "faketls":
-                        ok, verdict, detail, tested_via = await _test_raw_tcp_public_first(lambda h, p, u: _test_mtproto_faketls(h, p, u, domain=(link.get("mtproto_domain") or "www.google.com")), domain, raw_port, uid)
-                        detail = "fake-TLS variant: " + detail
+                    mtproto_forms = []
+                    _mt_domain = str(link.get("mtproto_domain") or "www.google.com").strip() or "www.google.com"
+                    for _form_name, _form_handshake in (
+                        ("plain", lambda h, p, u: _test_mtproto_plain(h, p, u, b"\xef\xef\xef\xef")),
+                        ("dd", lambda h, p, u: _test_mtproto_plain(h, p, u, b"\xdd\xdd\xdd\xdd")),
+                        ("faketls", lambda h, p, u: _test_mtproto_faketls(h, p, u, domain=_mt_domain)),
+                    ):
+                        _fok, _fverdict, _fdetail, _fvia = await _test_raw_tcp_public_first(_form_handshake, domain, raw_port, uid)
+                        mtproto_forms.append({"form": _form_name, "ok": bool(_fok), "verdict": _fverdict, "detail": _fdetail, "tested_via": _fvia})
+                    if any(item["verdict"] == "fail" for item in mtproto_forms):
+                        verdict = "fail"
+                        ok = False
+                    elif any(item["verdict"] == "local_only" for item in mtproto_forms):
+                        verdict = "local_only"
+                        ok = True
                     else:
-                        tag = b"\xdd\xdd\xdd\xdd" if variant == "dd" else b"\xef\xef\xef\xef"
-                        ok, verdict, detail, tested_via = await _test_raw_tcp_public_first(lambda h, p, u: _test_mtproto_plain(h, p, u, tag), domain, raw_port, uid)
-                        detail = variant + " variant: " + detail
+                        verdict = "pass"
+                        ok = True
+                    detail = "MTProto forms: " + "; ".join(item["form"] + "=" + item["verdict"] + " (" + item["detail"] + ")" for item in mtproto_forms)
+                    tested_via = mtproto_forms[0]["tested_via"] if mtproto_forms else ""
         elif proto.startswith("xhttp-"):
             vhead = b"\x00" + uuid_lib.UUID(uid).bytes + b"\x00\x01" + dial_port.to_bytes(2, "big") + b"\x01\x7f\x00\x00\x01"
             session_id = secrets.token_urlsafe(12)
@@ -13908,7 +14215,7 @@ async def test_inbound(uid: str, request: Request, _=Depends(require_auth)):
             stored["last_test_at"] = datetime.now(UTC).isoformat()
             stored["last_test_target"] = target_out[:300]
             stored["last_test_verdict"] = verdict
-    return {"ok": ok, "protocol": proto, "latency_ms": latency, "detail": detail, "domain": domain, "domain_source": domain_source, "port": panel_port, "tls": tls, "target": target_out, "verdict": verdict}
+    return {"ok": ok, "protocol": proto, "latency_ms": latency, "detail": detail, "domain": domain, "domain_source": domain_source, "port": panel_port, "tls": tls, "target": target_out, "verdict": verdict, "mtproto_forms": mtproto_forms}
 
 
 HEALTH_PROBE_INTERVAL_SECONDS = 1.0
@@ -14752,7 +15059,7 @@ async def websocket_tunnel_custom_path(websocket: WebSocket, full_path: str):
     if _webproxy_valid_token(_first):
         _wlink = _web_link_for_token(_first)
         if _wlink is not None:
-            await _forward_ws_to_telemt(websocket, str(_wlink.get("uid", "")), "/" + "/".join(parts))
+            await _forward_ws_to_telemt(websocket, _TELEMT_ROOT_CHILD_UID, "/api/v1/ws", quota_uid=str(_wlink.get("uid", "")))
             return
         await websocket.close(code=1008)
         return
@@ -22573,7 +22880,7 @@ async function createLink(){
 }
 
 function proxySecretFromLink(link){ try{ const u = new URL(link); return u.searchParams.get('secret') || ''; }catch(e){ return ''; } }
-function webproxySecretHexFromB64(secretB64){ try{ const norm=String(secretB64||'').replace(/-/g,'+').replace(/_/g,'/'); const bin=atob(norm); if(bin.length!==18||bin.charCodeAt(0)!==0x70||bin.charCodeAt(1)!==0xdd) return ''; let hex=''; for(let i=2;i<bin.length;i++){ hex+=bin.charCodeAt(i).toString(16).padStart(2,'0'); } return hex; }catch(e){ return ''; } }
+function webproxySecretHexFromB64(secretB64){ try{ const hexOnly=String(secretB64||'').trim().toLowerCase(); if(/^dd[0-9a-f]{32}$/.test(hexOnly)) return hexOnly.slice(2); if(/^[0-9a-f]{32}$/.test(hexOnly)) return hexOnly; const norm=String(secretB64||'').replace(/-/g,'+').replace(/_/g,'/'); const bin=atob(norm); if(bin.length!==18||bin.charCodeAt(0)!==0x70||bin.charCodeAt(1)!==0xdd) return ''; let hex=''; for(let i=2;i<bin.length;i++){ hex+=bin.charCodeAt(i).toString(16).padStart(2,'0'); } return hex; }catch(e){ return ''; } }
 function webproxySecretHex(l){ if(!l) return ''; const direct=String(l.webproxy_secret||'').trim().toLowerCase(); if(/^[0-9a-f]{32}$/.test(direct)) return direct; if(l.proxy&&l.proxy.secret) return webproxySecretHexFromB64(l.proxy.secret); const link=l.vless_link||(l.proxy&&l.proxy.protocol_link)||''; if(link){ const s=proxySecretFromLink(link); if(s) return webproxySecretHexFromB64(s); } return ''; }
 async function showEditMo(uid) {
   const l = allLinks.find(x => x.uuid === uid);
@@ -25492,6 +25799,7 @@ async def webproxy_forwarder(request: Request, token: str, rest: str):
     token = str(token or "").strip().lower()
     link = _web_link_for_token(token)
     if link is None:
+        logger.warning("WEB bridge request for unknown token path")
         raise HTTPException(status_code=404, detail="Not found")
     uid = str(link.get("uid", ""))
     body = await request.body()
@@ -25501,7 +25809,12 @@ async def webproxy_forwarder(request: Request, token: str, rest: str):
         except Exception:
             pass
     query = request.url.query.encode("latin-1") if request.url.query else b""
-    return await _forward_http_to_telemt(request, uid, "/" + token + "/" + rest, query, body=body)
+    bridge_v1 = _web_verify_token_bridge(request, token, link)
+    if bridge_v1 is False:
+        return Response(content="no active WEB proxy inbound for this bridge capability", status_code=404, media_type="text/plain", headers={"Cache-Control": "no-store"})
+    if bridge_v1:
+        query = _web_rewrite_bridge_query(query, bridge_v1)
+    return await _forward_http_to_telemt(request, _TELEMT_ROOT_CHILD_UID, "/" + rest, query, body=body, quota_uid=uid)
 
 
 @app.api_route("/{full_path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
@@ -25535,9 +25848,14 @@ async def dynamic_xhttp_router(full_path: str, request: Request):
                 except Exception:
                     pass
             _bare_query = request.url.query.encode("latin-1") if request.url.query else b""
-            return await _forward_http_to_telemt(request, str(_bare_link.get("uid", "")), "/" + _bare_token + "/", _bare_query, body=_bare_body)
+            _bare_bridge_v1 = _web_verify_token_bridge(request, _bare_token, _bare_link)
+            if _bare_bridge_v1 is False:
+                return Response(content="no active WEB proxy inbound for this bridge capability", status_code=404, media_type="text/plain", headers={"Cache-Control": "no-store"})
+            if _bare_bridge_v1:
+                _bare_query = _web_rewrite_bridge_query(_bare_query, _bare_bridge_v1)
+            return await _forward_http_to_telemt(request, _TELEMT_ROOT_CHILD_UID, "/", _bare_query, body=_bare_body, quota_uid=str(_bare_link.get("uid", "")))
         if request.query_params.get("bridge", "") or request.query_params.get("capability", "") or request.query_params.get("cap", "") or request.query_params.get("secret", "") or request.query_params.get("token", ""):
-            return Response(content="no active WEB proxy inbound for this token", status_code=404, media_type="text/plain")
+            return Response(content="no active WEB proxy inbound for this token", status_code=404, media_type="text/plain", headers={"Cache-Control": "no-store"})
     async with LINKS_LOCK:
         for uid, link in LINKS.items():
             if not link.get("active"):
