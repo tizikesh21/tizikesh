@@ -38,8 +38,6 @@ ENV_FILE="$DATA_DIR/.sulgx-env"
 CRED_FILE="$DATA_DIR/initial-credentials.txt"
 export DB_PATH="${DB_PATH:-$DATA_DIR/panel.db}"
 
-export PYTHONPATH="/home/sulgx/.local/lib/python3.11/site-packages:${PYTHONPATH:-}"
-
 DB_DIR="$(dirname "$DB_PATH")"
 mkdir -p "$DB_DIR" 2>/dev/null || true
 
@@ -156,5 +154,5 @@ if [ "$(id -u)" = "0" ] && command -v gosu >/dev/null 2>&1 && id sulgx >/dev/nul
   fi
 fi
 
-echo "SulgX entrypoint: executing $* as uid=$(id -u) with PYTHONPATH=$PYTHONPATH"
+echo "SulgX entrypoint: executing $* as uid=$(id -u)"
 exec "$@"
