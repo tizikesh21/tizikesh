@@ -30,6 +30,11 @@ import urllib.error
 import urllib.request
 
 try:
+    import httpx as _httpx
+except Exception:
+    _httpx = None
+
+try:
     from cryptography.hazmat.primitives.ciphers import Cipher as _AES_CIPHER
     from cryptography.hazmat.primitives.ciphers.algorithms import AES as _AES_ALG
     from cryptography.hazmat.primitives.ciphers.modes import CTR as _AES_CTR
@@ -165,6 +170,170 @@ def set_panel_forward(host, port):
 
 def panel_forward():
     return _PANEL_FORWARD
+
+
+_TCP_PROXY_GRAPHQL_URL = "https://backboard.railway.com/graphql/v2"
+_TCP_PROXY_GRAPHQL_CREATE = "mutation($input: TCPProxyCreateInput!) { tcpProxyCreate(input: $input) { applicationPort domain environmentId id proxyPort serviceId } }"
+_TCP_PROXY_GRAPHQL_DELETE = "mutation($id: String!) { tcpProxyDelete(id: $id) }"
+_TCP_PROXY_GRAPHQL_LIST = "query($environmentId: String, $serviceId: String) { tcpProxies(environmentId: $environmentId, serviceId: $serviceId) { applicationPort domain environmentId id proxyPort serviceId } }"
+
+
+class TcpProxyProvider:
+    name = "none"
+
+    async def create_public_proxy(self, local_port):
+        raise NotImplementedError("tcp proxy provider is not configured")
+
+    async def delete_public_proxy(self, proxy_id):
+        return False
+
+    async def list_public_proxies(self):
+        return []
+
+    def has_token(self):
+        return False
+
+
+class RailwayTcpProxyProvider(TcpProxyProvider):
+    name = "railway"
+
+    def __init__(self, token, service_id, environment_id):
+        self.token = token or ""
+        self.service_id = service_id or ""
+        self.environment_id = environment_id or ""
+
+    def has_token(self):
+        return bool(self.token and self.service_id and self.environment_id)
+
+    async def _graphql(self, query, variables):
+        if _httpx is None:
+            raise RuntimeError("httpx is not available for the Railway TCP proxy provider")
+        if not self.has_token():
+            raise RuntimeError("Railway token, service id and environment id are required")
+        async with _httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.post(_TCP_PROXY_GRAPHQL_URL, json={"query": query, "variables": variables}, headers={"Authorization": "Bearer " + self.token, "Content-Type": "application/json"})
+        if response.status_code >= 400:
+            raise RuntimeError("Railway API rejected the TCP proxy request with HTTP " + str(response.status_code))
+        payload = response.json()
+        errors = payload.get("errors") or []
+        if errors:
+            first = errors[0] or {}
+            raise RuntimeError("Railway API error: " + str(first.get("message") or first))
+        return payload.get("data") or {}
+
+    async def create_public_proxy(self, local_port):
+        data = await self._graphql(_TCP_PROXY_GRAPHQL_CREATE, {"input": {"applicationPort": int(local_port), "environmentId": self.environment_id, "serviceId": self.service_id}})
+        created = data.get("tcpProxyCreate") or {}
+        if not created.get("domain") or not created.get("proxyPort"):
+            raise RuntimeError("Railway TCP proxy create returned no public endpoint")
+        return {"domain": str(created["domain"]), "port": int(created["proxyPort"]), "id": str(created["id"]), "application_port": int(created.get("applicationPort") or local_port)}
+
+    async def delete_public_proxy(self, proxy_id):
+        if not proxy_id:
+            return False
+        try:
+            await self._graphql(_TCP_PROXY_GRAPHQL_DELETE, {"id": str(proxy_id)})
+        except Exception as exc:
+            _LOG.warning("Railway TCP proxy delete failed for " + str(proxy_id) + ": " + str(exc))
+            return False
+        return True
+
+    async def list_public_proxies(self):
+        data = await self._graphql(_TCP_PROXY_GRAPHQL_LIST, {"environmentId": self.environment_id, "serviceId": self.service_id})
+        out = []
+        for item in data.get("tcpProxies") or []:
+            out.append({"domain": str(item.get("domain") or ""), "port": int(item.get("proxyPort") or 0), "id": str(item.get("id") or ""), "application_port": int(item.get("applicationPort") or 0)})
+        return out
+
+
+class MockTcpProxyProvider(TcpProxyProvider):
+    name = "mock"
+
+    def __init__(self):
+        self._servers = {}
+        self._targets = {}
+        self._next = 0
+
+    def has_token(self):
+        return True
+
+    async def create_public_proxy(self, local_port):
+        self._next += 1
+        proxy_id = "mock-" + str(self._next)
+        target_port = int(local_port)
+
+        async def _forward(reader, writer):
+            try:
+                upstream_reader, upstream_writer = await asyncio.open_connection("127.0.0.1", target_port)
+            except OSError:
+                try:
+                    writer.close()
+                except OSError:
+                    pass
+                return
+
+            async def _pipe(src, dst):
+                try:
+                    while True:
+                        chunk = await src.read(65536)
+                        if not chunk:
+                            break
+                        dst.write(chunk)
+                        await dst.drain()
+                except (ConnectionError, asyncio.IncompleteReadError, asyncio.TimeoutError, OSError):
+                    pass
+                finally:
+                    try:
+                        dst.write_eof()
+                    except (AttributeError, OSError, RuntimeError):
+                        try:
+                            dst.close()
+                        except OSError:
+                            pass
+
+            await asyncio.gather(_pipe(reader, upstream_writer), _pipe(upstream_reader, writer), return_exceptions=True)
+            try:
+                upstream_writer.close()
+            except OSError:
+                pass
+            try:
+                writer.close()
+            except OSError:
+                pass
+
+        server = await asyncio.start_server(_forward, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        self._servers[proxy_id] = server
+        self._targets[proxy_id] = target_port
+        return {"domain": "127.0.0.1", "port": port, "id": proxy_id, "application_port": target_port}
+
+    async def delete_public_proxy(self, proxy_id):
+        server = self._servers.pop(str(proxy_id), None)
+        self._targets.pop(str(proxy_id), None)
+        if server is None:
+            return True
+        server.close()
+        await server.wait_closed()
+        return True
+
+    async def list_public_proxies(self):
+        out = []
+        for proxy_id, server in self._servers.items():
+            out.append({"domain": "127.0.0.1", "port": server.sockets[0].getsockname()[1], "id": proxy_id, "application_port": int(self._targets.get(proxy_id) or 0)})
+        return out
+
+
+_TCP_PROXY_PROVIDER = None
+
+
+def set_tcp_proxy_provider(provider):
+    global _TCP_PROXY_PROVIDER
+    _TCP_PROXY_PROVIDER = provider
+    return _TCP_PROXY_PROVIDER
+
+
+def tcp_proxy_provider():
+    return _TCP_PROXY_PROVIDER
 
 
 def configure_proxy_callbacks(auth_lookup, count_traffic, mtproxy_quota_ok, session_allowed=None):
@@ -365,12 +534,12 @@ def _could_be_http_or_socks5(prefix):
 async def _peek_prefix(reader):
     prefix = b""
     deadline = time.monotonic() + 10.0
-    while len(prefix) < 8 or (len(prefix) >= 2 and prefix[0] == 0x05 and len(prefix) < min(2 + prefix[1], 16)):
+    while len(prefix) < 16 or (len(prefix) >= 2 and prefix[0] == 0x05 and len(prefix) < min(2 + prefix[1], 16)):
         try:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            chunk = await asyncio.wait_for(reader.read(8 - len(prefix)), timeout=remaining)
+            chunk = await asyncio.wait_for(reader.read(16 - len(prefix)), timeout=remaining)
         except asyncio.TimeoutError:
             break
         except (ConnectionError, OSError):
@@ -459,7 +628,6 @@ def _mtproto_identify_faketls(hello):
 
 
 async def _handle_mtproto_relay(reader, writer, prefix):
-    _STATS["mtproxy_connections"] += 1
     upstream_reader = None
     upstream_writer = None
     sid = None
@@ -468,13 +636,18 @@ async def _handle_mtproto_relay(reader, writer, prefix):
     up_flushed = 0
     down_flushed = 0
     link_uid = ""
+    close_reason = "done"
+    peer = writer.get_extra_info("peername")
+    peer_ip = peer[0] if peer else ""
     try:
         if _MTPROXY_QUOTA_OK is not None:
             if not await _MTPROXY_QUOTA_OK():
+                close_reason = "quota"
                 writer.close()
                 return
         port = telemt_mtproto_port()
         if port is None:
+            close_reason = "child-down"
             _LOG.warning("telemt MTProto child is not running; closing MTProto connection")
             writer.close()
             return
@@ -495,14 +668,29 @@ async def _handle_mtproto_relay(reader, writer, prefix):
                     pass
             if len(head) == 64:
                 link_uid = _mtproto_identify_obfs(head)
+        if not link_uid:
+            close_reason = "unknown-secret"
+            _STATS["mtproxy_unknown_secret"] = int(_STATS.get("mtproxy_unknown_secret") or 0) + 1
+            if len(head) >= 5 and head[0] == 0x16 and head[1] == 0x03:
+                _LOG.warning("proxy mux dropped unidentified TLS hello from " + _mux_peer_text(writer) + " prefix " + bytes(head[:8]).hex() + " without opening the MTProto upstream")
+            else:
+                _LOG.info("proxy mux dropped unidentified obfs init from " + _mux_peer_text(writer) + " prefix " + bytes(head[:8]).hex())
+            try:
+                writer.close()
+            except OSError:
+                pass
+            return
+        _STATS["mtproxy_connections"] += 1
         if link_uid and _COUNT_TRAFFIC is not None:
             if not await _COUNT_TRAFFIC(link_uid, 0):
+                close_reason = "quota"
                 writer.close()
                 return
         if link_uid and _SESSION_ALLOWED is not None:
             _peer = writer.get_extra_info("peername")
             _cip = _peer[0] if _peer else ""
             if not _SESSION_ALLOWED(link_uid, _cip):
+                close_reason = "session-limit"
                 writer.close()
                 return
         try:
@@ -510,6 +698,8 @@ async def _handle_mtproto_relay(reader, writer, prefix):
                 asyncio.open_connection("127.0.0.1", port), timeout=10
             )
         except (OSError, asyncio.TimeoutError):
+            close_reason = "upstream-fail"
+            _LOG.warning("mtproxy child dial failed peer=" + peer_ip + " child=127.0.0.1:" + str(port))
             writer.close()
             return
         peer = writer.get_extra_info("peername")
@@ -520,7 +710,8 @@ async def _handle_mtproto_relay(reader, writer, prefix):
         async def _count(n, direction):
             nonlocal total_bytes, up_flushed, down_flushed
             total_bytes += n
-            _STATS["mtproxy_bytes"] += n
+            if link_uid:
+                _STATS["mtproxy_bytes"] += n
             pending = 0
             if direction == "up":
                 entry["bytes_up"] += n
@@ -577,8 +768,11 @@ async def _handle_mtproto_relay(reader, writer, prefix):
             task.cancel()
         await asyncio.gather(up_task, down_task, return_exceptions=True)
     except (ConnectionError, asyncio.IncompleteReadError, asyncio.TimeoutError, OSError):
+        if close_reason == "done":
+            close_reason = "relay-error"
         pass
     finally:
+        _LOG.info("mtproxy close peer=%s uid=%s bytes=%d reason=%s", peer_ip, link_uid or "unknown", total_bytes, close_reason)
         if link_uid and _COUNT_TRAFFIC is not None and total_bytes - (up_flushed + down_flushed) > 0:
             remainder = total_bytes - (up_flushed + down_flushed)
             try:
@@ -603,7 +797,9 @@ async def _handle_panel_forward(reader, writer):
     _STATS["panel_forward_connections"] += 1
     target = _PANEL_FORWARD
     upstream_writer = None
+    _panel_peer = _mux_peer_text(writer)
     try:
+        _LOG.info("panel forward from " + _panel_peer + " to " + str(target[0]) + ":" + str(target[1]) if target else "panel forward from " + _panel_peer + " with no target")
         if not target or int(target[1]) in _BOUND_PORTS:
             writer.write(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             await writer.drain()
@@ -657,6 +853,7 @@ async def _handle_panel_forward(reader, writer):
     except (ConnectionError, asyncio.IncompleteReadError, asyncio.TimeoutError, OSError):
         pass
     finally:
+        _LOG.info("panel forward close peer=" + _panel_peer)
         if upstream_writer is not None:
             try:
                 upstream_writer.close()
@@ -942,19 +1139,51 @@ def _http_connect_failure_status(reason):
     return 502, "Bad Gateway"
 
 
+def _mux_peer_text(writer):
+    peer = writer.get_extra_info("peername")
+    if peer:
+        if peer[1]:
+            return str(peer[0]) + ":" + str(peer[1])
+        return str(peer[0]) + " (ws)"
+    return ""
+
+
 async def _handle_multi(reader, writer):
     prefix = await _peek_prefix(reader)
+    peer_text = _mux_peer_text(writer)
     if not prefix:
+        _LOG.info("proxy mux connection from " + peer_text + " closed without bytes count " + str(_mux_dispatch_count("empty")))
         await _http_send_error(writer, 408, "Request Timeout")
         try:
             writer.close()
         except OSError:
             pass
         return
+    prefix_hex = bytes(prefix).hex()
+    if len(prefix) < 64 and ((len(prefix) >= 2 and prefix[0] == 0x05 and 1 <= prefix[1] <= 3) or _looks_socks5(prefix)):
+        deadline = time.monotonic() + 0.05
+        while len(prefix) < 64:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                extra = await asyncio.wait_for(reader.read(64 - len(prefix)), timeout=remaining)
+            except (asyncio.TimeoutError, ConnectionError, OSError):
+                break
+            if not extra:
+                break
+            prefix += bytes(extra)
+        if len(prefix) >= 64 and _mtproto_identify_obfs(prefix[:64]):
+            _LOG.info("proxy mux dispatch mtproto from " + peer_text + " prefix " + bytes(prefix).hex() + " count " + str(_mux_dispatch_count("mtproto")))
+            await _handle_mtproto_relay(reader, writer, prefix)
+            return
+        prefix_hex = bytes(prefix).hex()
     if _looks_socks5(prefix):
+        _LOG.info("proxy mux dispatch socks5 from " + peer_text + " prefix " + prefix_hex + " count " + str(_mux_dispatch_count("socks5")))
         await _handle_socks5(_PrefixedReader(reader, prefix), writer)
         return
-    if len(prefix) >= 2 and prefix[0] == 0x05 and 1 <= prefix[1] <= 253 and len(prefix) >= 2 + prefix[1]:
+    if len(prefix) >= 2 and prefix[0] == 0x05 and 1 <= prefix[1] <= 3 and len(prefix) >= 2 + prefix[1]:
+        _LOG.info("proxy mux dispatch socks5 from " + peer_text + " prefix " + prefix_hex + " count " + str(_mux_dispatch_count("socks5")))
         await _handle_socks5(_PrefixedReader(reader, prefix), writer)
         return
     token, _sep = _http_split_token(prefix)
@@ -962,29 +1191,36 @@ async def _handle_multi(reader, writer):
         prefix = await _extend_http_prefix(reader, prefix)
         token, sep = _http_split_token(prefix)
         if token is not None and token.upper() == b"CONNECT":
+            _LOG.info("proxy mux dispatch http-connect from " + peer_text + " prefix " + prefix_hex + " count " + str(_mux_dispatch_count("http_connect")))
             await _handle_http_proxy(_PrefixedReader(reader, prefix), writer)
             return
         if sep is not None:
             after = bytes(prefix[sep + 1:sep + 9]).lower()
             if after.startswith(b"http://") or after.startswith(b"https://"):
+                _LOG.info("proxy mux dispatch http-absolute from " + peer_text + " prefix " + prefix_hex + " count " + str(_mux_dispatch_count("http_absolute")))
                 await _handle_http_proxy(_PrefixedReader(reader, prefix), writer)
                 return
+        _LOG.info("proxy mux dispatch panel-forward from " + peer_text + " prefix " + prefix_hex + " count " + str(_mux_dispatch_count("panel_forward")))
         await _handle_panel_forward(_PrefixedReader(reader, prefix), writer)
         return
     if prefix and prefix[:1].isalpha() and all(0x20 <= byte <= 0x7e or byte in (0x0d, 0x0a) for byte in prefix):
         if b"\n" in bytes(prefix):
+            _LOG.info("proxy mux dispatch http from " + peer_text + " prefix " + prefix_hex + " count " + str(_mux_dispatch_count("http")))
             await _handle_http_proxy(_PrefixedReader(reader, prefix), writer)
             return
         extra = b""
         try:
             extra = bytes(await asyncio.wait_for(reader.readuntil(b"\n"), timeout=2.0))
         except asyncio.LimitOverrunError:
+            _LOG.info("proxy mux dispatch http from " + peer_text + " prefix " + prefix_hex + " count " + str(_mux_dispatch_count("http")))
             await _handle_http_proxy(_PrefixedReader(reader, prefix), writer)
             return
         except (asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError, OSError):
             if any(method.startswith(bytes(prefix).upper()) for method in _HTTP_METHODS):
+                _LOG.info("proxy mux dispatch http from " + peer_text + " prefix " + prefix_hex + " count " + str(_mux_dispatch_count("http")))
                 await _handle_http_proxy(_PrefixedReader(reader, prefix), writer)
                 return
+            _LOG.info("proxy mux dispatch unknown from " + peer_text + " prefix " + prefix_hex + " count " + str(_mux_dispatch_count("unknown")))
             try:
                 writer.close()
             except OSError:
@@ -993,12 +1229,138 @@ async def _handle_multi(reader, writer):
         else:
             combined = bytes(prefix) + extra
             if extra and all(0x20 <= byte <= 0x7e or byte in (0x0d, 0x0a) for byte in extra):
+                _LOG.info("proxy mux dispatch http from " + peer_text + " prefix " + prefix_hex + " count " + str(_mux_dispatch_count("http")))
                 await _handle_http_proxy(_PrefixedReader(reader, combined), writer)
                 return
             if extra:
+                _LOG.info("proxy mux dispatch mtproto from " + peer_text + " prefix " + prefix_hex + " count " + str(_mux_dispatch_count("mtproto")))
                 await _handle_mtproto_relay(reader, writer, combined)
                 return
+    _LOG.info("proxy mux dispatch mtproto from " + peer_text + " prefix " + prefix_hex + " count " + str(_mux_dispatch_count("mtproto")))
     await _handle_mtproto_relay(reader, writer, prefix)
+
+
+class _WSStreamReader(asyncio.StreamReader):
+    def __init__(self):
+        super().__init__()
+        self._ws_closed = False
+
+    def feed_ws_eof(self):
+        if not self._ws_closed:
+            self._ws_closed = True
+            self.feed_eof()
+
+
+class _WSStreamWriter:
+    def __init__(self, send_bytes, close_ws, client_ip):
+        self._send_bytes = send_bytes
+        self._close_ws = close_ws
+        self._client_ip = client_ip or ""
+        self._pending = bytearray()
+        self._closing = False
+        self._closed = False
+        self._close_task = None
+        self._send_lock = asyncio.Lock()
+        self.transport = "ws"
+
+    def get_extra_info(self, name, default=None):
+        if name == "peername":
+            return (self._client_ip, 0)
+        if name == "sockname":
+            return ("0.0.0.0", 0)
+        return default
+
+    def is_closing(self):
+        return self._closing or self._closed
+
+    def write(self, data):
+        if self._closing or self._closed or not data:
+            return
+        self._pending += bytes(data)
+
+    async def drain(self):
+        if not self._pending or self._closed:
+            return
+        data = bytes(self._pending)
+        self._pending = bytearray()
+        try:
+            async with self._send_lock:
+                if self._closed:
+                    return
+                await self._send_bytes(data)
+        except (ConnectionError, asyncio.TimeoutError, OSError, RuntimeError):
+            self._closed = True
+            self._pending = bytearray()
+            raise ConnectionError("ws closed")
+
+    async def drain_and_close(self):
+        if self._closed:
+            return
+        self._closing = True
+        try:
+            await self.drain()
+        except (ConnectionError, asyncio.TimeoutError, OSError, RuntimeError):
+            pass
+        finally:
+            async with self._send_lock:
+                self._closed = True
+                try:
+                    await self._close_ws()
+                except (ConnectionError, asyncio.TimeoutError, OSError, RuntimeError):
+                    pass
+
+    def _schedule_close(self):
+        if self._close_task is None or self._close_task.done():
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return
+            self._close_task = loop.create_task(self.drain_and_close())
+
+    def write_eof(self):
+        self._closing = True
+        self._schedule_close()
+
+    def close(self):
+        self._closing = True
+        self._schedule_close()
+
+
+async def handle_proxy_websocket(receive_bytes, send_bytes, close_ws, protocol, client_ip, first_chunk=b""):
+    reader = _WSStreamReader()
+    writer = _WSStreamWriter(send_bytes, close_ws, client_ip)
+    if first_chunk:
+        reader.feed_data(bytes(first_chunk))
+    stop = asyncio.Event()
+
+    async def _recv_loop():
+        try:
+            while not stop.is_set():
+                chunk = await receive_bytes()
+                if not chunk:
+                    continue
+                reader.feed_data(bytes(chunk))
+        except (ConnectionError, asyncio.IncompleteReadError, asyncio.TimeoutError, OSError):
+            pass
+        finally:
+            reader.feed_ws_eof()
+
+    recv_task = asyncio.create_task(_recv_loop())
+    _LOG.info("proxy ws dispatch " + str(protocol) + " from " + str(client_ip))
+    try:
+        if protocol == "socks5":
+            await _handle_socks5(reader, writer, transport="ws")
+        elif protocol == "http-proxy":
+            await _handle_http_proxy(reader, writer)
+        else:
+            _LOG.info("proxy ws dispatch unknown protocol " + str(protocol) + " from " + str(client_ip))
+            return
+    finally:
+        _LOG.info("proxy ws session end " + str(protocol) + " from " + str(client_ip))
+        stop.set()
+        recv_task.cancel()
+        await asyncio.gather(recv_task, return_exceptions=True)
+        await writer.drain_and_close()
 
 
 async def _socks_send(writer, data):
@@ -1083,7 +1445,7 @@ def _socks5_udp_reply_header(src_ip, src_port):
         return None
 
 
-async def _handle_socks5_udp_associate(reader, writer, username, link):
+async def _handle_socks5_udp_associate(reader, writer, username, link, transport="raw"):
     uid = link.get("uid", "")
     total_bytes = 0
     up_flushed = 0
@@ -1091,6 +1453,10 @@ async def _handle_socks5_udp_associate(reader, writer, username, link):
     sid = None
     entry = None
     udp_sock = None
+    if transport == "ws":
+        _LOG.info("socks5 udp associate unsupported on websocket transport user " + username + " from " + _mux_peer_text(writer))
+        await _socks_send(writer, _socks_failure_reply(0x07))
+        return
     try:
         if _COUNT_TRAFFIC is not None:
             if not await _COUNT_TRAFFIC(uid, 0):
@@ -1272,8 +1638,10 @@ async def _handle_socks5_udp_associate(reader, writer, username, link):
                 pass
 
 
-async def _handle_socks5(reader, writer):
+async def _handle_socks5(reader, writer, transport="raw"):
     _STATS["socks_connections"] += 1
+    peer_text = _mux_peer_text(writer)
+    username = ""
     link = None
     total_bytes = 0
     up_flushed = 0
@@ -1285,21 +1653,25 @@ async def _handle_socks5(reader, writer):
         try:
             greeting = await _read_exact(reader, 2)
         except (asyncio.IncompleteReadError, asyncio.TimeoutError, ConnectionError, OSError):
+            _LOG.info("socks5 greeting rejected from " + peer_text)
             await _socks_send(writer, b"\x05\xff")
             return
         if greeting[0] != 0x05:
+            _LOG.info("socks5 greeting rejected bad version byte " + format(greeting[0], "02x") + " from " + peer_text)
             await _socks_send(writer, b"\x05\xff")
             return
         nmethods = greeting[1]
         try:
             methods = await _read_exact(reader, nmethods)
         except (asyncio.IncompleteReadError, asyncio.TimeoutError, ConnectionError, OSError):
+            _LOG.info("socks5 greeting rejected from " + peer_text)
             await _socks_send(writer, b"\x05\xff")
             return
         if 0x02 in methods:
             if not await _socks_send(writer, b"\x05\x02"):
                 return
         else:
+            _LOG.info("socks5 greeting rejected no userpass method methods " + bytes(methods).hex() + " from " + peer_text)
             await _socks_send(writer, b"\x05\xff")
             return
         try:
@@ -1317,12 +1689,14 @@ async def _handle_socks5(reader, writer):
         if _AUTH_LOOKUP is not None:
             link = _AUTH_LOOKUP(username, password)
         if link is None:
+            _LOG.info("socks5 auth failed user " + username + " from " + peer_text)
             await _socks_send(writer, b"\x01\x01")
             return
         if _SESSION_ALLOWED is not None:
             peer = writer.get_extra_info("peername")
             cip = peer[0] if peer else ""
             if not _SESSION_ALLOWED(username, cip):
+                _LOG.info("socks5 session denied user " + username + " from " + peer_text)
                 await _socks_send(writer, b"\x01\x01")
                 return
         if not await _socks_send(writer, b"\x01\x00"):
@@ -1349,7 +1723,7 @@ async def _handle_socks5(reader, writer):
             await _socks_send(writer, _socks_failure_reply(addr_err))
             return
         if cmd == 0x03:
-            await _handle_socks5_udp_associate(reader, writer, username, link)
+            await _handle_socks5_udp_associate(reader, writer, username, link, transport)
             return
         targets = _ordered_targets(ips)
         if not targets:
@@ -1362,6 +1736,7 @@ async def _handle_socks5(reader, writer):
                 return
         target_reader, target_writer, rep = await _connect_target(targets, port)
         if target_writer is None:
+            _LOG.info("socks5 connect failed user " + username + " to " + str(host) + ":" + str(port) + " rep " + str(rep) + " from " + peer_text)
             await _socks_send(writer, _socks_failure_reply(rep))
             return
         bound = target_writer.get_extra_info("sockname")
@@ -1376,6 +1751,7 @@ async def _handle_socks5(reader, writer):
             reply = b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00"
         if not await _socks_send(writer, reply):
             return
+        _LOG.info("socks5 connect user " + username + " to " + str(host) + ":" + str(port) + " transport " + str(transport) + " from " + peer_text)
         peer = writer.get_extra_info("peername")
         sid = "socks5-" + os.urandom(6).hex()
         entry = {"id": sid, "username": username, "protocol": "socks5", "client_ip": peer[0] if peer else "", "started_at": datetime.now(timezone.utc).isoformat(), "bytes_up": 0, "bytes_down": 0, "bytes_flushed": 0, "writer": writer}
@@ -1412,6 +1788,7 @@ async def _handle_socks5(reader, writer):
                         pass
 
         async def _relay(src, dst, direction):
+            outcome = "eof"
             try:
                 while True:
                     chunk = await src.read(65536)
@@ -1421,7 +1798,7 @@ async def _handle_socks5(reader, writer):
                     await dst.drain()
                     await _count(len(chunk), direction)
             except (ConnectionError, asyncio.IncompleteReadError, asyncio.TimeoutError, OSError):
-                pass
+                outcome = "error"
             finally:
                 try:
                     dst.write_eof()
@@ -1430,8 +1807,22 @@ async def _handle_socks5(reader, writer):
                         dst.close()
                     except OSError:
                         pass
+            return outcome
 
-        await asyncio.gather(_relay(reader, target_writer, "up"), _relay(target_reader, writer, "down"))
+        up_task = asyncio.create_task(_relay(reader, target_writer, "up"))
+        down_task = asyncio.create_task(_relay(target_reader, writer, "down"))
+        done, pending = await asyncio.wait((up_task, down_task), return_when=asyncio.FIRST_COMPLETED)
+        errored = False
+        for task in done:
+            try:
+                if task.result() == "error":
+                    errored = True
+            except (asyncio.CancelledError, Exception):
+                errored = True
+        if errored:
+            for task in pending:
+                task.cancel()
+        await asyncio.gather(up_task, down_task, return_exceptions=True)
         try:
             target_writer.close()
         except OSError:
@@ -1439,6 +1830,8 @@ async def _handle_socks5(reader, writer):
     except (ConnectionError, asyncio.IncompleteReadError, asyncio.TimeoutError, OSError):
         pass
     finally:
+        if entry is not None:
+            _LOG.info("socks5 session end user " + username + " up " + str(entry.get("bytes_up", 0)) + " down " + str(entry.get("bytes_down", 0)) + " from " + peer_text)
         if link is not None and _COUNT_TRAFFIC is not None and total_bytes - (up_flushed + down_flushed) > 0:
             try:
                 await _COUNT_TRAFFIC(link.get("uid", ""), total_bytes - (up_flushed + down_flushed))
@@ -1458,14 +1851,17 @@ async def _handle_socks5(reader, writer):
 
 
 async def _http_check_proxy_access(writer, headers):
+    peer_text = _mux_peer_text(writer)
     creds = _parse_proxy_auth(headers)
     if creds is None:
+        _LOG.info("http proxy connect no credentials from " + peer_text)
         return None, "", (407, "Proxy Authentication Required", (b"Proxy-Authenticate: Basic realm=\"SulgX\"",))
     username, password = creds
     link = None
     if _AUTH_LOOKUP is not None:
         link = _AUTH_LOOKUP(username, password)
     if link is None:
+        _LOG.info("http proxy connect wrong credentials user " + str(username) + " from " + peer_text)
         return None, "", (407, "Proxy Authentication Required", (b"Proxy-Authenticate: Basic realm=\"SulgX\"",))
     if _SESSION_ALLOWED is not None:
         peer = writer.get_extra_info("peername")
@@ -1590,6 +1986,7 @@ async def _http_serve_connect(reader, writer, target, headers):
     target_reader, target_writer, reason = await _http_resolve_and_connect(host, port)
     if target_reader is None:
         status, phrase = _http_connect_failure_status(reason)
+        _LOG.info("http proxy connect failed user " + str(username) + " to " + str(host) + ":" + str(port) + " " + str(reason) + " from " + _mux_peer_text(writer))
         await _http_send_error(writer, status, phrase)
         return
     uid = link.get("uid", "")
@@ -1601,6 +1998,7 @@ async def _http_serve_connect(reader, writer, target, headers):
     try:
         writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         await writer.drain()
+        _LOG.info("http proxy connect user " + str(username) + " to " + str(host) + ":" + str(port) + " from " + _mux_peer_text(writer))
         sid, entry = _http_register_session(writer, username)
 
         async def _count(n, direction):
@@ -1634,6 +2032,7 @@ async def _http_serve_connect(reader, writer, target, headers):
                         pass
 
         async def _relay(src, dst, direction):
+            outcome = "eof"
             try:
                 while True:
                     chunk = await src.read(65536)
@@ -1643,7 +2042,7 @@ async def _http_serve_connect(reader, writer, target, headers):
                     await dst.drain()
                     await _count(len(chunk), direction)
             except (ConnectionError, asyncio.IncompleteReadError, asyncio.TimeoutError, OSError):
-                pass
+                outcome = "error"
             finally:
                 try:
                     dst.write_eof()
@@ -1652,8 +2051,22 @@ async def _http_serve_connect(reader, writer, target, headers):
                         dst.close()
                     except OSError:
                         pass
+            return outcome
 
-        await asyncio.gather(_relay(reader, target_writer, "up"), _relay(target_reader, writer, "down"))
+        up_task = asyncio.create_task(_relay(reader, target_writer, "up"))
+        down_task = asyncio.create_task(_relay(target_reader, writer, "down"))
+        done, pending = await asyncio.wait((up_task, down_task), return_when=asyncio.FIRST_COMPLETED)
+        errored = False
+        for task in done:
+            try:
+                if task.result() == "error":
+                    errored = True
+            except (asyncio.CancelledError, Exception):
+                errored = True
+        if errored:
+            for task in pending:
+                task.cancel()
+        await asyncio.gather(up_task, down_task, return_exceptions=True)
     except (ConnectionError, asyncio.IncompleteReadError, asyncio.TimeoutError, OSError):
         pass
     finally:
@@ -1710,6 +2123,7 @@ async def _http_serve_absolute(reader, writer, method, target, version, headers)
     target_reader, target_writer, reason = await _http_resolve_and_connect(host, port)
     if target_reader is None:
         status, phrase = _http_connect_failure_status(reason)
+        _LOG.info("http proxy absolute failed user " + str(username) + " to " + str(host) + ":" + str(port) + " " + str(reason) + " from " + _mux_peer_text(writer))
         await _http_send_error(writer, status, phrase)
         return
     uid = link.get("uid", "")
@@ -1720,6 +2134,7 @@ async def _http_serve_absolute(reader, writer, method, target, version, headers)
     entry = None
     try:
         sid, entry = _http_register_session(writer, username)
+        _LOG.info("http proxy absolute user " + str(username) + " to " + str(host) + ":" + str(port) + " " + str(method) + " from " + _mux_peer_text(writer))
 
         async def _count(n, direction):
             nonlocal total_bytes, up_flushed, down_flushed
@@ -1861,6 +2276,7 @@ async def _http_serve_absolute(reader, writer, method, target, version, headers)
             except (ConnectionError, asyncio.TimeoutError, OSError):
                 pass
         if sid is not None:
+            _LOG.info("http proxy absolute end user " + str(username) + " bytes=" + str(total_bytes) + " from " + _mux_peer_text(writer))
             ACTIVE_PROXY.pop(sid, None)
         try:
             target_writer.close()
@@ -1868,15 +2284,43 @@ async def _http_serve_absolute(reader, writer, method, target, version, headers)
             pass
 
 
+async def _read_http_head(reader):
+    buf = b""
+    deadline = time.monotonic() + 10.0
+    while True:
+        for sep in (b"\r\n\r\n", b"\n\n"):
+            at = buf.find(sep)
+            if at >= 0:
+                head = buf[:at + len(sep)]
+                rest = buf[at + len(sep):]
+                if b"\r\n" not in head:
+                    head = head.replace(b"\n", b"\r\n")
+                return head, rest
+        if len(buf) > 65536:
+            raise asyncio.LimitOverrunError("http head over 64KiB", b"")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise asyncio.TimeoutError()
+        chunk = await asyncio.wait_for(reader.read(65536), timeout=remaining)
+        if not chunk:
+            raise asyncio.IncompleteReadError(buf, None)
+        buf += bytes(chunk)
+
+
 async def _handle_http_proxy(reader, writer):
     _STATS["http_connections"] += 1
+    peer_text = _mux_peer_text(writer)
     try:
         try:
-            head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=10.0)
+            head, rest = await _read_http_head(reader)
+            if rest:
+                reader = _PrefixedReader(reader, rest)
         except asyncio.TimeoutError:
+            _LOG.info("http proxy head timeout from " + peer_text)
             await _http_send_error(writer, 408, "Request Timeout")
             return
         except asyncio.LimitOverrunError:
+            _LOG.info("http proxy head too large from " + peer_text)
             await _http_send_error(writer, 431, "Request Header Fields Too Large")
             return
         except (asyncio.IncompleteReadError, ConnectionError, OSError):
@@ -1952,6 +2396,35 @@ def _free_loopback_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
+
+
+def _stable_loopback_port(env_names, default_port):
+    if isinstance(env_names, str):
+        env_names = (env_names,)
+    wanted = 0
+    for env_name in env_names:
+        try:
+            wanted = int(os.environ.get(env_name, "") or 0)
+        except (TypeError, ValueError):
+            wanted = 0
+        if wanted:
+            break
+    if not wanted:
+        wanted = int(default_port)
+    if wanted <= 0 or wanted > 65535:
+        wanted = int(default_port)
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind(("127.0.0.1", wanted))
+    except OSError:
+        _LOG.warning("telemt fixed loopback port " + str(wanted) + " is busy, using an ephemeral port")
+        return _free_loopback_port()
+    finally:
+        try:
+            probe.close()
+        except OSError:
+            pass
+    return wanted
 
 
 def _random_bearer():
@@ -2031,13 +2504,26 @@ def _telemt_tls_host_ok(value):
     return True
 
 
+def sanitize_faketls_domain(raw, default="www.google.com"):
+    if not raw:
+        return default
+    text = str(raw).strip()
+    match = re.match(r"^\[([^\]]+)\]\(.*\)$", text)
+    if match:
+        text = match.group(1).strip()
+    text = re.sub(r"^[a-zA-Z]+://", "", text).split("/")[0].split("?")[0].strip()
+    if not re.fullmatch(r"[A-Za-z0-9.\-]{1,253}", text) or "." not in text:
+        return default
+    return text.lower()
+
+
 def _telemt_tls_set(primary, extras=None):
-    domain = str(primary or "").strip().lower()
+    domain = sanitize_faketls_domain(primary)
     if not _telemt_tls_host_ok(domain):
         domain = "www.google.com"
     domains = []
     for item in extras or []:
-        text = str(item or "").strip().lower()
+        text = sanitize_faketls_domain(item, default="")
         if not text or text == domain:
             continue
         if not _telemt_tls_host_ok(text):
@@ -2047,13 +2533,22 @@ def _telemt_tls_set(primary, extras=None):
     return domain, domains
 
 
-def _mtproto_config_text(api_port, token, port, bootstrap_secret, users=None, tls_domain="www.google.com", tls_domains=None):
+def _mtproto_config_text(api_port, token, port, bootstrap_secret, users=None, tls_domain="www.google.com", tls_domains=None, public_host=None, public_port=None):
     primary, extra_domains = _telemt_tls_set(tls_domain, tls_domains)
     lines = [
         "[general]",
         "use_middle_proxy = false",
         'log_level = "normal"',
         "",
+    ]
+    if public_host and public_port:
+        lines.extend([
+            "[general.links]",
+            'public_host = "' + _toml_escape(str(public_host)) + '"',
+            "public_port = " + str(int(public_port)),
+            "",
+        ])
+    lines.extend([
         "[general.modes]",
         "classic = true",
         "secure = true",
@@ -2070,9 +2565,14 @@ def _mtproto_config_text(api_port, token, port, bootstrap_secret, users=None, tl
         "port = " + str(port),
         'transport = "mtproxy"',
         "",
+        "[[server.listeners]]",
+        'ip = "::1"',
+        "port = " + str(port),
+        'transport = "mtproxy"',
+        "",
         "[censorship]",
         'tls_domain = "' + _toml_escape(primary) + '"',
-    ]
+    ])
     if extra_domains:
         lines.append('tls_domains = ["' + '", "'.join(_toml_escape(item) for item in extra_domains) + '"]')
     lines.extend([
@@ -2465,9 +2965,14 @@ async def _spawn_entry(entry):
         fields = entry["fields"]
         fields["generation"] = int(fields.get("generation") or 0) + 1
         live_primary, live_extras = _telemt_tls_set(str(fields.get("tls_domain") or "www.google.com"), fields.get("tls_domains"))
-        entry["config_text"] = _mtproto_config_text(entry["api_port"], entry["token"], entry["port"], str(fields.get("bootstrap_secret") or ""), users=_TELEMT_MTPROTO_USERS, tls_domain=live_primary, tls_domains=live_extras)
+        entry["config_text"] = _mtproto_config_text(entry["api_port"], entry["token"], entry["port"], str(fields.get("bootstrap_secret") or ""), users=_TELEMT_MTPROTO_USERS, tls_domain=live_primary, tls_domains=live_extras, public_host=fields.get("public_host"), public_port=fields.get("public_port"))
         fields["tls_domain_live"] = live_primary
         fields["tls_domains_live"] = live_extras
+        fields["links_host_live"] = str(fields.get("public_host") or "").strip() or None
+        try:
+            fields["links_port_live"] = int(fields.get("public_port")) if fields.get("public_port") is not None else None
+        except (TypeError, ValueError):
+            fields["links_port_live"] = None
         _write_text(entry["config_path"], entry["config_text"])
         entry["config_written"] = True
     elif not entry.get("config_written"):
@@ -2577,7 +3082,7 @@ def telemt_mtproto_port():
     return entry["port"]
 
 
-async def telemt_start_mtproto(tls_domain=None, tls_domains=None):
+async def telemt_start_mtproto(tls_domain=None, tls_domains=None, public_host=None, public_port=None):
     global _TELEMT_MTPROTO
     if not telemt_available():
         return {"enabled": False, "port": 0, "api_port": 0, "error": "telemt binary not found at " + _telemt_binary()}
@@ -2592,17 +3097,25 @@ async def telemt_start_mtproto(tls_domain=None, tls_domains=None):
             tls_domain = prev_fields.get("tls_domain")
         if tls_domains is None:
             tls_domains = prev_fields.get("tls_domains")
+        if public_host is None:
+            public_host = prev_fields.get("public_host")
+        if public_port is None:
+            public_port = prev_fields.get("public_port")
         if entry is not None:
             await _stop_entry(entry)
         base = _telemt_dir()
         run_dir = os.path.join(base, "mtproto")
         os.makedirs(run_dir, exist_ok=True)
         config_path = os.path.join(run_dir, "config.toml")
-        port = _free_loopback_port()
-        api_port = _free_loopback_port()
+        port = _stable_loopback_port(("TELEMT_PORT", "TELEMT_MTPROTO_PORT"), 8477)
+        api_port = _stable_loopback_port(("TELEMT_API_PORT", "TELEMT_MTPROTO_API_PORT"), 8478)
         token = _random_bearer()
-        fields = {"bootstrap_secret": secrets.token_hex(16), "tls_domain": tls_domain, "tls_domains": tls_domains}
-        config_text = _mtproto_config_text(api_port, token, port, fields["bootstrap_secret"], tls_domain=str(tls_domain or "www.google.com"), tls_domains=tls_domains)
+        try:
+            start_port = int(public_port) if public_port is not None else None
+        except (TypeError, ValueError):
+            start_port = None
+        fields = {"bootstrap_secret": secrets.token_hex(16), "tls_domain": tls_domain, "tls_domains": tls_domains, "public_host": str(public_host or "").strip() or None, "public_port": start_port}
+        config_text = _mtproto_config_text(api_port, token, port, fields["bootstrap_secret"], tls_domain=str(tls_domain or "www.google.com"), tls_domains=tls_domains, public_host=fields["public_host"], public_port=fields["public_port"])
         entry = _new_telemt_entry("mtproto", "mtproto", run_dir, config_path, port, api_port, token)
         entry["config_text"] = config_text
         entry["fields"] = fields
@@ -2636,8 +3149,63 @@ def _rfc3339(value):
 
 def _write_mtproto_config(entry):
     fields = entry.get("fields") or {}
-    entry["config_text"] = _mtproto_config_text(entry["api_port"], entry["token"], entry["port"], str(fields.get("bootstrap_secret") or ""), users=_TELEMT_MTPROTO_USERS, tls_domain=str(fields.get("tls_domain") or "www.google.com"), tls_domains=fields.get("tls_domains"))
+    entry["config_text"] = _mtproto_config_text(entry["api_port"], entry["token"], entry["port"], str(fields.get("bootstrap_secret") or ""), users=_TELEMT_MTPROTO_USERS, tls_domain=str(fields.get("tls_domain") or "www.google.com"), tls_domains=fields.get("tls_domains"), public_host=fields.get("public_host"), public_port=fields.get("public_port"))
     _write_text(entry["config_path"], entry["config_text"])
+
+
+def _telemt_mtproto_links_live(entry):
+    fields = entry.get("fields") or {}
+    if "links_host_live" in fields:
+        host = fields.get("links_host_live")
+    else:
+        host = fields.get("public_host")
+    if "links_port_live" in fields:
+        port = fields.get("links_port_live")
+    else:
+        port = fields.get("public_port")
+    try:
+        port = int(port) if port is not None else None
+    except (TypeError, ValueError):
+        port = None
+    return (str(host or "") or None, port)
+
+
+def telemt_mtproto_links():
+    entry = _TELEMT_MTPROTO
+    if entry is None:
+        return (None, None)
+    return _telemt_mtproto_links_live(entry)
+
+
+async def telemt_mtproto_set_links(public_host, public_port):
+    entry = _TELEMT_MTPROTO
+    if entry is None or not entry.get("ready"):
+        return False
+    async with _telemt_lock("mtproto-upsert"):
+        entry = _TELEMT_MTPROTO
+        if entry is None or not entry.get("ready"):
+            return False
+        wanted_host = str(public_host or "").strip() or None
+        try:
+            wanted_port = int(public_port) if public_port is not None else None
+        except (TypeError, ValueError):
+            wanted_port = None
+        if wanted_host is None:
+            wanted_port = None
+        live_host, live_port = _telemt_mtproto_links_live(entry)
+        if wanted_host == live_host and wanted_port == live_port:
+            return True
+        fields = entry.get("fields") or {}
+        fields["public_host"] = wanted_host
+        fields["public_port"] = wanted_port
+        entry["fields"] = fields
+        try:
+            _write_mtproto_config(entry)
+        except OSError:
+            return False
+        if not await _restart_mtproto_entry(entry):
+            return False
+        return True
 
 
 async def _restart_mtproto_entry(entry):
@@ -2748,7 +3316,7 @@ async def _telemt_mtproto_wait_live(entry, username, timeout=10.0):
     return False
 
 
-async def telemt_mtproto_upsert_user(uid, secret_hex, variant="dd", domain="www.google.com", max_conns=0, limit_bytes=0, expires_at=None, tls_domain=None, tls_domains=None):
+async def telemt_mtproto_upsert_user(uid, secret_hex, variant="dd", domain="www.google.com", max_conns=0, limit_bytes=0, expires_at=None, tls_domain=None, tls_domains=None, public_host=None, public_port=None):
     if not _valid_secret_hex(secret_hex):
         _LOG.warning("telemt MTProto upsert refused for uid %s: secret must be 32 hex characters", uid)
         return False
@@ -2766,26 +3334,33 @@ async def telemt_mtproto_upsert_user(uid, secret_hex, variant="dd", domain="www.
     async with _telemt_lock("mtproto-upsert"):
         _TELEMT_MTPROTO_USERS[username] = {"uid": str(uid), "secret_hex": secret_hex.lower(), "max_conns": int(max_conns or 0), "limit_bytes": int(limit_bytes or 0), "expires_at": expires_text}
         entry = _TELEMT_MTPROTO
-        if tls_domain is not None or tls_domains is not None:
+        if tls_domain is not None or tls_domains is not None or public_host is not None or public_port is not None:
             if entry is not None:
                 fields = entry.get("fields") or {}
                 if tls_domain is not None:
                     fields["tls_domain"] = tls_domain
                 if tls_domains is not None:
                     fields["tls_domains"] = tls_domains
+                if public_host is not None:
+                    fields["public_host"] = str(public_host or "").strip() or None
+                if public_port is not None:
+                    try:
+                        fields["public_port"] = int(public_port)
+                    except (TypeError, ValueError):
+                        fields["public_port"] = None
                 entry["fields"] = fields
         if entry is None or not entry.get("ready"):
             if entry is not None and not entry.get("gave_up"):
                 if await _wait_entry_ready(entry, timeout=30.0):
                     entry = _TELEMT_MTPROTO
                 else:
-                    started = await telemt_start_mtproto(tls_domain, tls_domains)
+                    started = await telemt_start_mtproto(tls_domain, tls_domains, public_host, public_port)
                     if not started.get("enabled"):
                         return False
                     entry = _TELEMT_MTPROTO
                     return await _telemt_mtproto_wait_live(entry, username)
             else:
-                started = await telemt_start_mtproto(tls_domain, tls_domains)
+                started = await telemt_start_mtproto(tls_domain, tls_domains, public_host, public_port)
                 if not started.get("enabled"):
                     return False
                 entry = _TELEMT_MTPROTO
@@ -2796,7 +3371,13 @@ async def telemt_mtproto_upsert_user(uid, secret_hex, variant="dd", domain="www.
             pass
         _want_primary, _want_extras = _telemt_tls_set(str((entry.get("fields") or {}).get("tls_domain") or "www.google.com"), (entry.get("fields") or {}).get("tls_domains"))
         _live_primary, _live_extras = _telemt_mtproto_tls_live(entry)
-        if _want_primary != _live_primary or sorted(_want_extras) != sorted(_live_extras):
+        _live_links_host, _live_links_port = _telemt_mtproto_links_live(entry)
+        _want_links_host = str((entry.get("fields") or {}).get("public_host") or "").strip() or None
+        try:
+            _want_links_port = int((entry.get("fields") or {}).get("public_port")) if (entry.get("fields") or {}).get("public_port") is not None else None
+        except (TypeError, ValueError):
+            _want_links_port = None
+        if _want_primary != _live_primary or sorted(_want_extras) != sorted(_live_extras) or _want_links_host != _live_links_host or _want_links_port != _live_links_port:
             if not await _restart_mtproto_entry(entry):
                 return False
             return await _telemt_mtproto_wait_live(_TELEMT_MTPROTO, username)
@@ -2911,8 +3492,8 @@ async def telemt_start_web(uid, token, secret_hex, host, max_sessions=8, max_str
         run_dir = os.path.join(base, _telemt_username(key))
         os.makedirs(run_dir, exist_ok=True)
         config_path = os.path.join(run_dir, "config.toml")
-        port = _free_loopback_port()
-        api_port = _free_loopback_port()
+        port = _stable_loopback_port("TELEMT_WEB_PORT", 8479)
+        api_port = _stable_loopback_port("TELEMT_WEB_API_PORT", 8480)
         bearer = _random_bearer()
         fields = {"uid": key, "web_token": token, "secret_hex": secret_hex.lower(), "host": host, "public_ip": resolved_ip, "max_sessions": max_sessions, "max_streams": max_streams, "root_enabled": bool(root_enabled), "profiles": wanted_profiles}
         entry = _new_telemt_entry("web", key, run_dir, config_path, port, api_port, bearer)
@@ -3223,6 +3804,44 @@ async def telemt_health():
     return {"available": available, "mtproto": mtproto, "web": web, "error": error}
 
 
+_MUX_BIND_MODES = {}
+
+
+def mux_bind_modes():
+    return dict(_MUX_BIND_MODES)
+
+
+def _mux_dispatch_count(kind):
+    key = "dispatch_" + kind
+    _STATS[key] = int(_STATS.get(key) or 0) + 1
+    return _STATS[key]
+
+
+async def _start_mux_server(port):
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        sock.bind(("::", port))
+        sock.listen(256)
+        server = await asyncio.start_server(_handle_multi, sock=sock)
+        sock = None
+        _MUX_BIND_MODES[port] = "dual-stack"
+        _LOG.info("proxy mux bind mode dual-stack on port " + str(port))
+        return server
+    except OSError as exc:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        server = await asyncio.start_server(_handle_multi, "0.0.0.0", port)
+        _MUX_BIND_MODES[port] = "ipv4-only"
+        _LOG.info("proxy mux bind mode ipv4-only on port " + str(port) + " after dual-stack failed: " + str(exc))
+        return server
+
+
 async def start_all(multi_ports, auth_lookup, count_traffic, mtproxy_quota_ok, session_allowed=None):
     global _AUTH_LOOKUP, _COUNT_TRAFFIC, _MTPROXY_QUOTA_OK, _SESSION_ALLOWED
     _AUTH_LOOKUP = auth_lookup
@@ -3255,14 +3874,16 @@ async def start_all(multi_ports, auth_lookup, count_traffic, mtproxy_quota_ok, s
     failed = {}
     for port in ports:
         try:
-            server = await asyncio.start_server(_handle_multi, "0.0.0.0", port)
+            server = await _start_mux_server(port)
             _SERVERS.append(server)
             _BOUND_PORTS.add(port)
             _BIND_ERRORS.pop(port, None)
             bound.append(port)
+            _LOG.info("proxy mux listening on port " + str(port))
         except OSError as exc:
             failed[port] = _bind_error_text(port, exc)
             _BIND_ERRORS[port] = _bind_error_text(port, exc)
+            _LOG.warning("proxy mux failed to bind port " + str(port) + ": " + _bind_error_text(port, exc))
             if not bind_error:
                 bind_error = _bind_error_text(port, exc)
     first = bound[0] if bound else 0
@@ -3305,14 +3926,16 @@ async def ensure_proxy_ports(ports):
         if port in _BOUND_PORTS:
             continue
         try:
-            server = await asyncio.start_server(_handle_multi, "0.0.0.0", port)
+            server = await _start_mux_server(port)
             _SERVERS.append(server)
             _BOUND_PORTS.add(port)
             _BIND_ERRORS.pop(port, None)
             bound.append(port)
+            _LOG.info("proxy mux listening on port " + str(port))
         except OSError as exc:
             failed[port] = _bind_error_text(port, exc)
             _BIND_ERRORS[port] = _bind_error_text(port, exc)
+            _LOG.warning("proxy mux failed to bind port " + str(port) + ": " + _bind_error_text(port, exc))
     return {"bound": bound, "failed": {str(k): v for k, v in failed.items()}, "ports": sorted(_BOUND_PORTS), "errors": {str(k): v for k, v in _BIND_ERRORS.items()}}
 
 
