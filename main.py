@@ -123,6 +123,9 @@ _WEB_BRIDGE_SERVERS = {}
 _WEB_BRIDGE_ERRORS = {}
 SINGLE_PORT_HOST = not SOCKS_PORT and not TG_PROXY_PORT and not HTTP_PROXY_PORT
 WEBPROXY_STATE = {"configure_error": "", "startup_lane_check": {"ok": False, "detail": "not run yet"}, "child_errors": {}}
+_WEB_BASE_SECRET_HEX = ""
+_WEB_BASE_SECRET_SOURCE = ""
+_TELEMT_WEB_HOSTS = {}
 TELEMT_HEALTH = {"available": False, "mtproto": False, "web": False, "error": ""}
 _TELEMT_WEB_STATUS_CACHE = {}
 _TELEMT_PROVISIONED = {"web": set(), "mtproto": set()}
@@ -159,18 +162,69 @@ def _b64u_encode(data):
     return base64.urlsafe_b64encode(bytes(data)).rstrip(b"=").decode("ascii")
 
 
+def _web_base_secret_valid(value):
+    text = str(value or "").strip().lower()
+    if text.startswith("dd"):
+        text = text[2:]
+    return len(text) == 32 and all(c in "0123456789abcdef" for c in text)
+
+
+def _web_base_secret_normalize(value):
+    text = str(value or "").strip().lower()
+    if text.startswith("dd"):
+        text = text[2:]
+    return text
+
+
 def _web_base_secret_bytes():
+    if _WEB_BASE_SECRET_HEX and _web_base_secret_valid(_WEB_BASE_SECRET_HEX):
+        return bytes.fromhex(_WEB_BASE_SECRET_HEX)
     raw = os.environ.get("TG_WEB_SECRET", "").strip()
-    if raw:
-        text = raw[2:] if raw.lower().startswith("dd") else raw
-        try:
-            parsed = bytes.fromhex(text)
-        except ValueError:
-            raise ValueError("TG_WEB_SECRET invalid — set a valid 32-hex secret or delete the variable")
-        if len(parsed) != 16:
-            raise ValueError("TG_WEB_SECRET invalid — set a valid 32-hex secret or delete the variable")
-        return parsed
+    if raw and _web_base_secret_valid(raw):
+        return bytes.fromhex(_web_base_secret_normalize(raw))
     return hashlib.sha256(b"proxygosha-secret-from-panel-v1\n" + str(CONFIG["secret_key"]).encode("utf-8")).digest()[:16]
+
+
+async def _ensure_web_base_secret():
+    global _WEB_BASE_SECRET_HEX, _WEB_BASE_SECRET_SOURCE
+    if _WEB_BASE_SECRET_HEX and _web_base_secret_valid(_WEB_BASE_SECRET_HEX):
+        return _WEB_BASE_SECRET_HEX
+    raw_env = os.environ.get("TG_WEB_SECRET", "").strip()
+    if raw_env and _web_base_secret_valid(raw_env):
+        _WEB_BASE_SECRET_HEX = _web_base_secret_normalize(raw_env)
+        _WEB_BASE_SECRET_SOURCE = "env"
+        os.environ["TG_WEB_SECRET"] = _WEB_BASE_SECRET_HEX
+        return _WEB_BASE_SECRET_HEX
+    if raw_env:
+        logger.warning("TG_WEB_SECRET in the environment is not a valid 32-hex secret, ignoring it and using a stored or generated secret instead")
+    try:
+        stored = await db_fetchone(
+            "SELECT value FROM settings WHERE key = 'tg_web_secret'",
+            "SELECT value FROM settings WHERE key = 'tg_web_secret'"
+        )
+        if stored and stored["value"] and _web_base_secret_valid(stored["value"]):
+            _WEB_BASE_SECRET_HEX = _web_base_secret_normalize(stored["value"])
+            _WEB_BASE_SECRET_SOURCE = "stored"
+            os.environ["TG_WEB_SECRET"] = _WEB_BASE_SECRET_HEX
+            return _WEB_BASE_SECRET_HEX
+        generated = secrets.token_hex(16)
+        await db_execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('tg_web_secret', ?)",
+            "INSERT INTO settings (key, value) VALUES ('tg_web_secret', $1) ON CONFLICT (key) DO UPDATE SET value = $1",
+            (generated,),
+        )
+        _WEB_BASE_SECRET_HEX = generated
+        _WEB_BASE_SECRET_SOURCE = "generated"
+        os.environ["TG_WEB_SECRET"] = generated
+        logger.warning("TG_WEB_SECRET was missing or invalid, a valid secret was generated and stored in the database so WEB proxy links keep working across restarts")
+        return _WEB_BASE_SECRET_HEX
+    except Exception as exc:
+        logger.error("could not read or store the WEB base secret, using a derived fallback for this boot: " + str(exc))
+        derived = hashlib.sha256(b"proxygosha-secret-from-panel-v1\n" + str(CONFIG["secret_key"]).encode("utf-8")).digest()[:16].hex()
+        _WEB_BASE_SECRET_HEX = derived
+        _WEB_BASE_SECRET_SOURCE = "derived"
+        os.environ["TG_WEB_SECRET"] = derived
+        return _WEB_BASE_SECRET_HEX
 
 
 def _web_token_secret_bytes(token):
@@ -448,7 +502,8 @@ async def _telemt_sync_root_vhost():
             return
         try:
             secret_hex = _web_secret_hex_for_link(oldest)
-        except ValueError:
+        except ValueError as exc:
+            WEBPROXY_STATE["child_errors"][_TELEMT_ROOT_CHILD_UID] = str(exc)
             return
         host = get_domain()
         key = oldest_uid + "|" + secret_hex + "|" + host
@@ -523,6 +578,7 @@ async def _telemt_sync_root_vhost():
 
 
 async def _telemt_provision_web(link):
+    await _ensure_web_base_secret()
     uid = str(link.get("uid", ""))
     token = str(link.get("webproxy_token") or "").strip().lower()
     if not token:
@@ -545,6 +601,7 @@ async def _telemt_provision_web(link):
     if result is None and _tg_fn("telemt_start_web") is None:
         raise ValueError("telemt WEB start is not available in the telegram module")
     _TELEMT_PROVISIONED["web"].add(uid)
+    _TELEMT_WEB_HOSTS[uid] = host
 
 
 async def _telemt_provision_mtproto(link):
@@ -578,6 +635,7 @@ async def _telemt_remove_web(uid):
     except Exception:
         pass
     _TELEMT_PROVISIONED["web"].discard(uid)
+    _TELEMT_WEB_HOSTS.pop(uid, None)
     _TELEMT_WEB_STATUS_CACHE.pop(uid, None)
     if _TELEMT_ROOT_UID == uid:
         _TELEMT_ROOT_UID = ""
@@ -627,6 +685,8 @@ async def _telemt_sync_link(link, previous=None):
             if str((previous or {}).get(key) or "") != str(link.get(key) or ""):
                 changed = True
                 break
+    if protocol == "webproxy" and uid in _TELEMT_WEB_HOSTS and _TELEMT_WEB_HOSTS.get(uid) != get_domain():
+        changed = True
     if protocol == "webproxy":
         provisioned = uid in _TELEMT_PROVISIONED["web"] and _telemt_web_port_for_uid(uid) is not None
         if changed or not provisioned:
@@ -826,8 +886,8 @@ def validate_transport_fields(body):
             raise HTTPException(status_code=400, detail="Invalid host name for " + key)
     if "ech_doh" in body and str(body.get("ech_doh") or "").strip():
         doh = str(body.get("ech_doh")).strip()
-        if not doh.startswith("https://") or any(ch.isspace() for ch in doh):
-            raise HTTPException(status_code=400, detail="Invalid ECH DoH URL: must start with https://")
+        if not validate_ech_config_url(doh):
+            raise HTTPException(status_code=400, detail="Invalid ECH config URL: must start with https://, udp:// or h2c://")
     if "xray_doh_url" in body and str(body.get("xray_doh_url") or "").strip():
         if not validate_doh_url(body.get("xray_doh_url")):
             raise HTTPException(status_code=400, detail="Invalid DoH URL: must be an https:// URL with a valid host")
@@ -978,15 +1038,53 @@ def resolve_ech_for_link(link):
         return True, str(link.get("ech_sni")).strip(), str(link.get("ech_doh") or "").strip()
     return False, "", ""
 
+ECH_RANDOM_FINGERPRINTS = ("randomized", "randomizednoalpn", "random")
+
+
+def ech_config_list_value(link):
+    ech_on, ech_sni, ech_doh = resolve_ech_for_link(link)
+    if not ech_on:
+        return ""
+    if ech_sni and ech_doh:
+        return ech_sni + "+" + ech_doh
+    if ech_doh:
+        return ech_doh
+    if ech_sni:
+        return ech_sni + "+" + DOH_FALLBACK_URL
+    return ""
+
+
+def ech_safe_fingerprint(link, fingerprint):
+    if not fingerprint:
+        return fingerprint
+    ech_on, _ech_sni, _ech_doh = resolve_ech_for_link(link)
+    if ech_on and str(fingerprint).strip().lower() in ECH_RANDOM_FINGERPRINTS:
+        return "chrome"
+    return fingerprint
+
+
+def validate_ech_config_url(url):
+    text = str(url or "").strip()
+    if any(ch.isspace() for ch in text):
+        return False
+    for scheme in ("https://", "udp://", "h2c://"):
+        if text.startswith(scheme):
+            rest = text[len(scheme):]
+            host = rest.split("/")[0].split("?")[0].split("#")[0].split(":")[0]
+            if host and "." in host and re.match(r"^[A-Za-z0-9.-]+$", host) and ".." not in host:
+                return True
+            return False
+    return False
+
 
 RESTRICTION_PROFILES = ("default", "normal", "relative", "severe", "emergency", "custom")
 LEGACY_SERVICE_PROFILES = ("youtube", "instagram", "twitter", "tiktok", "whatsapp", "telegram", "netflix", "spotify", "google")
 RESTRICTION_PROFILE_PARAMS = {
     "default": {"fragment_mode": "off", "fragment": "", "fragment_length": "100-200", "fragment_interval": "10-20", "fingerprint": "chrome", "alpn": "smart", "ech_enabled": 0, "ech_sni": "", "ech_doh": "", "ech_preset": "", "random_path": 0, "tfo": 0, "udp_enabled": 1, "enable_ipv6": 1, "xray_dns_mode": "direct"},
     "normal": {"fragment_mode": "off", "fragment": "", "fragment_length": "100-200", "fragment_interval": "10-20", "fingerprint": "chrome", "alpn": "smart", "ech_enabled": 0, "ech_sni": "", "ech_doh": "", "ech_preset": "", "random_path": 0, "tfo": 0, "udp_enabled": 1, "enable_ipv6": 1, "xray_dns_mode": "direct"},
-    "relative": {"fragment_mode": "tlshello", "fragment": "tlshello", "fragment_length": "100-200", "fragment_interval": "10-20", "fingerprint": "randomized", "alpn": "smart", "ech_enabled": 1, "ech_sni": "cloudflare.com", "ech_doh": "https://cloudflare-dns.com/dns-query", "ech_preset": "cloudflare", "random_path": 1, "tfo": 1, "udp_enabled": 1, "enable_ipv6": 1, "xray_dns_mode": "doh"},
-    "severe": {"fragment_mode": "tlshello", "fragment": "tlshello", "fragment_length": "100-500", "fragment_interval": "5-10", "fingerprint": "randomized", "alpn": "smart", "ech_enabled": 1, "ech_sni": "cloudflare.com", "ech_doh": "https://cloudflare-dns.com/dns-query", "ech_preset": "cloudflare", "random_path": 1, "tfo": 1, "udp_enabled": 0, "enable_ipv6": 1, "xray_dns_mode": "doh"},
-    "emergency": {"fragment_mode": "tlshello", "fragment": "tlshello", "fragment_length": "50-100", "fragment_interval": "1-5", "fingerprint": "randomized", "alpn": "smart", "ech_enabled": 1, "ech_sni": "cloudflare.com", "ech_doh": "https://cloudflare-dns.com/dns-query", "ech_preset": "cloudflare", "random_path": 1, "tfo": 1, "udp_enabled": 0, "enable_ipv6": 0, "xray_dns_mode": "fakedns"},
+    "relative": {"fragment_mode": "tlshello", "fragment": "tlshello", "fragment_length": "100-200", "fragment_interval": "10-20", "fingerprint": "chrome", "alpn": "smart", "ech_enabled": 1, "ech_sni": "cloudflare.com", "ech_doh": "https://cloudflare-dns.com/dns-query", "ech_preset": "cloudflare", "random_path": 1, "tfo": 1, "udp_enabled": 1, "enable_ipv6": 1, "xray_dns_mode": "doh"},
+    "severe": {"fragment_mode": "tlshello", "fragment": "tlshello", "fragment_length": "100-500", "fragment_interval": "5-10", "fingerprint": "chrome", "alpn": "smart", "ech_enabled": 1, "ech_sni": "cloudflare.com", "ech_doh": "https://cloudflare-dns.com/dns-query", "ech_preset": "cloudflare", "random_path": 1, "tfo": 1, "udp_enabled": 0, "enable_ipv6": 1, "xray_dns_mode": "doh"},
+    "emergency": {"fragment_mode": "tlshello", "fragment": "tlshello", "fragment_length": "50-100", "fragment_interval": "1-5", "fingerprint": "chrome", "alpn": "smart", "ech_enabled": 1, "ech_sni": "cloudflare.com", "ech_doh": "https://cloudflare-dns.com/dns-query", "ech_preset": "cloudflare", "random_path": 1, "tfo": 1, "udp_enabled": 0, "enable_ipv6": 0, "xray_dns_mode": "fakedns"},
 }
 
 
@@ -1218,44 +1316,6 @@ def _proxy_session_count(uid):
     return total
 
 
-BLOCKED_PAIRS = set()
-
-
-def is_session_blocked(uid, ip):
-    return (str(uid or ""), str(ip or "")) in BLOCKED_PAIRS
-
-
-async def load_blocked_sessions():
-    global BLOCKED_PAIRS
-    try:
-        rows = await db_fetchall("SELECT uid, ip FROM blocked_sessions", "SELECT uid, ip FROM blocked_sessions")
-        BLOCKED_PAIRS = {(str(r["uid"]), str(r["ip"])) for r in rows}
-    except Exception as e:
-        logger.error(f"load_blocked_sessions failed: {e}")
-
-
-async def block_session(uid, ip, reason=""):
-    uid = str(uid or "")
-    ip = str(ip or "")
-    if not uid or not ip:
-        return False
-    await db_execute("INSERT OR IGNORE INTO blocked_sessions (uid, ip, reason, created_at) VALUES (?,?,?,?)", "INSERT INTO blocked_sessions (uid, ip, reason, created_at) VALUES ($1,$2,$3,$4) ON CONFLICT (uid, ip) DO NOTHING", (uid, ip, str(reason or "")[:120], datetime.now(UTC).isoformat()))
-    BLOCKED_PAIRS.add((uid, ip))
-    log_event("Blocked", "Session blocked for " + uid + " from " + ip, ip=ip)
-    return True
-
-
-async def unblock_session(uid, ip):
-    uid = str(uid or "")
-    ip = str(ip or "")
-    if not uid or not ip:
-        return False
-    await db_execute("DELETE FROM blocked_sessions WHERE uid = ? AND ip = ?", "DELETE FROM blocked_sessions WHERE uid = $1 AND ip = $2", (uid, ip))
-    BLOCKED_PAIRS.discard((uid, ip))
-    log_event("Blocked", "Session unblocked for " + uid + " from " + ip, ip=ip)
-    return True
-
-
 def subnet24_of(ip):
     raw = str(ip or "").strip()
     if not raw:
@@ -1269,87 +1329,7 @@ def subnet24_of(ip):
     return str(ipaddress.ip_network(raw + "/64", strict=False))
 
 
-RESTRICTED_NETWORKS = []
-
-
-def _restricted_networks_reload(rows):
-    global RESTRICTED_NETWORKS
-    parsed = []
-    for r in rows:
-        entry = str(r["entry"])
-        try:
-            net = ipaddress.ip_network(entry, strict=False)
-        except ValueError:
-            continue
-        parsed.append((str(net), net))
-    RESTRICTED_NETWORKS = parsed
-
-
-async def load_restricted_ips():
-    try:
-        rows = await db_fetchall("SELECT entry FROM restricted_ips", "SELECT entry FROM restricted_ips")
-        _restricted_networks_reload(rows)
-    except Exception as e:
-        logger.error(f"load_restricted_ips failed: {e}")
-
-
-def is_ip_restricted(ip):
-    raw = str(ip or "").strip()
-    if not raw:
-        return False
-    try:
-        addr = ipaddress.ip_address(raw)
-    except ValueError:
-        return False
-    for _entry, net in RESTRICTED_NETWORKS:
-        if addr.version != net.version:
-            continue
-        if addr in net:
-            return True
-    return False
-
-
-def normalize_restricted_entry(raw):
-    text = str(raw or "").strip()
-    if not text:
-        raise ValueError("empty entry")
-    if "/" in text:
-        net = ipaddress.ip_network(text, strict=False)
-        if net.prefixlen == 0:
-            raise ValueError("prefix is too broad")
-        return str(net)
-    addr = ipaddress.ip_address(text)
-    return str(addr)
-
-
-async def add_restricted_ip(entry, note=""):
-    entry = normalize_restricted_entry(entry)
-    for _existing, _net in RESTRICTED_NETWORKS:
-        if _existing == entry:
-            return None
-    await db_execute("INSERT INTO restricted_ips (entry, note, created_at) VALUES (?,?,?)", "INSERT INTO restricted_ips (entry, note, created_at) VALUES ($1,$2,$3)", (entry, str(note or "")[:120], datetime.now(UTC).isoformat()))
-    RESTRICTED_NETWORKS.append((entry, ipaddress.ip_network(entry, strict=False)))
-    log_event("Restricted", "Restricted source " + entry, ip="")
-    return entry
-
-
-async def remove_restricted_ip(entry):
-    entry = normalize_restricted_entry(entry)
-    await db_execute("DELETE FROM restricted_ips WHERE entry = ?", "DELETE FROM restricted_ips WHERE entry = $1", (entry,))
-    RESTRICTED_NETWORKS[:] = [(e, n) for e, n in RESTRICTED_NETWORKS if e != entry]
-    log_event("Restricted", "Released restricted source " + entry, ip="")
-    return entry
-
-
-async def block_pair_with_telemt(uid, ip, reason=""):
-    await block_session(uid, ip, reason)
-
-
 def _session_limit_reason(link, uuid, client_ip, exclude_conn_id=None):
-    if is_session_blocked(uuid, client_ip):
-        return "blocked by admin"
-    if is_ip_restricted(client_ip):
-        return "restricted by admin"
     max_conn = int(link.get("max_connections") or 0)
     if max_conn > 0:
         n = sum(1 for cid, info in connections.items() if info.get("uuid") == uuid and cid != exclude_conn_id)
@@ -2977,6 +2957,7 @@ def generate_vmess_link(uid, remark="SulgX", address=None, extra=None, server_do
     fingerprint = (extra.get("fingerprint") or extra.get("custom_fp") or "chrome") if extra else "chrome"
     if not fingerprint or fingerprint.lower() == "none":
         fingerprint = ""
+    fingerprint = ech_safe_fingerprint(extra, fingerprint)
     alpn = effective_alpn(extra) or ""
     port = extra.get("port", 443) if extra else 443
     scy = vmess_security_for_link(extra)
@@ -3005,6 +2986,7 @@ def generate_trojan_link(uid, remark="SulgX", address=None, extra=None, server_d
     fingerprint = (extra.get("fingerprint") or extra.get("custom_fp") or "chrome") if extra else "chrome"
     if not fingerprint or fingerprint.lower() == "none":
         fingerprint = ""
+    fingerprint = ech_safe_fingerprint(extra, fingerprint)
     alpn = effective_alpn(extra) or ""
     port = extra.get("port", 443) if extra else 443
     fragment = fragment_spec_for_link(extra) if extra else ""
@@ -3023,12 +3005,9 @@ def generate_trojan_link(uid, remark="SulgX", address=None, extra=None, server_d
         params["allowInsecure"] = "0"
     if fragment:
         params["fragment"] = fragment
-    ech_enabled, ech_sni, ech_doh = resolve_ech_for_link(extra)
-    if ech_enabled and ech_sni:
-        ech_param = ech_sni
-        if ech_doh:
-            ech_param += "+" + ech_doh
-        params["ech"] = ech_param
+    _ech_value = ech_config_list_value(extra)
+    if _ech_value:
+        params["ech"] = _ech_value
     query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
     return f"trojan://{uid}@{format_host_port(addr, port)}?{query}#{quote(remark)}"
 
@@ -3257,6 +3236,20 @@ def _proxy_mux_bound(port):
         return int(port) in _PROXY_MUX_PORTS
     except (TypeError, ValueError):
         return False
+
+
+def _proxy_local_listener_usable(link):
+    if link is None or not link.get("active"):
+        return False
+    try:
+        port = int(link.get("port") or 0)
+    except (TypeError, ValueError):
+        return False
+    if not port:
+        return False
+    if _PROXY_MUX_BIND_ERRORS.get(port):
+        return False
+    return _proxy_mux_bound(port)
 
 
 def _web_bridge_running(port):
@@ -3511,10 +3504,11 @@ async def _card_usability(domain):
             if not _on:
                 if not _port:
                     result[_pid] = (False, "no_port")
-                else:
+                    continue
+                if not _proxy_local_listener_usable(_link):
                     _err = _PROXY_MUX_BIND_ERRORS.get(_port, "") or (TG_PROXY_STATUS.get({"socks5": "socks", "mtproto": "mtproxy", "http-proxy": "http"}.get(_pid, ""), {}) or {}).get("error", "") or ""
                     result[_pid] = (False, "listener_failed" if _err else "disabled")
-                continue
+                    continue
             _variant = str(_link.get("mtproto_variant") or "dd") if _pid == "mtproto" else ""
             _tls_domain = str(_link.get("mtproto_domain") or "www.google.com") if _pid == "mtproto" else ""
             check_ids.append(_pid)
@@ -3566,7 +3560,7 @@ async def _listener_cards(public_port, request=None):
             _why = "Listener is bound on port " + str(_shown_port) + " and the local handshake passes, but the public address is not reachable from outside on this host (single HTTPS port only, or the TCP port is closed)"
         cards.append({"id": _pid, "name": _pname, "protocol": _pid, "port": str(_shown_port) if _shown_port else "—", "enabled": bool(_on), "reason": _why, "reason_code": _code})
     _web_on, _web_code = usable.get("webproxy", (_proxy_listener_enabled("webproxy"), "running_panel" if _proxy_listener_enabled("webproxy") else "not_configured"))
-    cards.append({"id": "webproxy", "name": "WEB proxy", "protocol": "webproxy", "port": str(WEBPROXY_PUBLIC_PORT), "enabled": bool(_web_on), "reason": "" if _web_on else _proxy_disabled_reason("webproxy"), "reason_code": "running_panel" if _web_on else _web_code, "shared": _webproxy_shared_443()})
+    cards.append({"id": "webproxy", "name": "WEB proxy", "protocol": "webproxy", "port": str(WEBPROXY_PUBLIC_PORT), "enabled": bool(_web_on), "reason": "" if _web_on else _proxy_disabled_reason("webproxy"), "reason_code": "running_panel" if _web_on else _web_code, "shared": _webproxy_shared_443(), "tg_web_secret": _WEB_BASE_SECRET_HEX or "", "tg_web_secret_source": _WEB_BASE_SECRET_SOURCE or ""})
     return cards
 
 
@@ -3687,6 +3681,12 @@ async def refresh_proxy_listener_status(force=False):
         web_entry["failed_ports"] = {str(p): e for p, e in _WEB_BRIDGE_ERRORS.items()}
         web_entry["bridge_ports"] = sorted({int(_l.get("port") or 443) for _l in _status_rows if (_l.get("protocol") or "") == "webproxy" and _l.get("active") and int(_l.get("port") or 443) != int(WEBPROXY_PUBLIC_PORT) and _web_bridge_running(int(_l.get("port") or 443))})
         web_entry["bridge_errors"] = dict(_WEB_BRIDGE_ERRORS)
+        try:
+            await _ensure_web_base_secret()
+        except Exception:
+            pass
+        if _WEB_BASE_SECRET_HEX:
+            WEBPROXY_STATE["configure_error"] = ""
         if WEBPROXY_STATE.get("configure_error"):
             web_entry["enabled"] = False
             web_entry["error"] = str(WEBPROXY_STATE["configure_error"])
@@ -3744,7 +3744,7 @@ async def _telemt_retry_web_children():
     child_errors = WEBPROXY_STATE.get("child_errors") or {}
     for link in rows:
         uid = str(link.get("uid", ""))
-        needs = uid not in _TELEMT_PROVISIONED.get("web", set()) or uid in child_errors or _telemt_web_port_for_uid(uid) is None
+        needs = uid not in _TELEMT_PROVISIONED.get("web", set()) or uid in child_errors or _telemt_web_port_for_uid(uid) is None or _TELEMT_WEB_HOSTS.get(uid) != get_domain()
         if not needs:
             continue
         try:
@@ -4215,8 +4215,7 @@ if CONFIG["database_url"] and HAS_POSTGRES:
                     owner_user_id TEXT DEFAULT '', outbound_proxy TEXT DEFAULT '', outbound_proxy_pass TEXT DEFAULT ''
                 );
                 CREATE TABLE IF NOT EXISTS hourly_traffic (hour TEXT PRIMARY KEY, bytes BIGINT DEFAULT 0);
-                CREATE TABLE IF NOT EXISTS blocked_sessions (uid TEXT NOT NULL, ip TEXT NOT NULL, reason TEXT DEFAULT '', created_at TEXT DEFAULT '', PRIMARY KEY (uid, ip));
-                CREATE TABLE IF NOT EXISTS restricted_ips (entry TEXT PRIMARY KEY, note TEXT DEFAULT '', created_at TEXT DEFAULT '');
+                CREATE TABLE IF NOT EXISTS session_events (id SERIAL PRIMARY KEY, conn_id TEXT NOT NULL, uid TEXT DEFAULT '', ip TEXT DEFAULT '', inbound TEXT DEFAULT '', transport TEXT DEFAULT '', started_at TEXT NOT NULL, ended_at TEXT DEFAULT '');
                 CREATE TABLE IF NOT EXISTS daily_traffic (day TEXT PRIMARY KEY, bytes BIGINT DEFAULT 0, uid TEXT DEFAULT '');
                 CREATE TABLE IF NOT EXISTS custom_addresses (
                     id SERIAL PRIMARY KEY,
@@ -4424,8 +4423,7 @@ else:
                 last_test_ok INTEGER DEFAULT 0, last_test_ms INTEGER DEFAULT 0, last_test_detail TEXT DEFAULT '', last_test_at TEXT DEFAULT '', last_test_target TEXT DEFAULT '', last_test_verdict TEXT DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS hourly_traffic (hour TEXT PRIMARY KEY, bytes INTEGER DEFAULT 0);
-            CREATE TABLE IF NOT EXISTS blocked_sessions (uid TEXT NOT NULL, ip TEXT NOT NULL, reason TEXT DEFAULT '', created_at TEXT DEFAULT '', PRIMARY KEY (uid, ip));
-                CREATE TABLE IF NOT EXISTS restricted_ips (entry TEXT PRIMARY KEY, note TEXT DEFAULT '', created_at TEXT DEFAULT '');
+            CREATE TABLE IF NOT EXISTS session_events (id INTEGER PRIMARY KEY AUTOINCREMENT, conn_id TEXT NOT NULL, uid TEXT DEFAULT '', ip TEXT DEFAULT '', inbound TEXT DEFAULT '', transport TEXT DEFAULT '', started_at TEXT NOT NULL, ended_at TEXT DEFAULT '');
             CREATE TABLE IF NOT EXISTS daily_traffic (day TEXT PRIMARY KEY, bytes INTEGER DEFAULT 0, uid TEXT DEFAULT '');
             CREATE TABLE IF NOT EXISTS custom_addresses (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4749,8 +4747,6 @@ async def load_initial_data():
                 continue
             link_dict.pop("region_id", None)
             LINKS[r["uid"]] = link_dict
-    await load_blocked_sessions()
-    await load_restricted_ips()
     addr_rows = await db_fetchall("SELECT address, flag FROM custom_addresses", "SELECT address, flag FROM custom_addresses")
     async with CUSTOM_ADDRESSES_LOCK:
         CUSTOM_ADDRESSES[:] = [r["address"] for r in addr_rows]
@@ -5388,6 +5384,7 @@ async def lifespan(app: FastAPI):
     if _secret_was_generated:
         logger.warning("SulgX startup: a new JWT secret key was generated and stored in the database. If the database is not on a persistent volume, every restart invalidates all sessions.")
         print("SulgX startup: a new JWT secret key was generated and stored in the database. If the database is not on a persistent volume, every restart invalidates all sessions.", flush=True)
+    await _ensure_web_base_secret()
     if tgproxy is not None:
         _secret_env = ""
         try:
@@ -5410,10 +5407,8 @@ async def lifespan(app: FastAPI):
         WEBPROXY_STATE["configure_error"] = ""
         try:
             _web_base_secret_bytes()
-        except ValueError as exc:
-            _web_base_ok = False
-            WEBPROXY_STATE["configure_error"] = str(exc)
-            logger.error("web proxy configure failed: " + str(exc))
+        except Exception as exc:
+            logger.error("web proxy base secret check failed, continuing with the healed secret: " + str(exc))
         _telemt_ok = False
         try:
             _telemt_ok = bool(await _tg_call("telemt_available"))
@@ -5487,6 +5482,7 @@ async def lifespan(app: FastAPI):
             except Exception:
                 return True
 
+        await _tg_call("configure_proxy_callbacks", _tg_auth, _tg_count, _tg_quota_ok, _tg_session_allowed)
         _set_forward = _tg_fn("set_panel_forward")
         if _set_forward is not None:
             try:
@@ -6321,6 +6317,7 @@ def generate_vless_link(uid: str, remark: str = "SulgX", address: str = None, ex
     protocol = extra.get("protocol", "vless-ws") if extra else "vless-ws"
     fp_raw = (extra.get("fingerprint") or extra.get("custom_fp") or "").strip() if extra else ""
     fingerprint = None if (not fp_raw or fp_raw.lower() == "none") else fp_raw
+    fingerprint = ech_safe_fingerprint(extra, fingerprint)
     alpn = effective_alpn(extra, protocol)
     port = extra.get("port", 443) if extra else 443
 
@@ -6370,11 +6367,9 @@ def generate_vless_link(uid: str, remark: str = "SulgX", address: str = None, ex
 
     if fragment:
         params["fragment"] = fragment
-    if ech_enabled and ech_sni:
-        ech_param = ech_sni
-        if ech_doh:
-            ech_param += "+" + ech_doh
-        params["ech"] = ech_param
+    _ech_value = ech_config_list_value(extra)
+    if _ech_value:
+        params["ech"] = _ech_value
 
     query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
     link = f"vless://{uid}@{format_host_port(addr, port)}?{query}#{quote(remark)}"
@@ -6924,20 +6919,6 @@ LANDING_HTML = r"""<!DOCTYPE html>
   <div class="card">
     <h1>SulgX</h1>
     <div class="subtitle" data-en="Welcome to our platform – your reliable cloud partner." data-fa="به پلتفرم ما خوش آمدید – شریک ابری قابل اعتماد شما.">Welcome to our platform – your reliable cloud partner.</div>
-    <div class="steps">
-      <div class="step">
-        <div class="step-num">1</div>
-        <div class="step-text" data-en="Use Stealth Mode for enhanced security." data-fa="برای امنیت بیشتر از حالت استتار استفاده کنید.">Use Stealth Mode for enhanced security.</div>
-      </div>
-      <div class="step">
-        <div class="step-num">2</div>
-        <div class="step-text" data-en="Do not use the scanner on free services." data-fa="در سرویس‌های رایگان از اسکنر استفاده نکنید.">Do not use the scanner on free services.</div>
-      </div>
-      <div class="step">
-        <div class="step-num">3</div>
-        <div class="step-text" data-en="Always configure a Landing Page and Redirect URL." data-fa="حتماً از صفحه فرود و تغییر مسیر استفاده کنید.">Always configure a Landing Page and Redirect URL.</div>
-      </div>
-    </div>
     <div style="margin-top:8px;">
       <button class="btn btn-primary" id="login-btn" onclick="window.location.href='/login'" style="width:100%;margin:0;padding:13px;"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="4.5"/><path d="M11 12L21 2M16 7l3 3"/></svg></span><span data-en="Login" data-fa="ورود">Login</span></button>
     </div>
@@ -7162,10 +7143,6 @@ def _forwarder_headers(request, host, client_ip):
 async def _forward_http_to_telemt(request, uid, upstream_path, upstream_query=b"", body=b""):
     host = get_domain(request)
     client_ip = _forwarder_client_ip(request)
-    if is_session_blocked(uid, client_ip):
-        return JSONResponse(status_code=403, content={"ok": False, "detail": "blocked by admin"})
-    if is_ip_restricted(client_ip):
-        return JSONResponse(status_code=403, content={"ok": False, "detail": "restricted by admin"})
     port = _telemt_web_port_for_uid(uid)
     if not port:
         return JSONResponse(status_code=502, content={"ok": False, "detail": "telemt WEB child is not running for this inbound"})
@@ -7213,14 +7190,6 @@ async def _forward_http_to_telemt(request, uid, upstream_path, upstream_query=b"
 async def _forward_ws_to_telemt(websocket, uid, upstream_path):
     host = get_domain(websocket)
     client_ip = _forwarder_client_ip(websocket)
-    if is_session_blocked(uid, client_ip):
-        log_event("Tunnel", "Blocked WEB session for " + str(uid) + " from " + str(client_ip), ip=client_ip)
-        await websocket.close(code=1008, reason="blocked by admin")
-        return
-    if is_ip_restricted(client_ip):
-        log_event("Tunnel", "Restricted WEB session for " + str(uid) + " from " + str(client_ip), ip=client_ip)
-        await websocket.close(code=1008, reason="restricted by admin")
-        return
     port = _telemt_web_port_for_uid(uid)
     if not port:
         await websocket.close(code=1011)
@@ -7818,6 +7787,8 @@ async def sse_stats_live(_=Depends(require_auth)):
                 "uptime": uptime(),
                 "timestamp": datetime.now(UTC).isoformat(),
             }
+            await _flush_session_events()
+            data["session_stats"] = await session_event_stats(sum(int(s.get("session_count", 1) or 0) for s in data["sessions"]))
             yield f"data: {json.dumps(data)}\n\n"
             await asyncio.sleep(3)
     return StreamingResponse(event_stream(), media_type="text/event-stream")
@@ -8925,9 +8896,10 @@ async def list_links(request: Request, _=Depends(require_auth)):
 
 @app.get("/api/inbounds")
 async def list_inbounds(request: Request, _=Depends(require_auth)):
+    await _ensure_web_base_secret()
     defs = get_inbound_definitions()
     _domain, _domain_source, _tls, public_port, _ws_scheme, _http_scheme = _test_public_address(request)
-    return {"inbounds": defs, "ws_rate_max": WS_RATE_MAX, "ws_rate_window": WS_RATE_WINDOW, "max_xhttp_sessions": MAX_XHTTP_SESSIONS, "xhttp_path": DEFAULT_XHTTP_PATH, "panel_port": public_port, "single_port_host": _is_single_port_host(), "socks_port": SOCKS_PORT, "mtproxy_port": TG_PROXY_PORT, "http_proxy_port": HTTP_PROXY_PORT, "webproxy_ports": list(WEBPROXY_PORTS), "webproxy_allowed_ports": _webproxy_allowed_ports(), "webproxy_public_port": WEBPROXY_PUBLIC_PORT, "proxy_default_ports": dict(PROXY_DEFAULT_PORTS), "proxy_bound_ports": sorted(_PROXY_MUX_PORTS), "proxy_bind_errors": {str(k): v for k, v in _PROXY_MUX_BIND_ERRORS.items()}, "web_bridge_ports": sorted(_WEB_BRIDGE_SERVERS.keys()), "web_bridge_errors": {str(k): v for k, v in _WEB_BRIDGE_ERRORS.items()}, "proxy_status": TG_PROXY_STATUS, "webproxy_status": dict(TELEMT_HEALTH), "listener_cards": await _listener_cards(public_port, request)}
+    return {"inbounds": defs, "ws_rate_max": WS_RATE_MAX, "ws_rate_window": WS_RATE_WINDOW, "max_xhttp_sessions": MAX_XHTTP_SESSIONS, "xhttp_path": DEFAULT_XHTTP_PATH, "panel_port": public_port, "single_port_host": _is_single_port_host(), "socks_port": SOCKS_PORT, "mtproxy_port": TG_PROXY_PORT, "http_proxy_port": HTTP_PROXY_PORT, "webproxy_ports": list(WEBPROXY_PORTS), "webproxy_allowed_ports": _webproxy_allowed_ports(), "webproxy_public_port": WEBPROXY_PUBLIC_PORT, "proxy_default_ports": dict(PROXY_DEFAULT_PORTS), "proxy_bound_ports": sorted(_PROXY_MUX_PORTS), "proxy_bind_errors": {str(k): v for k, v in _PROXY_MUX_BIND_ERRORS.items()}, "web_bridge_ports": sorted(_WEB_BRIDGE_SERVERS.keys()), "web_bridge_errors": {str(k): v for k, v in _WEB_BRIDGE_ERRORS.items()}, "proxy_status": TG_PROXY_STATUS, "webproxy_status": dict(TELEMT_HEALTH), "listener_cards": await _listener_cards(public_port, request), "tg_web_secret": _WEB_BASE_SECRET_HEX or "", "tg_web_secret_source": _WEB_BASE_SECRET_SOURCE or ""}
 
 
 @app.get("/api/outbounds")
@@ -9166,6 +9138,8 @@ async def telegram_proxy_status(request: Request, _=Depends(require_auth)):
         "webproxy_public_port": WEBPROXY_PUBLIC_PORT,
         "webproxy_shared_443": _webproxy_shared_443(),
         "webproxy_allowed_ports": _webproxy_allowed_ports(),
+        "tg_web_secret": _WEB_BASE_SECRET_HEX or "",
+        "tg_web_secret_source": _WEB_BASE_SECRET_SOURCE or "",
         "mtproxy_per_link_secret": True,
         "mtproxy_note": "MTProto links are per inbound: each MTProto inbound carries its own derived secret, so no shared link is published here. Open the inbound row on the Links page to copy its own tg://proxy link.",
         "http_link_note": "SOCKS5 / HTTP proxy auth is the per-inbound username and password shown on the inbound row (a generated code when left empty at create time)",
@@ -9186,6 +9160,67 @@ async def tgweb_retired(request: Request):
     if bridge is not None:
         return bridge
     return Response(content="the /tgweb bridge path is retired: use the tg://webproxy link from a WEB proxy inbound", status_code=404, media_type="text/plain")
+
+
+_SESSION_EVENT_SEEN = {}
+_SESSION_EVENT_PENDING = []
+_SESSION_EVENT_ENDS = []
+
+
+def _observe_session_event(row):
+    conn_id = str(row.get("conn_id") or "")
+    if not conn_id:
+        return
+    started = str(row.get("started_at") or "").strip()
+    if started:
+        if _SESSION_EVENT_SEEN.get(conn_id) == started:
+            return
+    elif conn_id in _SESSION_EVENT_SEEN:
+        return
+    else:
+        started = datetime.now(UTC).isoformat()
+    _SESSION_EVENT_SEEN[conn_id] = started
+    _SESSION_EVENT_PENDING.append((conn_id, str(row.get("uid") or ""), str(row.get("client_ip") or ""), str(row.get("inbound_tag") or row.get("transport") or ""), str(row.get("transport") or ""), started))
+
+
+def _observe_session_end(conn_id):
+    conn_id = str(conn_id or "")
+    if conn_id in _SESSION_EVENT_SEEN:
+        del _SESSION_EVENT_SEEN[conn_id]
+        _SESSION_EVENT_ENDS.append((conn_id, datetime.now(UTC).isoformat()))
+
+
+async def _flush_session_events():
+    pending = _SESSION_EVENT_PENDING[:]
+    del _SESSION_EVENT_PENDING[:]
+    for conn_id, uid, ip, inbound, transport, started in pending:
+        try:
+            await db_execute("INSERT INTO session_events (conn_id, uid, ip, inbound, transport, started_at) VALUES (?,?,?,?,?,?)", "INSERT INTO session_events (conn_id, uid, ip, inbound, transport, started_at) VALUES ($1,$2,$3,$4,$5,$6)", (conn_id, uid, ip, inbound, transport, started))
+        except Exception as e:
+            logger.error(f"session_events insert failed: {e}")
+    ends = _SESSION_EVENT_ENDS[:]
+    del _SESSION_EVENT_ENDS[:]
+    for conn_id, ended in ends:
+        try:
+            row = await db_fetchone("SELECT MAX(id) AS max_id FROM session_events WHERE conn_id = ? AND ended_at = ''", "SELECT MAX(id) AS max_id FROM session_events WHERE conn_id = $1 AND ended_at = ''", (conn_id,))
+            if row and row.get("max_id") is not None:
+                await db_execute("UPDATE session_events SET ended_at = ? WHERE id = ?", "UPDATE session_events SET ended_at = $1 WHERE id = $2", (ended, int(row["max_id"])))
+        except Exception as e:
+            logger.error(f"session_events end update failed: {e}")
+
+
+async def session_event_stats(online):
+    now = datetime.now(UTC)
+    today = now.strftime("%Y-%m-%d")
+    month = now.strftime("%Y-%m")
+    try:
+        today_row = await db_fetchone("SELECT COUNT(*) AS n FROM session_events WHERE substr(started_at, 1, 10) = ?", "SELECT COUNT(*) AS n FROM session_events WHERE substring(started_at from 1 for 10) = $1", (today,))
+        month_row = await db_fetchone("SELECT COUNT(*) AS n FROM session_events WHERE substr(started_at, 1, 7) = ?", "SELECT COUNT(*) AS n FROM session_events WHERE substring(started_at from 1 for 7) = $1", (month,))
+        unique_row = await db_fetchone("SELECT COUNT(DISTINCT ip) AS n FROM session_events WHERE ip <> ''", "SELECT COUNT(DISTINCT ip) AS n FROM session_events WHERE ip <> ''")
+        return {"online": int(online or 0), "today": int((today_row or {}).get("n") or 0), "month": int((month_row or {}).get("n") or 0), "unique_ips": int((unique_row or {}).get("n") or 0)}
+    except Exception as e:
+        logger.error(f"session_event_stats failed: {e}")
+        return {"online": int(online or 0), "today": 0, "month": 0, "unique_ips": 0}
 
 
 def active_sessions_snapshot():
@@ -9351,9 +9386,12 @@ def active_sessions_snapshot():
                 "max_connections": int(link.get("max_connections", 0) or 0) if link else 0,
                 "link_sessions": _link_session_count(_wuid) + _proxy_session_count(_wuid),
             })
+    for row in out:
+        _observe_session_event(row)
     for dead in list(_ACTIVE_LAST):
         if dead not in live:
             _ACTIVE_LAST.pop(dead, None)
+            _observe_session_end(dead)
     return out
 
 
@@ -9449,362 +9487,20 @@ async def list_active_users(_=Depends(require_auth)):
     except Exception:
         pass
     sessions = active_users_snapshot()
-    return {"sessions": sessions, "total": len(sessions), "total_up_bps": sum(s["up_bps"] for s in sessions), "total_down_bps": sum(s["down_bps"] for s in sessions), "aggregated": True, "raw_session_count": sum(s.get("session_count", 1) for s in sessions)}
+    raw_session_count = sum(s.get("session_count", 1) for s in sessions)
+    await _flush_session_events()
+    session_stats = await session_event_stats(raw_session_count)
+    return {"sessions": sessions, "total": len(sessions), "total_up_bps": sum(s["up_bps"] for s in sessions), "total_down_bps": sum(s["down_bps"] for s in sessions), "aggregated": True, "raw_session_count": raw_session_count, "session_stats": session_stats}
 
 
 @app.get("/api/active-users/{group_id:path}/details")
 async def active_user_details(group_id: str, _=Depends(require_auth)):
     group_id = unquote(group_id)
+    await _flush_session_events()
     for group in active_users_snapshot():
         if group.get("conn_id") == group_id:
             return {"user": group}
     raise HTTPException(status_code=404, detail="user not active")
-
-
-@app.post("/api/active-users/{conn_id:path}/disconnect")
-async def disconnect_active_user(conn_id: str, _=Depends(require_auth)):
-    if conn_id.startswith("card:"):
-        body = conn_id[5:]
-        if "|" in body:
-            target_uid, target_ip = body.split("|", 1)
-        else:
-            target_uid, target_ip = body, "unknown"
-        target_uid = unquote(target_uid.strip())
-        target_ip = unquote(target_ip.strip()) or "unknown"
-        try:
-            target_net = ipaddress.ip_network(target_ip, strict=False) if target_ip != "unknown" else None
-        except ValueError:
-            target_net = None
-
-        def _card_ip_matches(ip):
-            ip = str(ip or "")
-            if target_net is not None:
-                try:
-                    return ipaddress.ip_address(ip) in target_net
-                except ValueError:
-                    return False
-            if target_ip == "unknown":
-                return ip == ""
-            return ip == target_ip
-
-        card_ips = set()
-        for _group in active_users_snapshot():
-            if _group.get("conn_id") == conn_id:
-                for _gip in (_group.get("client_ips") or []):
-                    if _gip and _card_ip_matches(_gip):
-                        card_ips.add(str(_gip))
-        async with connections_lock:
-            for _cid, _info in list(connections.items()):
-                if str(_info.get("uuid") or "") == target_uid and _info.get("ip") and _card_ip_matches(_info.get("ip")):
-                    card_ips.add(str(_info.get("ip")))
-        for _sess in list(xhttp_sessions.values()):
-            if str(_sess.get("uuid") or "") == target_uid and _sess.get("ip") and _card_ip_matches(_sess.get("ip")):
-                card_ips.add(str(_sess.get("ip")))
-        if tgproxy is not None:
-            try:
-                for _s in tgproxy.active_proxy_sessions():
-                    _slink = _link_for_proxy_session(_s.get("username") or "")
-                    _suid = str(_slink.get("uid") or "") if _slink else str(_s.get("username") or "")
-                    if _suid == target_uid and _s.get("client_ip") and _card_ip_matches(_s.get("client_ip")):
-                        card_ips.add(str(_s.get("client_ip")))
-            except Exception:
-                pass
-        disconnected = 0
-        async with connections_lock:
-            ws_ids = []
-            for cid, info in list(connections.items()):
-                if str(info.get("uuid") or "") != target_uid:
-                    continue
-                if not _card_ip_matches(info.get("ip") or ""):
-                    continue
-                ws_ids.append(cid)
-        xhttp_ids = {sess.get("conn_id") for sess in xhttp_sessions.values()}
-        for cid in ws_ids:
-            ws = connection_sockets.get(cid)
-            if ws is None and cid not in xhttp_ids:
-                async with connections_lock:
-                    connections.pop(cid, None)
-                disconnected += 1
-                continue
-            if ws is None:
-                continue
-            try:
-                await ws.close(code=1000, reason="disconnected by admin")
-            except Exception:
-                pass
-            async with connections_lock:
-                connections.pop(cid, None)
-            connection_sockets.pop(cid, None)
-            disconnected += 1
-        for sid, sess in list(xhttp_sessions.items()):
-            if sess.get("conn_id") in ws_ids or (str(sess.get("uuid") or "") == target_uid and _card_ip_matches(sess.get("ip") or "")):
-                await _teardown_xhttp(sid)
-                disconnected += 1
-        if tgproxy is not None:
-            try:
-                proxy_sessions = tgproxy.active_proxy_sessions()
-            except Exception:
-                proxy_sessions = []
-            for s in proxy_sessions:
-                link = _link_for_proxy_session(s.get("username") or "")
-                row_uid = str(link.get("uid") or "") if link else str(s.get("username") or "")
-                if row_uid == target_uid and _card_ip_matches(s.get("client_ip") or ""):
-                    if tgproxy.disconnect_proxy_session(s.get("id", "")):
-                        disconnected += 1
-        blocked = 0
-        for _bip in sorted(card_ips):
-            if not _bip or _bip == "unknown":
-                continue
-            try:
-                ipaddress.ip_address(_bip)
-            except ValueError:
-                continue
-            if await block_session(target_uid, _bip, "disconnected by admin"):
-                blocked += 1
-        if disconnected == 0 and blocked == 0:
-            for group in active_users_snapshot():
-                if group.get("conn_id") == conn_id:
-                    raise HTTPException(status_code=400, detail="WEB proxy sessions live in telemt: disable the WEB inbound to close its sessions")
-            raise HTTPException(status_code=404, detail="session not found")
-        return {"ok": True, "disconnected": disconnected, "blocked": blocked}
-    if conn_id.startswith("user:") or conn_id.startswith("owner:") or conn_id.startswith("ip:"):
-        kind, target = conn_id.split(":", 1)
-        uids = set()
-        if kind == "user":
-            uids.add(target)
-        elif kind == "owner":
-            async with LINKS_LOCK:
-                for link in LINKS.values():
-                    if str(link.get("owner_user_id") or "") == target:
-                        uids.add(str(link.get("uid") or ""))
-        disconnected = 0
-        _block_pairs = set()
-        async with connections_lock:
-            for _cid, _info in list(connections.items()):
-                _match = False
-                if kind == "user" and str(_info.get("uuid") or "") == target:
-                    _match = True
-                elif kind == "owner" and str(_info.get("uuid") or "") in uids:
-                    _match = True
-                elif kind == "ip" and str(_info.get("ip") or "") == target:
-                    _match = True
-                if _match and _info.get("uuid") and _info.get("ip"):
-                    _block_pairs.add((str(_info.get("uuid")), str(_info.get("ip"))))
-        for _sid, _sess in list(xhttp_sessions.items()):
-            _suuid = str(_sess.get("uuid") or "")
-            _sip = str(_sess.get("ip") or "")
-            if not _suuid or not _sip:
-                continue
-            if (kind == "user" and _suuid == target) or (kind == "owner" and _suuid in uids) or (kind == "ip" and _sip == target):
-                _block_pairs.add((_suuid, _sip))
-        for _group in active_users_snapshot():
-            if _group.get("conn_id") == conn_id and str(_group.get("protocol") or "") in ("webproxy", "mtproto"):
-                _g_uid = str(_group.get("uid") or "")
-                for _g_ip in (_group.get("client_ips") or []):
-                    if _g_uid and _g_ip:
-                        _block_pairs.add((_g_uid, str(_g_ip)))
-        async with connections_lock:
-            ws_ids = []
-            for cid, info in list(connections.items()):
-                if kind == "user" and str(info.get("uuid") or "") == target:
-                    ws_ids.append(cid)
-                elif kind == "owner" and str(info.get("uuid") or "") in uids:
-                    ws_ids.append(cid)
-                elif kind == "ip" and str(info.get("ip") or "") == target:
-                    ws_ids.append(cid)
-        xhttp_ids = {sess.get("conn_id") for sess in xhttp_sessions.values()}
-        for cid in ws_ids:
-            ws = connection_sockets.get(cid)
-            if ws is None and cid not in xhttp_ids:
-                async with connections_lock:
-                    connections.pop(cid, None)
-                disconnected += 1
-                continue
-            if ws is None:
-                continue
-            try:
-                await ws.close(code=1000, reason="disconnected by admin")
-            except Exception:
-                pass
-            async with connections_lock:
-                connections.pop(cid, None)
-            connection_sockets.pop(cid, None)
-            disconnected += 1
-        for sid, sess in list(xhttp_sessions.items()):
-            if sess.get("conn_id") in ws_ids or str(sess.get("uuid") or "") in uids or (kind == "ip" and str(sess.get("ip") or "") == target):
-                await _teardown_xhttp(sid)
-                disconnected += 1
-        if tgproxy is not None:
-            try:
-                for _s in tgproxy.active_proxy_sessions():
-                    _slink = _link_for_proxy_session(_s.get("username") or "")
-                    _suid = str(_slink.get("uid") or "") if _slink else str(_s.get("username") or "")
-                    _sip = str(_s.get("client_ip") or "")
-                    if not _suid or not _sip:
-                        continue
-                    if _suid in uids or (kind == "ip" and _sip == target):
-                        _block_pairs.add((_suid, _sip))
-            except Exception:
-                pass
-            try:
-                proxy_sessions = tgproxy.active_proxy_sessions()
-            except Exception:
-                proxy_sessions = []
-            for s in proxy_sessions:
-                link = _link_for_proxy_session(s.get("username") or "")
-                row_uid = str(link.get("uid") or "") if link else str(s.get("username") or "")
-                if row_uid in uids or (kind == "ip" and str(s.get("client_ip") or "") == target):
-                    if tgproxy.disconnect_proxy_session(s.get("id", "")):
-                        disconnected += 1
-        for _buid, _bip in sorted(_block_pairs):
-            await block_pair_with_telemt(_buid, _bip, "disconnected by admin")
-        if disconnected == 0:
-            if _block_pairs:
-                return {"ok": True, "disconnected": 0, "blocked": len(_block_pairs)}
-            for group in active_users_snapshot():
-                if group.get("conn_id") == conn_id:
-                    raise HTTPException(status_code=400, detail="WEB proxy sessions live in telemt: disable the WEB inbound to close its sessions")
-            raise HTTPException(status_code=404, detail="session not found")
-        return {"ok": True, "disconnected": disconnected, "blocked": len(_block_pairs)}
-    if conn_id.startswith("proxy:"):
-        _ppair = None
-        if tgproxy is not None:
-            try:
-                for _s in tgproxy.active_proxy_sessions():
-                    if str(_s.get("id", "")) == conn_id[6:]:
-                        _plink = _link_for_proxy_session(_s.get("username") or "")
-                        _puid = str(_plink.get("uid") or "") if _plink else str(_s.get("username") or "")
-                        _pip = str(_s.get("client_ip") or "")
-                        if _puid and _pip:
-                            _ppair = (_puid, _pip)
-                        break
-            except Exception:
-                pass
-        if tgproxy is not None and tgproxy.disconnect_proxy_session(conn_id[6:]):
-            if _ppair is not None:
-                await block_pair_with_telemt(_ppair[0], _ppair[1], "disconnected by admin")
-            return {"ok": True}
-        if conn_id.startswith("proxy:web:"):
-            _parts = conn_id.split(":")
-            _wuid = _parts[2] if len(_parts) > 2 else ""
-            _wip = ""
-            for _row in active_sessions_snapshot():
-                if _row.get("conn_id") == conn_id:
-                    _wip = str(_row.get("client_ip") or "")
-                    break
-            if _wuid and _wip:
-                await block_pair_with_telemt(_wuid, _wip, "disconnected by admin")
-                return {"ok": True, "blocked": True}
-            raise HTTPException(status_code=400, detail="WEB proxy sessions live in telemt: disable the WEB inbound to close its sessions")
-        raise HTTPException(status_code=404, detail="proxy session not found")
-    ws = connection_sockets.get(conn_id)
-    if ws is not None:
-        _pair = None
-        async with connections_lock:
-            _info = connections.get(conn_id)
-            if _info and _info.get("uuid") and _info.get("ip"):
-                _pair = (str(_info.get("uuid")), str(_info.get("ip")))
-        try:
-            await ws.close(code=1000, reason="disconnected by admin")
-        except Exception:
-            pass
-        if _pair is not None:
-            await block_pair_with_telemt(_pair[0], _pair[1], "disconnected by admin")
-        return {"ok": True}
-    for sid, sess in list(xhttp_sessions.items()):
-        if sess.get("conn_id") == conn_id:
-            _xpair = None
-            if sess.get("uuid") and sess.get("ip"):
-                _xpair = (str(sess.get("uuid")), str(sess.get("ip")))
-            await _teardown_xhttp(sid)
-            if _xpair is not None:
-                await block_pair_with_telemt(_xpair[0], _xpair[1], "disconnected by admin")
-            return {"ok": True}
-    raise HTTPException(status_code=404, detail="session not found")
-
-
-@app.get("/api/blocked-sessions")
-async def list_blocked_sessions(_=Depends(require_auth)):
-    rows = await db_fetchall("SELECT uid, ip, reason, created_at FROM blocked_sessions ORDER BY created_at DESC", "SELECT uid, ip, reason, created_at FROM blocked_sessions ORDER BY created_at DESC")
-    out = []
-    for r in rows:
-        link = LINKS.get(str(r["uid"]))
-        out.append({"uid": str(r["uid"]), "ip": str(r["ip"]), "reason": str(r.get("reason") or ""), "created_at": str(r.get("created_at") or ""), "label": str(link.get("label", "")) if link else "", "protocol": str(link.get("protocol", "")) if link else ""})
-    return {"blocked": out}
-
-
-@app.post("/api/blocked-sessions")
-async def create_blocked_session(request: Request, _=Depends(require_auth)):
-    body = await request.json()
-    uid = str(body.get("uid") or "").strip()
-    ip = str(body.get("ip") or "").strip()
-    reason = str(body.get("reason") or "").strip()[:120]
-    if uid not in LINKS:
-        raise HTTPException(status_code=404, detail="link not found")
-    try:
-        ipaddress.ip_address(ip)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid IP address")
-    await block_pair_with_telemt(uid, ip, reason or "blocked by admin")
-    await close_connections_for_link(uid)
-    return {"ok": True, "blocked": {"uid": uid, "ip": ip}}
-
-
-@app.delete("/api/blocked-sessions/{uid}/{ip}")
-async def delete_blocked_session(uid: str, ip: str, _=Depends(require_auth)):
-    if (str(uid), str(ip)) not in BLOCKED_PAIRS:
-        raise HTTPException(status_code=404, detail="session is not blocked")
-    await unblock_session(uid, ip)
-    link = LINKS.get(str(uid))
-    if link is not None and str(link.get("protocol") or "") in ("webproxy", "mtproto") and link.get("active"):
-        await _telemt_sync_link(link)
-    return {"ok": True}
-
-
-@app.get("/api/restricted-ips")
-async def list_restricted_ips(_=Depends(require_auth)):
-    rows = await db_fetchall("SELECT entry, note, created_at FROM restricted_ips ORDER BY created_at DESC", "SELECT entry, note, created_at FROM restricted_ips ORDER BY created_at DESC")
-    out = []
-    for r in rows:
-        entry = str(r["entry"])
-        out.append({"entry": entry, "kind": "cidr" if "/" in entry else "ip", "note": str(r.get("note") or ""), "created_at": str(r.get("created_at") or "")})
-    return {"restricted": out}
-
-
-@app.post("/api/restricted-ips")
-async def create_restricted_ip(request: Request, _=Depends(require_auth)):
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="invalid JSON body")
-    if not isinstance(body, dict):
-        raise HTTPException(status_code=400, detail="invalid JSON body")
-    raw = str(body.get("entry") or "").strip()
-    note = str(body.get("note") or "").strip()[:120]
-    try:
-        entry = normalize_restricted_entry(raw)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid IP or CIDR")
-    for _existing, _net in RESTRICTED_NETWORKS:
-        if _existing == entry:
-            raise HTTPException(status_code=400, detail="already restricted")
-    try:
-        await add_restricted_ip(entry, note)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid IP or CIDR")
-    return {"ok": True, "restricted": {"entry": entry, "kind": "cidr" if "/" in entry else "ip", "note": note}}
-
-
-@app.delete("/api/restricted-ips/{entry:path}")
-async def delete_restricted_ip(entry: str, _=Depends(require_auth)):
-    try:
-        normalized = normalize_restricted_entry(entry)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid IP or CIDR")
-    if normalized not in [e for e, _n in RESTRICTED_NETWORKS]:
-        raise HTTPException(status_code=404, detail="restriction not found")
-    await remove_restricted_ip(normalized)
-    return {"ok": True}
 
 
 @app.get("/api/export-links")
@@ -10127,39 +9823,6 @@ async def regenerate_uuid(uid: str, _=Depends(require_auth)):
         await _telemt_sync_link(link, previous=None)
         log_event("Inbound", f"UUID regenerated for {link['label']}: {uid} -> {new_uid}")
         return {"new_uuid": new_uid}
-
-
-@app.post("/api/links/{uid}/disconnect")
-async def disconnect_link(uid: str, _=Depends(require_auth)):
-    _pairs = set()
-    async with connections_lock:
-        for _info in list(connections.values()):
-            if str(_info.get("uuid") or "") == uid and _info.get("ip"):
-                _pairs.add((uid, str(_info.get("ip"))))
-    for _sess in list(xhttp_sessions.values()):
-        if str(_sess.get("uuid") or "") == uid and _sess.get("ip"):
-            _pairs.add((uid, str(_sess.get("ip"))))
-    if tgproxy is not None:
-        try:
-            for _s in tgproxy.active_proxy_sessions():
-                _slink = _link_for_proxy_session(_s.get("username") or "")
-                if _slink is not None and str(_slink.get("uid") or "") == uid and _s.get("client_ip"):
-                    _pairs.add((uid, str(_s.get("client_ip"))))
-        except Exception:
-            pass
-    await close_connections_for_link(uid)
-    if tgproxy is not None:
-        try:
-            for s in tgproxy.active_proxy_sessions():
-                _slink = _link_for_proxy_session(s.get("username") or "")
-                if _slink is not None and str(_slink.get("uid") or "") == uid:
-                    tgproxy.disconnect_proxy_session(s.get("id", ""))
-        except Exception:
-            pass
-    for _buid, _bip in sorted(_pairs):
-        await block_pair_with_telemt(_buid, _bip, "disconnected by admin")
-    log_event("Inbound", f"Disconnected all connections for {uid}")
-    return {"ok": True, "blocked": len(_pairs)}
 
 
 @app.patch("/api/links/{uid}")
@@ -11453,7 +11116,7 @@ async def user_dashboard(uid: str, request: Request):
 </div>
   <div id="link-text-box" style="display:none;margin-top:12px;"><input id="link-text-input" readonly value="{vless_link_esc}" style="width:100%;padding:10px;border:1px solid var(--border);border-radius:8px;background:var(--surface-2);color:var(--text);font-size:13px;direction:ltr;text-align:start;"><button class="btn btn-outline" style="margin-top:8px;" onclick="copyToClip(document.getElementById('link-text-input').value, t('link_copied'))" data-en="Copy link text" data-fa="کپی متن لینک">Copy link text</button></div>
 </div>
-<div id="toast"><span class="ic" id="toast-ic"></span><span id="toast-msg" data-en="Copied!" data-fa="کپی شد!">Copied!</span></div>
+<div class="toast" id="toast"><span class="ic" id="toast-ic"></span><span id="toast-msg"></span></div>
 <script>
 var lang = localStorage.getItem('ll') || 'en';
 var i18n = {{
@@ -12083,6 +11746,7 @@ async def clash_subscription(uid: str, request: Request):
     fingerprint = link.get("fingerprint") or link.get("custom_fp") or "chrome"
     if not fingerprint or fingerprint.lower() == "none":
         fingerprint = None
+    fingerprint = ech_safe_fingerprint(link, fingerprint)
     alpn = effective_alpn(link)
     port = link.get("port", 443)
     udp_enabled = bool(link.get("udp_enabled", True))
@@ -12353,6 +12017,7 @@ async def singbox_subscription(uid: str, request: Request):
     fingerprint = link.get("fingerprint") or link.get("custom_fp") or "chrome"
     if not fingerprint or fingerprint.lower() == "none":
         fingerprint = None
+    fingerprint = ech_safe_fingerprint(link, fingerprint)
     alpn = effective_alpn(link)
     port = link.get("port", 443)
     udp_enabled = bool(link.get("udp_enabled", True))
@@ -12432,7 +12097,7 @@ async def singbox_subscription(uid: str, request: Request):
         if tfo:
             proxy["tcp_fast_open"] = True
         if ech_enabled and ech_sni:
-            proxy["tls"]["ech"] = {"enabled": True}
+            proxy["tls"]["ech"] = {"enabled": True, "query_server_name": ech_sni}
         if proto == "vmess-ws":
             proxy["type"] = "vmess"
             proxy["alter_id"] = 0
@@ -13644,6 +13309,85 @@ async def _test_webproxy_real_session(link, domain, port, dc_timeout=8.0):
                 pass
 
 
+
+ECH_PING_TIMEOUT = 6.0
+ECH_PING_MAX_ENTRIES = 32
+
+
+def _ech_doh_query_bytes(domain):
+    header = struct.pack(">HHHHHH", 0x1234, 0x0100, 1, 0, 0, 0)
+    qname = b"".join(bytes([len(part)]) + part.encode() for part in str(domain).split(".")) + b"\x00"
+    return header + qname + struct.pack(">HH", 65, 1)
+
+
+async def _ech_ping_one(entry):
+    result = {"id": entry.get("id", ""), "label": entry.get("label", ""), "sni": entry.get("sni", ""), "doh": entry.get("doh", ""), "ms": None, "status": "error", "method": None}
+    sni = str(entry.get("sni") or "").strip()
+    doh = str(entry.get("doh") or "").strip()
+    if not sni or not _valid_host_name(sni):
+        return result
+    if doh and not validate_ech_config_url(doh):
+        return result
+    started = time.monotonic()
+    if doh.startswith("https://"):
+        try:
+            query = base64.urlsafe_b64encode(_ech_doh_query_bytes(sni)).decode().rstrip("=")
+            async with httpx.AsyncClient(timeout=ECH_PING_TIMEOUT, follow_redirects=True, trust_env=False) as client:
+                response = await client.get(doh, params={"dns": query}, headers={"Accept": "application/dns-message"})
+            if response.status_code == 200 and response.content:
+                result["ms"] = int((time.monotonic() - started) * 1000)
+                result["status"] = "ok"
+                result["method"] = "doh"
+                return result
+        except httpx.TimeoutException:
+            result["status"] = "timeout"
+            result["method"] = "doh"
+            return result
+        except httpx.HTTPError:
+            pass
+    started = time.monotonic()
+    try:
+        async with httpx.AsyncClient(timeout=ECH_PING_TIMEOUT, follow_redirects=True, trust_env=False) as client:
+            response = await client.head("https://" + sni + "/", headers={"User-Agent": "SulgX-ECH-Ping"})
+        if response.status_code < 500:
+            result["ms"] = int((time.monotonic() - started) * 1000)
+            result["status"] = "ok"
+            result["method"] = "https"
+            return result
+    except httpx.TimeoutException:
+        result["status"] = "timeout"
+        result["method"] = "https"
+        return result
+    except httpx.HTTPError:
+        pass
+    result["status"] = "unreachable"
+    result["method"] = None
+    return result
+
+
+@app.post("/api/ech/ping")
+@limiter.limit("10/minute")
+async def ping_ech_entries(request: Request, _=Depends(require_auth)):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    raw_entries = body.get("entries")
+    entries = []
+    if isinstance(raw_entries, list) and raw_entries:
+        for item in raw_entries[:ECH_PING_MAX_ENTRIES]:
+            if not isinstance(item, dict):
+                continue
+            entries.append({"id": str(item.get("id") or ""), "label": str(item.get("label") or ""), "sni": str(item.get("sni") or "").strip(), "doh": str(item.get("doh") or "").strip()})
+    else:
+        for preset in ECH_PRESETS:
+            entries.append({"id": preset["id"], "label": preset["label"], "sni": preset["sni"], "doh": preset["doh"]})
+    results = await asyncio.gather(*[_ech_ping_one(entry) for entry in entries])
+    return {"results": list(results)}
+
+
 @app.post("/api/links/{uid}/test")
 async def test_inbound(uid: str, request: Request, _=Depends(require_auth)):
     link = LINKS.get(uid)
@@ -13685,7 +13429,7 @@ async def test_inbound(uid: str, request: Request, _=Depends(require_auth)):
                 raw_port = int(link.get("port") or PROXY_DEFAULT_PORTS.get("socks5", 1080))
                 target = format_host_port(domain, raw_port)
                 await refresh_proxy_listener_status()
-                if not _proxy_inbound_enabled(link):
+                if not _proxy_inbound_enabled(link) and not _proxy_local_listener_usable(link):
                     verdict = "not_available"
                     detail = _proxy_inbound_disabled_reason(link) + " " + _PAAS_TCP_NOTE
                 else:
@@ -13694,7 +13438,7 @@ async def test_inbound(uid: str, request: Request, _=Depends(require_auth)):
                 raw_port = int(link.get("port") or PROXY_DEFAULT_PORTS.get("http-proxy", 3128))
                 target = format_host_port(domain, raw_port)
                 await refresh_proxy_listener_status()
-                if not _proxy_inbound_enabled(link):
+                if not _proxy_inbound_enabled(link) and not _proxy_local_listener_usable(link):
                     verdict = "not_available"
                     detail = _proxy_inbound_disabled_reason(link) + " " + _PAAS_TCP_NOTE
                 else:
@@ -13705,7 +13449,8 @@ async def test_inbound(uid: str, request: Request, _=Depends(require_auth)):
                 if variant not in MTPROTO_VARIANTS:
                     variant = "dd"
                 target = format_host_port(domain, raw_port)
-                if not _proxy_inbound_enabled(link):
+                await refresh_proxy_listener_status()
+                if not _proxy_inbound_enabled(link) and not _proxy_local_listener_usable(link):
                     verdict = "not_available"
                     detail = _proxy_inbound_disabled_reason(link) + " " + _PAAS_TCP_NOTE
                 else:
@@ -15083,10 +14828,6 @@ async def xhttp_stream_one(base_path: str, request: Request):
     if not link or not link["active"]:
         raise HTTPException(status_code=403, detail="inactive or unknown UUID")
     _require_xhttp_protocol(link)
-    if is_session_blocked(user_uuid, ip):
-        raise HTTPException(status_code=403, detail="blocked by admin")
-    if is_ip_restricted(ip):
-        raise HTTPException(status_code=403, detail="restricted by admin")
     if not is_ip_allowed(link, user_uuid, ip):
         raise HTTPException(status_code=403, detail="ip limit reached")
 
@@ -18004,19 +17745,20 @@ html{scroll-padding-top:84px}
 .page-header{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:20px}
 .page-title{font-size:26px;font-weight:800;color:var(--sx-text);letter-spacing:-0.02em;line-height:var(--sx-leading-tight)}
 .page-sub{font-size:var(--sx-text-md);color:var(--sx-text-2);margin-top:4px}
-.stats-row{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,240px),1fr));gap:16px;margin-bottom:20px;align-items:start}
-.stat-card{background:var(--sx-surface);border:1px solid var(--sx-border);border-radius:var(--sx-radius-xl);padding:18px;box-shadow:var(--sx-shadow-sm);min-width:0;position:relative;overflow:hidden;transition:border-color var(--sx-transition),transform 150ms ease-out}
+.stats-row{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;margin-bottom:20px;align-items:stretch;grid-auto-rows:1fr}
+.stat-card{background:var(--sx-surface);border:1px solid var(--sx-border);border-radius:var(--sx-radius-xl);padding:18px;box-shadow:var(--sx-shadow-sm);min-width:0;position:relative;overflow:hidden;transition:border-color var(--sx-transition),transform 150ms ease-out;display:flex;flex-direction:column}
 .stat-card::before{content:"";position:absolute;top:0;inset-inline-start:0;bottom:0;width:3px;background:var(--sx-accent-solid);opacity:0.85}
 .stat-card:hover{border-color:var(--sx-border-strong);transform:translateY(-1px)}
 .stat-label{font-size:var(--sx-text-sm);font-weight:700;color:var(--sx-text-3);text-transform:uppercase;letter-spacing:0.06em;display:flex;align-items:center;gap:8px}
 .stat-card .stat-icon{width:18px;height:18px;color:var(--sx-accent-ink)}
 .stat-val{font-size:1.75rem;font-weight:800;color:var(--sx-text);line-height:1.2;margin-top:8px;font-variant-numeric:tabular-nums;overflow-wrap:break-word}
 .stat-unit{font-size:var(--sx-text-sm);font-weight:600;color:var(--sx-text-3);margin-inline-start:4px}
+.stat-val .stat-sub{display:block;font-size:0.85rem;font-weight:600;color:var(--sx-text-3);line-height:1.4;margin-top:2px}
 .speed-card{background:var(--sx-surface);border:1px solid var(--sx-border);border-radius:var(--sx-radius-xl);padding:18px}
 .speed-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 .speed-item .stat-label{margin-bottom:4px}
 .speed-item .stat-val{font-size:1.4rem}
-.status-cards-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,200px),1fr));gap:12px;margin-bottom:20px}#settings-status{grid-template-columns:repeat(3,minmax(0,1fr))}#settings-status .status-card{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;text-align:center;padding:12px 6px;font-size:0.85rem;min-width:0}
+.status-cards-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,200px),1fr));gap:12px;margin-bottom:20px}#settings-status{grid-template-columns:repeat(6,minmax(0,1fr));gap:6px;margin-bottom:0;flex:1}#settings-status .status-card{display:flex;flex-direction:column;align-items:center;justify-content:flex-start;gap:3px;text-align:center;padding:8px 0;font-size:0.65rem;line-height:1.25;min-width:0;overflow-wrap:anywhere}#settings-status .status-card .status-icon{width:16px;height:16px}#settings-status .status-card>span:last-child{overflow-wrap:anywhere;min-width:0}#settings-status .status{display:flex;flex-direction:row;align-items:flex-start;justify-content:center;gap:3px;font-size:inherit;min-width:0}#settings-status .status-dot{flex:none;margin-top:4px}#settings-status .status>span:last-child{flex:1 1 auto;overflow-wrap:anywhere;min-width:0}
 .status-card{background:var(--sx-surface);border:1px solid var(--sx-border);border-radius:var(--sx-radius-lg);padding:14px 16px;cursor:pointer;transition:border-color var(--sx-transition),background-color var(--sx-transition);min-width:0}
 .status-card:hover{border-color:var(--sx-accent-border)}
 .status-card.active{border-color:var(--sx-success-border);background:var(--sx-success-soft)}
@@ -18130,6 +17872,7 @@ body[dir="rtl"] .row-act-grid{flex-direction:row}
 @media (min-width:1024px){
 .stats-row{gap:16px}
 }
+@media (max-width:1399px){.stats-row{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media (max-width:1023px){
 .sx-sidebar{transform:translateX(-105%);transition:transform 200ms ease-out;box-shadow:var(--sx-shadow-lg)}
 [dir="rtl"] .sx-sidebar{transform:translateX(105%)}
@@ -18144,7 +17887,7 @@ body[dir="rtl"] .row-act-grid{flex-direction:row}
 .header{padding:0 16px}
 .header-inner{flex-wrap:wrap;gap:10px}
 #inbound-table{min-width:0}
-.stats-row{grid-template-columns:repeat(auto-fill,minmax(min(100%,240px),1fr));gap:16px}
+.stats-row{grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
 }
 @media (max-width:768px){
 #inbound-table thead{display:none}
@@ -18160,7 +17903,7 @@ body[dir="rtl"] .row-act-grid{flex-direction:row}
 #login-logs-table td{word-break:normal;overflow-wrap:normal}
 }
 @media (max-width:500px){
-.stats-row{grid-template-columns:repeat(auto-fill,minmax(min(100%,240px),1fr))}
+.stats-row{grid-template-columns:repeat(1,minmax(0,1fr))}
 .seg-group{flex-direction:column;width:100%}
 .seg-btn{width:100%}
 .page-title{font-size:22px}
@@ -18345,14 +18088,12 @@ body[dir="rtl"] .row-act-grid{flex-direction:row}
       <div class="stats-row">
         <div class="stat-card stat-traffic"><div class="stat-label"><span class="stat-icon ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 16V4M7 4L3 8M7 4l4 4M17 8v12M17 20l4-4M17 20l-4-4"/></svg></span><span data-en="Traffic" data-fa="ترافیک">Traffic</span></div><div class="stat-val" id="sv-traffic">–<span class="stat-unit"> MB</span></div></div>
         <div class="stat-card stat-requests"><div class="stat-label"><span class="stat-icon ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></span><span data-en="Requests" data-fa="درخواست‌ها">Requests</span></div><div class="stat-val" id="sv-requests">–</div></div>
-        <div class="stat-card stat-uptime"><div class="stat-label"><span class="stat-icon ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></span><span data-en="Uptime" data-fa="آپتایم">Uptime</span></div><div class="stat-val" id="sv-uptime" style="font-size:1.2rem;">–</div></div>
+        <div class="stat-card stat-uptime"><div class="stat-label"><span class="stat-icon ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></span><span data-en="Uptime" data-fa="آپتایم">Uptime</span></div><div class="stat-val" id="sv-uptime">–</div></div>
         <div class="stat-card stat-disk"><div class="stat-label"><span class="stat-icon ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg></span><span data-en="Disk Free" data-fa="فضای دیسک">Disk Free</span></div><div class="stat-val" id="sv-disk">–<span class="stat-unit"> GB</span></div></div>
-      </div>
-      <div class="stats-row">
         <div class="stat-card stat-download"><div class="stat-label"><span class="stat-icon ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg></span><span data-en="Download Speed" data-fa="سرعت دانلود">Download Speed</span></div><div class="stat-val" id="sv-down-speed">–<span class="stat-unit"> KB/s</span></div></div>
         <div class="stat-card stat-upload"><div class="stat-label"><span class="stat-icon ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg></span><span data-en="Upload Speed" data-fa="سرعت آپلود">Upload Speed</span></div><div class="stat-val" id="sv-up-speed">–<span class="stat-unit"> KB/s</span></div></div>
         <div class="stat-card stat-monthly"><div class="stat-label"><span class="stat-icon ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg></span><span data-en="Monthly Usage" data-fa="مصرف ماهانه">Monthly Usage</span></div><div class="stat-val" id="sv-monthly">–<span class="stat-unit"> GB</span></div></div>
-        <div class="stat-card" style="font-size:0.8rem;">
+        <div class="stat-card">
           <div class="stat-label"><span class="stat-icon ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M19.1 4.9L17 7M7 17l-2.1 2.1"/></svg></span><span data-en="Settings Status" data-fa="وضعیت تنظیمات">Settings Status</span></div>
           <div class="status-cards-grid" id="settings-status">
             <div class="status-card inactive" id="st-log" onclick="switchPage('settings')" role="button" tabindex="0" title="Open Settings" data-en-title="Open Settings" data-fa-title="باز کردن تنظیمات">
@@ -18409,7 +18150,7 @@ body[dir="rtl"] .row-act-grid{flex-direction:row}
     </section>
     <section class="page" id="page-inbounds">
       <div class="page-header">
-        <div><div class="page-title" data-en="Inbounds" data-fa="اینباندها">Inbounds</div><div class="page-sub" data-en="Manage VLESS Configs" data-fa="مدیریت کانفیگ‌های VLESS">Manage VLESS Configs</div></div>
+        <div><div class="page-title" data-en="Inbounds" data-fa="اینباندها">Inbounds</div></div>
         <div style="display:flex;gap:6px;flex-wrap:wrap;">
           <button class="btn btn-primary" onclick="showAddMo()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></span><span data-en="Create" data-fa="ایجاد">Create</span></button>
           <button class="btn btn-outline btn-sm" onclick="exportLinks()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg></span><span data-en="Export" data-fa="خروجی">Export</span></button>
@@ -18617,16 +18358,14 @@ example.com
       <div class="page-header"><div><div class="page-title" data-en="Active Users" data-fa="کاربران فعال">Active Users</div><div class="page-sub" data-en="Live sessions — updated from the server every 3 seconds" data-fa="نشست‌های زنده — هر ۳ ثانیه از سرور به‌روز می‌شود">Live sessions — updated from the server every 3 seconds</div></div><button class="btn btn-outline btn-sm" onclick="refreshActiveUsers(this)"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg></span><span data-en="Refresh" data-fa="بروزرسانی">Refresh</span></button></div>
       <div class="card">
         <div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></span><span class="card-title" data-en="Sessions" data-fa="نشست‌ها">Sessions</span></span><span id="active-users-summary" style="color:var(--text-2);font-size:0.85rem;"></span></div>
+        <div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-bottom:12px;">
+          <div class="stat-card" style="padding:12px;"><div class="stat-label"><span data-en="Online now" data-fa="آنلاین اکنون">Online now</span></div><div class="stat-val" id="au-online" style="font-size:1.3rem;">0</div></div>
+          <div class="stat-card" style="padding:12px;"><div class="stat-label"><span data-en="Connected today" data-fa="متصل‌شده امروز">Connected today</span></div><div class="stat-val" id="au-today" style="font-size:1.3rem;">0</div></div>
+          <div class="stat-card" style="padding:12px;"><div class="stat-label"><span data-en="Connected this month" data-fa="متصل‌شده این ماه">Connected this month</span></div><div class="stat-val" id="au-month" style="font-size:1.3rem;">0</div></div>
+          <div class="stat-card" style="padding:12px;"><div class="stat-label"><span data-en="Unique users (by IP)" data-fa="کاربران یکتا (بر اساس IP)">Unique users (by IP)</span></div><div class="stat-val" id="au-unique" style="font-size:1.3rem;">0</div></div>
+        </div>
+        <div style="font-size:0.8rem;color:var(--text-2);margin-bottom:12px;" data-en="Today and this month count every connection; Unique counts each IP once, all-time." data-fa="امروز و این ماه هر اتصال را می‌شمارند؛ یکتا هر آی‌پی را فقط یک‌بار در همه زمان‌ها می‌شمارد.">Today and this month count every connection; Unique counts each IP once, all-time.</div>
         <div id="active-users-cards" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px;"></div>
-      </div>
-      <div class="card" style="margin-top:12px;">
-        <div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></span><span class="card-title" data-en="Disabled users" data-fa="کاربران مسدودشده">Disabled users</span></span><span style="color:var(--text-2);font-size:0.85rem;" data-en="Blocked IPs stay blocked until released" data-fa="آی‌پی‌های مسدودشده تا زمان رفع مسدودیت، مسدود می‌مانند">Blocked IPs stay blocked until released</span></div>
-        <div id="blocked-users-list" style="display:grid;gap:8px;"></div>
-      </div>
-      <div class="card" style="margin-top:12px;">
-        <div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg></span><span class="card-title" data-en="Restricted users" data-fa="کاربران محدود شده">Restricted users</span></span><span style="color:var(--text-2);font-size:0.85rem;" data-en="Blocked source IPs and ranges cannot connect to any config" data-fa="آی‌پی‌ها و بازه‌های مسدودشده نمی‌توانند به هیچ کانفیگی متصل شوند">Blocked source IPs and ranges cannot connect to any config</span></div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;"><input class="fi" id="restricted-entry" style="flex:1;min-width:200px;" data-ph-en="IP or CIDR, e.g. 203.0.113.7 or 203.0.113.0/24" data-ph-fa="آی‌پی یا CIDR، مثلاً 203.0.113.7 یا 203.0.113.0/24" placeholder="IP or CIDR, e.g. 203.0.113.7 or 203.0.113.0/24"><button class="btn btn-outline btn-sm" onclick="addRestrictedUser()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></span><span data-en="Restrict" data-fa="محدود کردن">Restrict</span></button></div>
-        <div id="restricted-users-list" style="display:grid;gap:8px;margin-top:8px;"></div>
       </div>
     </section>
     <section class="page" id="page-settings">
@@ -18778,7 +18517,7 @@ example.com
       </div>
     </section>
     <section class="page" id="page-about">
-      <div class="page-header"><div><div class="page-title" data-en="About SulgX" data-fa="درباره SulgX">About SulgX</div><div class="page-sub" data-en="Project introduction" data-fa="معرفی پروژه">Project introduction</div></div></div>
+      <div class="page-header"><div><div class="page-title" data-en="About SulgX" data-fa="درباره SulgX">About SulgX</div></div></div>
       <div class="card" style="margin-bottom:16px;"><div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></span><span class="card-title" data-en="What is SulgX Panel" data-fa="پنل SulgX چیست">What is SulgX Panel</span></span></div><div style="color:var(--text-2);line-height:1.7;" data-en="SulgX Panel is a self-hosted web panel for managing VLESS, VMess, Trojan, Shadowsocks and Telegram proxy (WEB and MTProto) inbounds, users, traffic quotas and clean IPs from one place." data-fa="پنل SulgX یک پنل وب خودمیزبان برای مدیریت اینباندهای VLESS، VMess، Trojan، Shadowsocks و پروکسی تلگرام (WEB و MTProto)، کاربران، سقف مصرف و آی‌پی‌های تمیز از یک مکان است.">SulgX Panel is a self-hosted web panel for managing VLESS, VMess, Trojan, Shadowsocks and Telegram proxy (WEB and MTProto) inbounds, users, traffic quotas and clean IPs from one place.</div></div>
       <div class="card" style="margin-bottom:16px;"><div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg></span><span class="card-title" data-en="Features" data-fa="ویژگی‌ها">Features</span></span></div><ul style="margin:0;padding-inline-start:20px;display:grid;gap:8px;color:var(--text-2);line-height:1.7;"><li data-en="Multi-protocol inbounds: VLESS, VMess, Trojan, Shadowsocks, HTTP, SOCKS5 and MTProto." data-fa="اینباندهای چندپروتکله: VLESS، VMess، Trojan، Shadowsocks، HTTP، SOCKS5 و MTProto.">Multi-protocol inbounds: VLESS, VMess, Trojan, Shadowsocks, HTTP, SOCKS5 and MTProto.</li><li data-en="Traffic, quota and expiry control per inbound, with live sessions and active users." data-fa="کنترل ترافیک، سقف مصرف و انقضا برای هر اینباند، با نشست‌های زنده و کاربران فعال.">Traffic, quota and expiry control per inbound, with live sessions and active users.</li><li data-en="Clean-IP profiles and an IP scanner for finding fast, working addresses." data-fa="پروفایل‌های آی‌پی تمیز و اسکنر آی‌پی برای یافتن آدرس‌های سریع و سالم.">Clean-IP profiles and an IP scanner for finding fast, working addresses.</li><li data-en="Telegram bot, notifications and Telegram proxy (WEB and MTProto) with subscription links." data-fa="ربات تلگرام، اعلان‌ها و پروکسی تلگرام (WEB و MTProto) با لینک اشتراک.">Telegram bot, notifications and Telegram proxy (WEB and MTProto) with subscription links.</li><li data-en="Subscription links for VLESS, Clash and Sing-box, plus QR codes and health checks." data-fa="لینک اشتراک VLESS، Clash و Sing-box، به‌همراه کد QR و بررسی سلامت.">Subscription links for VLESS, Clash and Sing-box, plus QR codes and health checks.</li><li data-en="Logs, login history and settings, all in Persian and English." data-fa="لاگ‌ها، تاریخچه ورود و تنظیمات، همه به فارسی و انگلیسی.">Logs, login history and settings, all in Persian and English.</li></ul></div>
       <div class="card" style="margin-bottom:16px;"><div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></span><span class="card-title" data-en="How it works" data-fa="نحوه کار">How it works</span></span></div><ol style="margin:0;padding-inline-start:20px;display:grid;gap:8px;color:var(--text-2);line-height:1.7;"><li data-en="Create an inbound from the Inbounds page and set its traffic limit and expiry." data-fa="از صفحه اینباندها یک اینباند بسازید و سقف مصرف و انقضا را تعیین کنید.">Create an inbound from the Inbounds page and set its traffic limit and expiry.</li><li data-en="Copy its link, subscription or QR code and import it into your client app, such as v2rayNG." data-fa="لینک، اشتراک یا کد QR آن را کپی کنید و در برنامه کلاینت خود، مانند v2rayNG، وارد کنید.">Copy its link, subscription or QR code and import it into your client app, such as v2rayNG.</li><li data-en="Watch traffic, sessions and health from the Dashboard and Active Users pages." data-fa="ترافیک، نشست‌ها و سلامت را از صفحات داشبورد و کاربران فعال ببینید.">Watch traffic, sessions and health from the Dashboard and Active Users pages.</li><li data-en="For Telegram, create a WEB or MTProto proxy from the Telegram page and share its link." data-fa="برای تلگرام، از صفحه تلگرام یک پروکسی WEB یا MTProto بسازید و لینک آن را به اشتراک بگذارید.">For Telegram, create a WEB or MTProto proxy from the Telegram page and share its link.</li></ol></div>
@@ -18943,7 +18682,7 @@ example.com
         <div id="ech-create-fields" style="display:none;">
           <input class="fi" id="ech-sni-create" placeholder="ECH SNI (e.g. cloudflare.com)" data-ph-en="ECH SNI (e.g. cloudflare.com)" data-ph-fa="ECH SNI (مثلاً cloudflare.com)" style="margin-top:5px;">
           <input class="fi" id="ech-doh-create" placeholder="ECH DoH URL (optional)" data-ph-en="ECH DoH URL (optional)" data-ph-fa="آدرس ECH DoH (اختیاری)" style="margin-top:5px;">
-          <select class="fs" id="ech-preset-create" onchange="applyEchPreset('create')" style="margin-top:5px;"><option value="custom" data-en="Custom (enter SNI below)" data-fa="سفارشی (SNI را زیر وارد کنید)">Custom (enter SNI below)</option><option value="cloudflare">Cloudflare (cloudflare.com)</option><option value="cloudflare-www">Cloudflare WWW (www.cloudflare.com)</option><option value="one-one-one-one">Cloudflare 1.1.1.1 (one.one.one.one)</option><option value="developers-cloudflare">Cloudflare Developers (developers.cloudflare.com)</option><option value="blog-cloudflare">Cloudflare Blog (blog.cloudflare.com)</option><option value="cdnjs">cdnjs (cdnjs.cloudflare.com)</option><option value="workers-cloudflare">Cloudflare Workers (workers.cloudflare.com)</option><option value="pages-cloudflare">Cloudflare Pages (pages.cloudflare.com)</option><option value="research-cloudflare">Cloudflare Research (research.cloudflare.com)</option><option value="tls-ech-dev" data-en="ECH test site (tls-ech.dev)" data-fa="سایت تست ECH (tls-ech.dev)">ECH test site (tls-ech.dev)</option></select>
+          <select class="fs" id="ech-preset-create" onchange="applyEchPreset('create')" style="margin-top:5px;"><option value="custom" data-en="Custom (enter SNI below)" data-fa="سفارشی (SNI را زیر وارد کنید)">Custom (enter SNI below)</option><option value="cloudflare">Cloudflare (cloudflare.com)</option><option value="cloudflare-www">Cloudflare WWW (www.cloudflare.com)</option><option value="one-one-one-one">Cloudflare 1.1.1.1 (one.one.one.one)</option><option value="developers-cloudflare">Cloudflare Developers (developers.cloudflare.com)</option><option value="blog-cloudflare">Cloudflare Blog (blog.cloudflare.com)</option><option value="cdnjs">cdnjs (cdnjs.cloudflare.com)</option><option value="workers-cloudflare">Cloudflare Workers (workers.cloudflare.com)</option><option value="pages-cloudflare">Cloudflare Pages (pages.cloudflare.com)</option><option value="research-cloudflare">Cloudflare Research (research.cloudflare.com)</option><option value="tls-ech-dev" data-en="ECH test site (tls-ech.dev)" data-fa="سایت تست ECH (tls-ech.dev)">ECH test site (tls-ech.dev)</option></select><button type="button" class="btn btn-outline" id="ech-ping-btn-create" onclick="testEchPing('create')" style="margin-top:5px;width:100%;" data-en="Test ECH ping" data-fa="تست پینگ ECH">Test ECH ping</button><div id="ech-ping-results-create" style="margin-top:5px;"></div>
         </div>
         <div class="fg" data-adv="allow_insecure"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Allow Insecure" data-fa="اجازه اتصال ناامن">Allow Insecure</span></label><div class="toggle" id="insecure-create" onclick="this.classList.toggle('on')"></div></div>
         <div class="fg" data-adv="random_path"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Random Path" data-fa="مسیر تصادفی">Random Path</span></label><div class="toggle" id="random-create" onclick="this.classList.toggle('on')"></div></div>
@@ -19151,7 +18890,7 @@ example.com
         <div id="ech-edit-fields" style="display:none;">
           <input class="fi" id="ech-sni-edit" placeholder="ECH SNI (e.g. cloudflare.com)" data-ph-en="ECH SNI (e.g. cloudflare.com)" data-ph-fa="ECH SNI (مثلاً cloudflare.com)" style="margin-top:5px;">
           <input class="fi" id="ech-doh-edit" placeholder="ECH DoH URL (optional)" data-ph-en="ECH DoH URL (optional)" data-ph-fa="آدرس ECH DoH (اختیاری)" style="margin-top:5px;">
-          <select class="fs" id="ech-preset-edit" onchange="applyEchPreset('edit')" style="margin-top:5px;"><option value="custom" data-en="Custom (enter SNI below)" data-fa="سفارشی (SNI را زیر وارد کنید)">Custom (enter SNI below)</option><option value="cloudflare">Cloudflare (cloudflare.com)</option><option value="cloudflare-www">Cloudflare WWW (www.cloudflare.com)</option><option value="one-one-one-one">Cloudflare 1.1.1.1 (one.one.one.one)</option><option value="developers-cloudflare">Cloudflare Developers (developers.cloudflare.com)</option><option value="blog-cloudflare">Cloudflare Blog (blog.cloudflare.com)</option><option value="cdnjs">cdnjs (cdnjs.cloudflare.com)</option><option value="workers-cloudflare">Cloudflare Workers (workers.cloudflare.com)</option><option value="pages-cloudflare">Cloudflare Pages (pages.cloudflare.com)</option><option value="research-cloudflare">Cloudflare Research (research.cloudflare.com)</option><option value="tls-ech-dev" data-en="ECH test site (tls-ech.dev)" data-fa="سایت تست ECH (tls-ech.dev)">ECH test site (tls-ech.dev)</option></select>
+          <select class="fs" id="ech-preset-edit" onchange="applyEchPreset('edit')" style="margin-top:5px;"><option value="custom" data-en="Custom (enter SNI below)" data-fa="سفارشی (SNI را زیر وارد کنید)">Custom (enter SNI below)</option><option value="cloudflare">Cloudflare (cloudflare.com)</option><option value="cloudflare-www">Cloudflare WWW (www.cloudflare.com)</option><option value="one-one-one-one">Cloudflare 1.1.1.1 (one.one.one.one)</option><option value="developers-cloudflare">Cloudflare Developers (developers.cloudflare.com)</option><option value="blog-cloudflare">Cloudflare Blog (blog.cloudflare.com)</option><option value="cdnjs">cdnjs (cdnjs.cloudflare.com)</option><option value="workers-cloudflare">Cloudflare Workers (workers.cloudflare.com)</option><option value="pages-cloudflare">Cloudflare Pages (pages.cloudflare.com)</option><option value="research-cloudflare">Cloudflare Research (research.cloudflare.com)</option><option value="tls-ech-dev" data-en="ECH test site (tls-ech.dev)" data-fa="سایت تست ECH (tls-ech.dev)">ECH test site (tls-ech.dev)</option></select><button type="button" class="btn btn-outline" id="ech-ping-btn-edit" onclick="testEchPing('edit')" style="margin-top:5px;width:100%;" data-en="Test ECH ping" data-fa="تست پینگ ECH">Test ECH ping</button><div id="ech-ping-results-edit" style="margin-top:5px;"></div>
         </div>
         <div class="fg" data-adv="allow_insecure"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Allow Insecure" data-fa="اجازه اتصال ناامن">Allow Insecure</span></label><div class="toggle" id="insecure-edit" onclick="this.classList.toggle('on')"></div></div>
         <div class="fg" data-adv="random_path"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Random Path" data-fa="مسیر تصادفی">Random Path</span></label><div class="toggle" id="random-edit" onclick="this.classList.toggle('on')"></div></div>
@@ -19221,7 +18960,7 @@ example.com
       <button class="btn btn-outline btn-sm" onclick="refreshProxyFlagsAndOptions('edit')" style="margin-top:6px;"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg></span><span data-en="Refresh Flags" data-fa="بروزرسانی پرچم‌ها">Refresh Flags</span></button>
     </div>
     <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Link text" data-fa="متن لینک">Link text</span></label><div style="display:flex;flex-wrap:wrap;gap:6px;"><input class="fi" id="edit-link-text" readonly style="direction:ltr;text-align:left;flex:1;min-width:0;"><button class="btn btn-outline btn-sm" onclick="copyToClipboard(document.getElementById('edit-link-text').value)"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></span><span data-en="Copy" data-fa="کپی">Copy</span></button></div></div>
-    <div style="display:flex;gap:6px;margin-top:10px;flex-wrap:wrap;"><button class="btn btn-outline btn-sm" onclick="regenUuidFromEdit()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="15.5" cy="15.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="15.5" cy="8.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="8.5" cy="15.5" r="1.4" fill="currentColor" stroke="none"/></svg></span><span data-en="Regenerate UUID" data-fa="تولید دوباره UUID">Regenerate UUID</span></button><button class="btn btn-outline btn-sm" onclick="disconnectFromEdit()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 7V3M15 7V3M7 7h10v4a5 5 0 0 1-10 0z"/><line x1="12" y1="16" x2="12" y2="21"/><line x1="4" y1="4" x2="20" y2="20"/></svg></span><span data-en="Disconnect all" data-fa="قطع همه اتصال‌ها">Disconnect all</span></button><button class="btn btn-outline btn-sm" onclick="cloneLinkFromEdit()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/><line x1="18" y1="2" x2="18" y2="6"/><line x1="16" y1="4" x2="20" y2="4"/></svg></span><span data-en="Clone" data-fa="کلون">Clone</span></button></div>
+    <div style="display:flex;gap:6px;margin-top:10px;flex-wrap:wrap;"><button class="btn btn-outline btn-sm" onclick="regenUuidFromEdit()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="15.5" cy="15.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="15.5" cy="8.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="8.5" cy="15.5" r="1.4" fill="currentColor" stroke="none"/></svg></span><span data-en="Regenerate UUID" data-fa="تولید دوباره UUID">Regenerate UUID</span></button><button class="btn btn-outline btn-sm" onclick="cloneLinkFromEdit()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/><line x1="18" y1="2" x2="18" y2="6"/><line x1="16" y1="4" x2="20" y2="4"/></svg></span><span data-en="Clone" data-fa="کلون">Clone</span></button></div>
     <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:10px;"><button class="btn btn-primary" onclick="saveEdit()" style="flex:1;"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg></span><span data-en="Save" data-fa="ذخیره">Save</span></button><button class="btn btn-danger btn-sm" onclick="resetTraf()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg></span><span data-en="Reset Traffic" data-fa="بازنشانی ترافیک">Reset Traffic</span></button><button class="btn btn-outline" onclick="document.getElementById('mo-edit').classList.remove('show')"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></span><span data-en="Cancel" data-fa="انصراف">Cancel</span></button></div>
   </div>
 </div>
@@ -19458,6 +19197,7 @@ const i18n = {
     logout: 'Logout',
     reachable:'Reachable', failed:'Failed',
     testing:'Testing...',
+    echPingTest:'Test ECH ping', echPingFailed:'ECH ping test failed', echTimeout:'timeout', echUnreachable:'unreachable', echNotTested:'not tested', echUseEntry:'Use this ECH entry',
     Error: 'Error',
     'None (Direct)': 'None (Direct)',
     'Proxy flags refreshed': 'Proxy flags refreshed',
@@ -19477,10 +19217,8 @@ const i18n = {
     confirmDeleteRule: 'Delete this routing rule?',
     confirmDeleteSelected: 'Delete selected?',
     confirmDeleteUser: 'Delete this user? Their links stay but lose the owner.',
-    confirmDisconnectSession: 'Disconnect this session?',
     detailsBtn: 'Details',
     hideDetailsBtn: 'Hide details',
-    confirmDisconnectUser: 'Disconnect all sessions of this user?',
     destinationCol: 'Destination',
     sessionsCol: 'Sessions',
     confirmReset: 'Reset?',
@@ -19499,8 +19237,6 @@ const i18n = {
     deleted: 'Deleted',
     deletedSelected: 'Deleted selected',
     detectionFailed: 'Detection failed: ',
-    disconnectAllTip: 'Disconnect All',
-    disconnected: 'Disconnected',
     dohCopied: 'DoH URL copied',
     enterName: 'Enter a name',
     enterNameUrl: 'Enter name and URL',
@@ -19608,15 +19344,6 @@ const i18n = {
     loadingLogs: 'Loading logs…',
     loading: 'Loading…',
     noActiveUsers: 'No active users',
-    noBlockedUsers: 'No blocked users',
-    noRestrictedUsers: 'No restricted users',
-    restrictedAdded: 'Restricted',
-    restrictedRemoved: 'Restriction removed',
-    invalidIpOrCidr: 'Invalid IP or CIDR',
-    alreadyRestricted: 'Already restricted',
-    unblockBtn: 'Unblock',
-    unblocked: 'Unblocked',
-    disconnectBtn: 'Disconnect',
     noAddressesAdded: 'No addresses added',
     noAddressesInProfile: 'No addresses in this profile',
     copyProxyLinkTip: 'Copy proxy link',
@@ -19651,7 +19378,7 @@ const i18n = {
     copyLinkText: 'Copy link text',
     activeCount: '{n} active',
     ipsCount: '({n} IPs)',
-    diskFreeOf: '{free} GB free of {total} GB',
+    diskFreeOf: 'of {total} GB',
     diskTitle: 'Disk: {path}',
     notAvailable: 'N/A',
     currentExpiry: 'Current expiry: {date}',
@@ -19678,6 +19405,7 @@ const i18n = {
     logout: 'خروج',
     reachable:'در دسترس', failed:'خطا',
     testing:'در حال تست',
+    echPingTest:'تست پینگ ECH', echPingFailed:'تست پینگ ECH ناموفق بود', echTimeout:'پایان زمان', echUnreachable:'در دسترس نیست', echNotTested:'تست نشده', echUseEntry:'استفاده از این ورودی ECH',
     Error: 'خطا',
     'None (Direct)': 'هیچ‌کدام (مستقیم)',
     'Proxy flags refreshed': 'پرچم‌های پروکسی تازه‌سازی شد',
@@ -19697,10 +19425,8 @@ const i18n = {
     confirmDeleteRule: 'این قانون مسیریابی حذف شود؟',
     confirmDeleteSelected: 'موارد انتخاب‌شده حذف شوند؟',
     confirmDeleteUser: 'این کاربر حذف شود؟ لینک‌هایش می‌مانند اما مالک خود را از دست می‌دهند.',
-    confirmDisconnectSession: 'این نشست قطع شود؟',
     detailsBtn: 'جزئیات',
     hideDetailsBtn: 'پنهان کردن جزئیات',
-    confirmDisconnectUser: 'همه نشست‌های این کاربر قطع شود؟',
     destinationCol: 'مقصد',
     sessionsCol: 'نشست‌ها',
     confirmReset: 'بازنشانی شود؟',
@@ -19719,8 +19445,6 @@ const i18n = {
     deleted: 'حذف شد',
     deletedSelected: 'موارد انتخاب‌شده حذف شدند',
     detectionFailed: 'تشخیص ناموفق بود: ',
-    disconnectAllTip: 'قطع همه',
-    disconnected: 'قطع شد',
     dohCopied: 'آدرس DoH کپی شد',
     enterName: 'یک نام وارد کنید',
     enterNameUrl: 'نام و آدرس را وارد کنید',
@@ -19828,15 +19552,6 @@ const i18n = {
     loadingLogs: 'در حال بارگیری گزارش‌ها…',
     loading: 'در حال بارگیری…',
     noActiveUsers: 'کاربر فعالی نیست',
-    noBlockedUsers: 'کاربر مسدودشده‌ای نیست',
-    noRestrictedUsers: 'کاربر محدودشده‌ای نیست',
-    restrictedAdded: 'محدود شد',
-    restrictedRemoved: 'محدودیت برداشته شد',
-    invalidIpOrCidr: 'آی‌پی یا CIDR نامعتبر است',
-    alreadyRestricted: 'از قبل محدود شده است',
-    unblockBtn: 'رفع مسدودیت',
-    unblocked: 'رفع مسدودیت شد',
-    disconnectBtn: 'قطع اتصال',
     noAddressesAdded: 'آدرسی اضافه نشده است',
     noAddressesInProfile: 'در این پروفایل آدرسی نیست',
     copyProxyLinkTip: 'کپی لینک پروکسی',
@@ -19871,7 +19586,7 @@ const i18n = {
     copyLinkText: 'کپی متن لینک',
     activeCount: '{n} فعال',
     ipsCount: '({n} آی‌پی)',
-    diskFreeOf: '{free} گیگابایت آزاد از {total} گیگابایت',
+    diskFreeOf: 'از {total} گیگابایت',
     diskTitle: 'دیسک: {path}',
     notAvailable: 'ناموجود',
     currentExpiry: 'انقضای فعلی: {date}',
@@ -19902,9 +19617,8 @@ const stealth_i18n = {
     reachable: 'Reachable', failed: 'Failed',
     Inbound: 'Service', Inbounds: 'Services', Subscription: 'Sync',
     VLESS: 'Channel', Clash: 'Meta Config', SingBox: 'Sing Config',
-    'Quick Add': 'Quick Service', 'Manage VLESS Configs': 'Manage Channels',
+    'Quick Add': 'Quick Service',
     'This Server is Free': 'Free Service', 'Regenerate UUID': 'Refresh ID',
-    'Disconnect All': 'Terminate Links',
     testing:'Testing...',
     Error: 'Error',
     'None (Direct)': 'None (Direct)',
@@ -19925,10 +19639,8 @@ const stealth_i18n = {
     confirmDeleteRule: 'Delete this routing rule?',
     confirmDeleteSelected: 'Delete selected?',
     confirmDeleteUser: 'Delete this user? Their links stay but lose the owner.',
-    confirmDisconnectSession: 'Disconnect this session?',
     detailsBtn: 'Details',
     hideDetailsBtn: 'Hide details',
-    confirmDisconnectUser: 'Disconnect all sessions of this user?',
     destinationCol: 'Destination',
     sessionsCol: 'Sessions',
     confirmReset: 'Reset?',
@@ -19947,8 +19659,6 @@ const stealth_i18n = {
     deleted: 'Deleted',
     deletedSelected: 'Deleted selected',
     detectionFailed: 'Detection failed: ',
-    disconnectAllTip: 'Disconnect All',
-    disconnected: 'Disconnected',
     dohCopied: 'DoH URL copied',
     enterName: 'Enter a name',
     enterNameUrl: 'Enter name and URL',
@@ -20046,9 +19756,8 @@ const stealth_i18n = {
     reachable: 'در دسترس', failed: 'خطا',
     Inbound: 'سرویس', Inbounds: 'سرویس‌ها', Subscription: 'همگام‌سازی',
     VLESS: 'کانال', Clash: 'تنظیمات متا', SingBox: 'پیکربندی سینگ',
-    'Quick Add': 'سرویس سریع', 'Manage VLESS Configs': 'مدیریت کانال‌ها',
+    'Quick Add': 'سرویس سریع',
     'This Server is Free': 'سرویس رایگان', 'Regenerate UUID': 'تازه‌سازی شناسه',
-    'Disconnect All': 'قطع تمام اتصالات',
     testing:'در حال تست',
     Error: 'خطا',
     'None (Direct)': 'هیچ‌کدام (مستقیم)',
@@ -20069,10 +19778,8 @@ const stealth_i18n = {
     confirmDeleteRule: 'این قانون مسیریابی حذف شود؟',
     confirmDeleteSelected: 'موارد انتخاب‌شده حذف شوند؟',
     confirmDeleteUser: 'این کاربر حذف شود؟ لینک‌هایش می‌مانند اما مالک خود را از دست می‌دهند.',
-    confirmDisconnectSession: 'این نشست قطع شود؟',
     detailsBtn: 'جزئیات',
     hideDetailsBtn: 'پنهان کردن جزئیات',
-    confirmDisconnectUser: 'همه نشست‌های این کاربر قطع شود؟',
     destinationCol: 'مقصد',
     sessionsCol: 'نشست‌ها',
     confirmReset: 'بازنشانی شود؟',
@@ -20091,8 +19798,6 @@ const stealth_i18n = {
     deleted: 'حذف شد',
     deletedSelected: 'موارد انتخاب‌شده حذف شدند',
     detectionFailed: 'تشخیص ناموفق بود: ',
-    disconnectAllTip: 'قطع همه',
-    disconnected: 'قطع شد',
     dohCopied: 'آدرس DoH کپی شد',
     enterName: 'یک نام وارد کنید',
     enterNameUrl: 'نام و آدرس را وارد کنید',
@@ -20206,8 +19911,6 @@ const detailFa = {
   'Invalid address': 'آدرس نامعتبر است',
   'Invalid address format': 'قالب آدرس نامعتبر است',
   'Invalid IP or CIDR': 'آی‌پی یا CIDR نامعتبر است',
-  'already restricted': 'از قبل محدود شده است',
-  'restriction not found': 'محدودیتی یافت نشد',
   'Address already exists': 'این آدرس از قبل وجود دارد',
   'Address already in profile': 'این آدرس از قبل در پروفایل وجود دارد',
   'Address not found': 'آدرس یافت نشد',
@@ -20245,8 +19948,6 @@ const detailFa = {
   'Unknown owner user': 'کاربر مالک ناشناخته است',
   'Unknown proxy line': 'خط پروکسی ناشناخته است',
   'Proxy not found': 'پروکسی یافت نشد',
-  'proxy session not found': 'نشست پروکسی یافت نشد',
-  'session not found': 'نشست یافت نشد',
   'invalid session id': 'شناسه نشست نامعتبر است',
   'inactive or unknown UUID': 'UUID غیرفعال یا ناشناخته است',
   'invalid VLESS header': 'هدر VLESS نامعتبر است',
@@ -20308,9 +20009,6 @@ const detailFa = {
   'telemt WEB child is not running for this inbound': 'فرزند WEB مربوط به telemt برای این اینباند در حال اجرا نیست',
   'upstream WEB proxy timed out': 'زمان پروکسی WEB upstream تمام شد',
   'user not active': 'کاربر فعال نیست',
-  'blocked by admin': 'توسط مدیر مسدود شده است',
-  'restricted by admin': 'توسط مدیر محدود شده است',
-  'session is not blocked': 'نشست مسدود نیست',
   'upstreams must be a list': 'upstreamها باید فهرست باشند',
   'invalid JSON body': 'بدنه JSON نامعتبر است',
   'Invalid JSON body': 'بدنه JSON نامعتبر است',
@@ -20381,7 +20079,7 @@ const detailFaPrefixes = [
   ['cannot reach ', 'دسترسی به '],
   ['Proxy error: ', 'خطای پروکسی: '],
   ['Invalid DoH upstream URL: ', 'URL upstream DoH نامعتبر است: '],
-  ['Invalid ECH DoH URL: ', 'URL DoH برای ECH نامعتبر است: '],
+  ['Invalid ECH config URL: ', 'آدرس ECH نامعتبر است: '],
   ['Invalid host name for ', 'نام هاست نامعتبر برای '],
   ["Custom path '", "مسیر سفارشی '"],
   ["WebSocket path '", "مسیر WebSocket '"],
@@ -20445,7 +20143,6 @@ const ICONS={
   'chevron-down':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>',
   'chevron-left':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>',
   'chevron-right':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>',
-  'disconnect':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 7V3M15 7V3M7 7h10v4a5 5 0 0 1-10 0z"/><line x1="12" y1="16" x2="12" y2="21"/><line x1="4" y1="4" x2="20" y2="20"/></svg>',
   'power':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>',
   'lock':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>',
   'key':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="4.5"/><path d="M11 12L21 2M16 7l3 3"/></svg>',
@@ -20836,9 +20533,9 @@ const ECH_PRESETS_JS = {
 const RESTRICTION_PROFILE_JS = {
     "default": { fragment_mode: "off", fragment_length: "100-200", fragment_interval: "10-20", fp: "chrome", alpn: "smart", ech: 0, ech_preset: "", random_path: 0, tfo: 0, udp: 1, ipv6: 1, dns: "direct" },
     "normal": { fragment_mode: "off", fragment_length: "100-200", fragment_interval: "10-20", fp: "chrome", alpn: "smart", ech: 0, ech_preset: "", random_path: 0, tfo: 0, udp: 1, ipv6: 1, dns: "direct" },
-    "relative": { fragment_mode: "tlshello", fragment_length: "100-200", fragment_interval: "10-20", fp: "randomized", alpn: "smart", ech: 1, ech_preset: "cloudflare", random_path: 1, tfo: 1, udp: 1, ipv6: 1, dns: "doh" },
-    "severe": { fragment_mode: "tlshello", fragment_length: "100-500", fragment_interval: "5-10", fp: "randomized", alpn: "smart", ech: 1, ech_preset: "cloudflare", random_path: 1, tfo: 1, udp: 0, ipv6: 1, dns: "doh" },
-    "emergency": { fragment_mode: "tlshello", fragment_length: "50-100", fragment_interval: "1-5", fp: "randomized", alpn: "smart", ech: 1, ech_preset: "cloudflare", random_path: 1, tfo: 1, udp: 0, ipv6: 0, dns: "fakedns" }
+    "relative": { fragment_mode: "tlshello", fragment_length: "100-200", fragment_interval: "10-20", fp: "chrome", alpn: "smart", ech: 1, ech_preset: "cloudflare", random_path: 1, tfo: 1, udp: 1, ipv6: 1, dns: "doh" },
+    "severe": { fragment_mode: "tlshello", fragment_length: "100-500", fragment_interval: "5-10", fp: "chrome", alpn: "smart", ech: 1, ech_preset: "cloudflare", random_path: 1, tfo: 1, udp: 0, ipv6: 1, dns: "doh" },
+    "emergency": { fragment_mode: "tlshello", fragment_length: "50-100", fragment_interval: "1-5", fp: "chrome", alpn: "smart", ech: 1, ech_preset: "cloudflare", random_path: 1, tfo: 1, udp: 0, ipv6: 0, dns: "fakedns" }
 };
 
 function setToggleState(el, on) {
@@ -21167,9 +20864,72 @@ function toggleEchFields(context) {
     const fields = $m(`ech-${context}-fields`);
     if (toggle.classList.contains('on')) {
         fields.style.display = 'block';
+        renderEchPingResults(context);
     } else {
         fields.style.display = 'none';
     }
+}
+
+let echPingResults = {};
+try { echPingResults = JSON.parse(localStorage.getItem("sulgx_ech_ping_v1") || "{}") || {}; } catch (e) { echPingResults = {}; }
+function saveEchPingResults() { try { localStorage.setItem("sulgx_ech_ping_v1", JSON.stringify(echPingResults)); } catch (e) {} }
+function echPingLabel(result) {
+  if (!result) return t("echNotTested");
+  if (result.status === "ok" && typeof result.ms === "number") return result.ms + " ms" + (result.method ? " (" + result.method.toUpperCase() + ")" : "");
+  if (result.status === "timeout") return t("echTimeout");
+  if (result.status === "unreachable") return t("echUnreachable");
+  return t("Error");
+}
+function renderEchPingResults(context) {
+  const box = $m("ech-ping-results-" + context);
+  if (!box) return;
+  const selected = $m("ech-preset-" + context) ? $m("ech-preset-" + context).value : "";
+  const rows = Object.keys(ECH_PRESETS_JS).map(function (id) {
+    return { id: id, sni: ECH_PRESETS_JS[id].sni, result: echPingResults[id] || null };
+  });
+  rows.sort(function (a, b) {
+    const am = a.result && a.result.status === "ok" ? a.result.ms : null;
+    const bm = b.result && b.result.status === "ok" ? b.result.ms : null;
+    if (am === null && bm === null) return 0;
+    if (am === null) return 1;
+    if (bm === null) return -1;
+    return am - bm;
+  });
+  let html = "";
+  rows.forEach(function (row) {
+    const label = echPingLabel(row.result);
+    let color = "var(--text-3)";
+    if (row.result && row.result.status === "ok") color = "var(--success)";
+    if (row.result && row.result.status !== "ok") color = "var(--danger)";
+    const outline = row.id === selected ? "outline:2px solid var(--accent);outline-offset:1px;" : "";
+    html += `<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:6px 8px;margin-top:4px;border:1px solid var(--border);border-radius:8px;cursor:pointer;font-size:0.85rem;${outline}" onclick="applyEchPingChoice('${context}', '${row.id}')" title="${t("echUseEntry")}"><span>${row.sni}</span><span style="color:${color};font-weight:700;white-space:nowrap;">${label}</span></div>`;
+  });
+  box.innerHTML = html;
+}
+function applyEchPingChoice(context, id) {
+  const sel = $m("ech-preset-" + context);
+  if (!sel) return;
+  sel.value = id;
+  applyEchPreset(context);
+  renderEchPingResults(context);
+}
+async function testEchPing(context) {
+  const btn = $m("ech-ping-btn-" + context);
+  const box = $m("ech-ping-results-" + context);
+  if (btn) { btn.disabled = true; btn.textContent = t("testing"); }
+  if (box) box.innerHTML = '<div style="color:var(--text-3);font-size:0.85rem;">' + t("testing") + '</div>';
+  try {
+    const res = await fetch("/api/ech/ping", {method: "POST", headers: {"Content-Type": "application/json"}, credentials: "same-origin", body: JSON.stringify({})});
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    (data.results || []).forEach(function (r) { if (r && r.id) echPingResults[r.id] = r; });
+    saveEchPingResults();
+  } catch (e) {
+    if (box) box.innerHTML = '<div style="color:var(--danger);font-size:0.85rem;">' + t("echPingFailed") + '</div>';
+  }
+  renderEchPingResults("create");
+  renderEchPingResults("edit");
+  if (btn) { btn.disabled = false; btn.textContent = t("echPingTest"); }
 }
 
 function toggleFingerprintCustom(context) {
@@ -21413,11 +21173,15 @@ function updateSettingsStatus(settings){
 function updateSettingsStatusLabels(){
   document.querySelectorAll('#settings-status .status-card').forEach(card => {
     const key = card.id.replace('st-','');
-    let label = card.getAttribute('data-'+lang) || card.querySelector('span[data-'+lang+']')?.textContent || '';
+    const oldLabel = card.querySelector('span[data-en]');
+    const enText = oldLabel ? oldLabel.getAttribute('data-en') : '';
+    const faText = oldLabel ? oldLabel.getAttribute('data-fa') : '';
+    let label = card.getAttribute('data-'+lang) || (oldLabel && oldLabel.textContent) || '';
+    if(!label) label = lang === 'fa' ? faText : enText;
     const iconEl = card.querySelector('span:first-child');
     const iconHtml = iconEl ? iconEl.outerHTML : '';
     const ok = card.classList.contains('active');
-    card.innerHTML = iconHtml + '<span class="status"><span class="status-dot ' + (ok ? 'ok' : 'err') + '"></span><span>' + esc(label) + '</span></span>';
+    card.innerHTML = iconHtml + '<span class="status"><span class="status-dot ' + (ok ? 'ok' : 'err') + '"></span><span data-en="' + esc(enText) + '" data-fa="' + esc(faText) + '">' + esc(label) + '</span></span>';
   });
 }
 function setLang(l){
@@ -21805,6 +21569,7 @@ function inbOutCardHtml(c){
     +'<span style="margin-inline-start:auto;color:var(--text-3);font-size:0.85rem;">'+portLbl+': <span style="direction:ltr;display:inline-block;">'+esc(String(c.port||'—'))+'</span></span>'
     +'</div>';
   if(c.id==='webproxy'&&c.shared)h+='<div style="color:var(--text-3);font-size:0.85rem;margin-top:6px;">'+(lang==='fa'?'پورت 443 مشترک است — لینک جدا برای هر کاربر':'Port 443 is shared — each user has their own link')+'</div>';
+  if(c.id==='webproxy'&&c.tg_web_secret)h+='<div style="color:var(--text-3);font-size:0.85rem;margin-top:6px;direction:ltr;text-align:left;">'+(lang==='fa'?'رمز پایه WEB: ':'WEB base secret: ')+esc(c.tg_web_secret)+' ('+esc(c.tg_web_secret_source||'')+')</div>';
   if(!on)h+='<div style="color:var(--text-3);font-size:0.85rem;margin-top:6px;">'+esc(inbOutReasonText(c))+'</div>';
   return h+'</div>';
 }
@@ -21869,6 +21634,7 @@ async function loadTgProxyCard(){
     html += protoRow('SOCKS5', cardFor('socks5', 'socks', d.socks_port));
     html += protoRow('MTProto', cardFor('mtproto', 'mtproxy', d.mtproxy_port));
     html += protoRow('WEB', cardFor('webproxy', 'webproxy', webPort));
+    if(d.tg_web_secret) html += '<div style="color:var(--text-3);font-size:0.85rem;padding:2px 0 6px;direction:ltr;text-align:left;">'+(lang==='fa'?'رمز پایه WEB: ':'WEB base secret: ')+esc(d.tg_web_secret)+' ('+esc(d.tg_web_secret_source||'')+')</div>';
     if(d.webproxy_shared_443) html += '<div style="color:var(--text-3);font-size:0.85rem;padding:2px 0 6px;">'+(lang==='fa'?'پورت 443 مشترک است — لینک جدا برای هر کاربر':'Port 443 is shared — each user has their own link')+'</div>';
     html += protoRow('HTTP', cardFor('http-proxy', 'http', d.http_port));
     if(d.webproxy_link){ html += tgProxyLinkRow((lang==='fa'?'لینک وب‌پروکسی (پورت ':'WEB proxy link (port ') + esc(String(webPort)) + ')', d.webproxy_link); }
@@ -21902,8 +21668,6 @@ function switchPage(id,opts){
   }
   if (id === 'active-users') {
     loadActiveUsers();
-    loadBlockedUsers();
-    loadRestrictedUsers();
   }
   if (id === 'telegram') {
     loadTgProxyCard();
@@ -22118,12 +21882,6 @@ async function testInbound(uid, btn){
     if (btn) { btn.disabled = false; btn.innerHTML = prevBtnHtml; btn.title = t('testInboundTip'); }
   }
 }
-async function disconnectLink(uid){await authenticatedFetch('/api/links/'+uid+'/disconnect',{method:'POST'});toast(t('disconnected'));loadLinks();}
-async function disconnectFromEdit(){
-  const uid = $m('eu').value;
-  if (!uid) return;
-  await disconnectLink(uid);
-}
 async function cloneLinkFromEdit(){
   const uid = $m('eu').value;
   if (!uid) return;
@@ -22212,9 +21970,10 @@ function protoShort(p){
 }
 function fmtBps(b){ if(!b) return '0 B/s'; return b >= 1048576 ? (b/1048576).toFixed(2)+' MB/s' : b >= 1024 ? (b/1024).toFixed(1)+' KB/s' : b+' B/s'; }
 let _audOpen = {};
-function renderActiveUsers(sessions){
+function renderActiveUsers(sessions, sessionStats){
   const box = $m('active-users-cards');
   if(!box) return;
+  renderSessionStats(sessionStats);
   const sum = $m('active-users-summary');
   if(sum) sum.textContent = t('activeCount', {n: (sessions||[]).length});
   if(!sessions || !sessions.length){ box.innerHTML = '<div style="color:var(--text-2);">' + t('noActiveUsers') + '</div>'; return; }
@@ -22235,7 +21994,7 @@ function renderActiveUsers(sessions){
     + (ipRows || '')
     + '<div style="font-size:0.85rem;">' + t('quotaLeft') + ' ' + (s.quota_remaining === null || s.quota_remaining === undefined ? '∞' : '<span class="num">' + fmtB(s.quota_remaining) + '</span>') + ' · ' + t('sessionsOnLink') + ' ' + (s.session_count || s.link_sessions || 0) + '/' + (s.max_connections || '∞') + '</div>'
     + '<div style="display:flex;gap:8px;margin-top:8px;"><button class="btn btn-outline btn-sm" id="aud-btn-' + idx + '" onclick="toggleActiveUserDetails(' + idx + ', \'' + esc(s.conn_id) + '\')">' + t('detailsBtn') + '</button>'
-    + '<button class="btn btn-danger btn-sm" onclick="disconnectActiveUser(\'' + esc(s.conn_id) + '\')">' + t('disconnectBtn') + '</button></div>'
+    + '</div>'
     + '<div id="aud-' + idx + '" style="display:none;margin-top:8px;"><div style="font-size:0.85rem;font-weight:600;">' + t('destinationCol') + ' (' + dests.length + ')</div>' + (detRows || '<div style="font-size:0.85rem;color:var(--text-2);">—</div>') + '<div style="font-size:0.85rem;font-weight:600;margin-top:8px;">' + t('sessionsCol') + ' (' + sessRows.length + ')</div>' + (sesRows || '<div style="font-size:0.85rem;color:var(--text-2);">—</div>') + '</div>'
     + '</div>';
   }).join('');
@@ -22246,6 +22005,14 @@ function renderActiveUsers(sessions){
     const btn = $m('aud-btn-' + idx);
     if(btn) btn.textContent = t('hideDetailsBtn');
   });
+}
+function renderSessionStats(stats){
+  if(!stats) return;
+  const setNum = (id, v) => { const el = $m(id); if(el) el.textContent = String(v === undefined || v === null ? 0 : v); };
+  setNum('au-online', stats.online);
+  setNum('au-today', stats.today);
+  setNum('au-month', stats.month);
+  setNum('au-unique', stats.unique_ips);
 }
 function toggleActiveUserDetails(idx, connId){
   const el = $m('aud-' + idx);
@@ -22262,56 +22029,9 @@ async function loadActiveUsers(){
     if (box && !box.innerHTML.trim()) box.innerHTML = '<div style="color:var(--text-3);">' + t('loading') + '</div>';
     const r = await authenticatedFetch('/api/active-users');
     const d = await r.json();
-    renderActiveUsers(d.sessions || []);
-    loadBlockedUsers();
+    renderActiveUsers(d.sessions || [], d.session_stats || null);
     return true;
   }catch(e){ toast(t('Error'), true); return false; }
-}
-async function disconnectActiveUser(connId){
-  const isGroup = String(connId).indexOf('user:') === 0 || String(connId).indexOf('owner:') === 0 || String(connId).indexOf('ip:') === 0 || String(connId).indexOf('card:') === 0;
-  if(!(await confirmDialog(isGroup ? t('confirmDisconnectUser') : t('confirmDisconnectSession')))) return;
-  try{ const r = await authenticatedFetch('/api/active-users/' + encodeURIComponent(connId) + '/disconnect', {method:'POST'}); if(!r.ok) throw new Error('failed'); toast(t('disconnected')); loadActiveUsers(); loadBlockedUsers(); }catch(e){ toast(t('Error'), true); }
-}
-
-async function loadBlockedUsers(){
-  const box = $m('blocked-users-list');
-  if(!box) return;
-  try{
-    const r = await authenticatedFetch('/api/blocked-sessions');
-    const d = await r.json();
-    const rows = d.blocked || [];
-    if(!rows.length){ box.innerHTML = '<div style="color:var(--text-2);">' + t('noBlockedUsers') + '</div>'; return; }
-    box.innerHTML = rows.map(row => '<div style="display:flex;justify-content:space-between;gap:8px;align-items:center;font-size:0.85rem;padding:8px 0;border-top:1px solid var(--border);"><span><b>' + esc(row.label || row.uid || '') + '</b> · ' + esc(row.protocol || '') + '<br><span style="color:var(--text-2);">IP ' + esc(row.ip || '') + ' · ' + esc(row.created_at || '') + (row.reason ? ' · ' + esc(trDetail(row.reason || '')) : '') + '</span></span><button class="btn btn-outline btn-sm" onclick="unblockSession(\'' + esc(row.uid) + '\', \'' + esc(row.ip) + '\')">' + t('unblockBtn') + '</button></div>').join('');
-  }catch(e){ box.innerHTML = '<div style="color:var(--text-2);">' + t('Error') + '</div>'; }
-}
-async function unblockSession(uid, ip){
-  try{ const r = await authenticatedFetch('/api/blocked-sessions/' + encodeURIComponent(uid) + '/' + encodeURIComponent(ip), {method:'DELETE'}); if(!r.ok) throw new Error('failed'); toast(t('unblocked')); loadBlockedUsers(); loadActiveUsers(); }catch(e){ toast(t('Error'), true); }
-}
-async function loadRestrictedUsers(){
-  const box = $m('restricted-users-list');
-  if(!box) return;
-  try{
-    const r = await authenticatedFetch('/api/restricted-ips');
-    const d = await r.json();
-    const rows = d.restricted || [];
-    if(!rows.length){ box.innerHTML = '<div style="color:var(--text-2);">' + t('noRestrictedUsers') + '</div>'; return; }
-    box.innerHTML = rows.map(row => '<div style="display:flex;justify-content:space-between;gap:8px;align-items:center;font-size:0.85rem;padding:8px 0;border-top:1px solid var(--border);"><span><b>' + esc(row.entry || '') + '</b> · ' + esc(row.kind || '') + (row.note ? ' · ' + esc(row.note) : '') + '<br><span style="color:var(--text-2);">' + esc(row.created_at || '') + '</span></span><button class="btn btn-outline btn-sm" onclick="removeRestrictedUser(\'' + esc(row.entry) + '\')">' + t('unblockBtn') + '</button></div>').join('');
-  }catch(e){ box.innerHTML = '<div style="color:var(--text-2);">' + t('Error') + '</div>'; }
-}
-async function addRestrictedUser(){
-  const input = $m('restricted-entry');
-  const entry = input ? input.value.trim() : '';
-  if(!entry){ toast(t('invalidIpOrCidr'), true); return; }
-  try{
-    const r = await authenticatedFetch('/api/restricted-ips', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({entry: entry})});
-    if(!r.ok){ const d = await r.json().catch(() => ({})); throw new Error((d && d.detail) || 'failed'); }
-    toast(t('restrictedAdded'));
-    if(input) input.value = '';
-    loadRestrictedUsers();
-  }catch(e){ toast(trDetail(e.message) || t('Error'), true); }
-}
-async function removeRestrictedUser(entry){
-  try{ const r = await authenticatedFetch('/api/restricted-ips/' + encodeURIComponent(entry), {method:'DELETE'}); if(!r.ok) throw new Error('failed'); toast(t('restrictedRemoved')); loadRestrictedUsers(); }catch(e){ toast(t('Error'), true); }
 }
 function proxyInfoText(proto, info){
   const st = (info && info.proxy_status) || {};
@@ -22632,6 +22352,7 @@ async function showEditMo(uid) {
   $m('egaming-profile').value = l.gaming_profile || 'off';
   $m('eres-profile').value = l.profile === 'custom' ? '' : (l.profile || 'default');
   if ($m('ech-preset-edit')) $m('ech-preset-edit').value = l.ech_preset || 'custom';
+  renderEchPingResults('edit');
   if ($m('xray-blocked-domains')) $m('xray-blocked-domains').value = (l.xray_blocked_domains || '').replace(/,/g, '\n');
   $m('eowner-name').value = l.owner_name || '';
   $m('eowner-maxsess').value = l.owner_max_sessions || 0;
@@ -22993,7 +22714,7 @@ async function loadStats() {
     safeSetText('sv-requests', sData.total_requests);
     safeSetText('sv-uptime', sData.uptime);
     if (sData.disk_free_gb !== undefined && sData.disk_free_gb !== null && sData.disk_total_gb !== undefined && sData.disk_total_gb !== null) {
-      safeSetHTML('sv-disk', '<span class="stat-unit num">' + t('diskFreeOf', {free: sData.disk_free_gb, total: sData.disk_total_gb}) + '</span>');
+      safeSetHTML('sv-disk', sData.disk_free_gb + '<span class="stat-unit"> GB</span><span class="stat-sub">' + t('diskFreeOf', {total: sData.disk_total_gb}) + '</span>');
       const dv = $m('sv-disk');
       if (dv && sData.disk_path) dv.title = t('diskTitle', {path: sData.disk_path});
     } else {
@@ -23112,8 +22833,8 @@ function initSpeedChart(){
 }
 function updSpeedChart(up,down){
   if(!speedChart)return;
-  const t=getLocalTimeString();
-  speedHistory.push({t,up,down});
+  const ts=getLocalTimeString();
+  speedHistory.push({t:ts,up,down});
   if(speedHistory.length>60)speedHistory.shift();
   const maxVal = Math.max(...speedHistory.map(s=>Math.max(s.up,s.down)), 1);
   speedChart.options.scales.y.max = maxVal * 1.2;
@@ -23862,19 +23583,13 @@ async function saveScannerProfile() {
   } catch(e) { toast(t('Error'), true); }
 }
 
-const LOG_TYPES={Scanner:{en:'Scanner',fa:'اسکنر'},Tunnel:{en:'Tunnel',fa:'تونل'},Proxy:{en:'Proxy',fa:'پروکسی'},Login:{en:'Login',fa:'ورود'},Error:{en:'Error',fa:'خطا'},Event:{en:'Event',fa:'رویداد'},Auth:{en:'Auth',fa:'احراز هویت'},Warning:{en:'Warning',fa:'هشدار'},Security:{en:'Security',fa:'امنیت'},Settings:{en:'Settings',fa:'تنظیمات'},Admin:{en:'Admin',fa:'مدیر'},Inbound:{en:'Inbound',fa:'اینباند'},'Clean IP':{en:'Clean IP',fa:'آی‌پی تمیز'},Subscription:{en:'Subscription',fa:'اشتراک'},Blocked:{en:'Blocked',fa:'مسدودشده'},Restricted:{en:'Restricted',fa:'محدودشده'},Auto:{en:'Auto',fa:'خودکار'}};
+const LOG_TYPES={Scanner:{en:'Scanner',fa:'اسکنر'},Tunnel:{en:'Tunnel',fa:'تونل'},Proxy:{en:'Proxy',fa:'پروکسی'},Login:{en:'Login',fa:'ورود'},Error:{en:'Error',fa:'خطا'},Event:{en:'Event',fa:'رویداد'},Auth:{en:'Auth',fa:'احراز هویت'},Warning:{en:'Warning',fa:'هشدار'},Security:{en:'Security',fa:'امنیت'},Settings:{en:'Settings',fa:'تنظیمات'},Admin:{en:'Admin',fa:'مدیر'},Inbound:{en:'Inbound',fa:'اینباند'},'Clean IP':{en:'Clean IP',fa:'آی‌پی تمیز'},Subscription:{en:'Subscription',fa:'اشتراک'},Auto:{en:'Auto',fa:'خودکار'}};
 function logTypeLabel(ty){const e=LOG_TYPES[ty];if(e)return e[lang]||e.en;return ty||'Event';}
 function trLogMsg(m){
   if(!m || lang !== 'fa') return m;
   const s = String(m);
   const rules = [
-    [/^Session blocked for (\S+) from (\S+)$/, 'نشست برای $1 از $2 مسدود شد'],
-    [/^Session unblocked for (\S+) from (\S+)$/, 'رفع مسدودیت نشست برای $1 از $2'],
-    [/^Restricted source (.+)$/, 'منبع محدودشده $1'],
-    [/^Released restricted source (.+)$/, 'منبع محدودشده آزاد شد: $1'],
     [/^Expired inbound (.+) auto-disabled$/, 'اینباند منقضی‌شده $1 به‌طور خودکار غیرفعال شد'],
-    [/^Blocked WEB session for (\S+) from (\S+)$/, 'نشست WEB مسدودشده برای $1 از $2'],
-    [/^Restricted WEB session for (\S+) from (\S+)$/, 'نشست WEB محدودشده برای $1 از $2'],
     [/^Failed login attempt from (\S+)$/, 'تلاش ناموفق برای ورود از $1'],
     [/^Successful panel login from (\S+)$/, 'ورود موفق به پنل از $1'],
     [/^Failed to record login event for (\S+): (.*)$/, 'ثبت رویداد ورود برای $1 ناموفق بود: $2'],
@@ -23884,7 +23599,6 @@ function trLogMsg(m){
     [/^All logs cleared$/, 'همه گزارش‌ها پاک شدند'],
     [/^Created inbound (.+) \(([0-9a-f-]{36})\)$/, 'اینباند $1 ($2) ساخته شد'],
     [/^UUID regenerated for (.+): (\S+) -> (\S+)$/, 'UUID برای $1 تازه‌سازی شد: $2 -> $3'],
-    [/^Disconnected all connections for (\S+)$/, 'همه اتصالات برای $1 قطع شدند'],
     [/^Updated inbound (\S+)$/, 'اینباند $1 به‌روز شد'],
     [/^Deleted inbound (\S+)$/, 'اینباند $1 حذف شد'],
     [/^Cloned inbound (\S+) -> (\S+)$/, 'اینباند $1 کلون شد -> $2'],
@@ -24331,7 +24045,8 @@ function startSSE() {
         safeSetHTML('sv-traffic', data.total_traffic_mb + '<span class="stat-unit"> MB</span>');
         safeSetText('sv-uptime', data.uptime);
         markStatsUpdated(data.timestamp);
-        if(data.sessions && $m('page-active-users') && $m('page-active-users').classList.contains('active')) renderActiveUsers(data.sessions);
+        if(data.session_stats) renderSessionStats(data.session_stats);
+        if(data.sessions && $m('page-active-users') && $m('page-active-users').classList.contains('active')) renderActiveUsers(data.sessions, data.session_stats || null);
     };
     sseConnection.onerror = async function() {
         sseConnection.close();
@@ -24955,6 +24670,7 @@ def build_xray_config(link: dict, proxy_line: dict, request: Request, address: s
     fingerprint = link.get("fingerprint") or link.get("custom_fp") or "chrome"
     if not fingerprint or fingerprint.lower() == "none":
         fingerprint = "chrome"
+    fingerprint = ech_safe_fingerprint(link, fingerprint)
 
     allow_insecure = bool(link.get("allow_insecure", False))
     alpn = effective_alpn(link)
@@ -24981,9 +24697,10 @@ def build_xray_config(link: dict, proxy_line: dict, request: Request, address: s
     }
     if alpn:
         tls_settings["alpn"] = [a.strip() for a in str(alpn).split(",") if a.strip()]
-    _ech_on, _ech_sni, _ech_doh = resolve_ech_for_link(link)
-    if _ech_on and _ech_sni and _ech_doh:
-        tls_settings["echConfigList"] = _ech_sni + "+" + _ech_doh
+    _ech_value = ech_config_list_value(link)
+    if _ech_value:
+        tls_settings["echConfigList"] = _ech_value
+        tls_settings["minVersion"] = "1.3"
     stream_settings["tlsSettings"] = tls_settings
 
     _ipv6_on = bool(link.get("enable_ipv6", True))
@@ -25195,6 +24912,7 @@ async def xray_balancer_config(uid: str, request: Request):
     fingerprint = link.get("fingerprint") or link.get("custom_fp") or "chrome"
     if not fingerprint or fingerprint.lower() == "none":
         fingerprint = "chrome"
+    fingerprint = ech_safe_fingerprint(link, fingerprint)
     allow_insecure = bool(link.get("allow_insecure", False))
     alpn = effective_alpn(link)
     udp_enabled = bool(link.get("udp_enabled", True))
@@ -25225,9 +24943,10 @@ async def xray_balancer_config(uid: str, request: Request):
     }
     if alpn:
         tls_settings["alpn"] = [a.strip() for a in str(alpn).split(",") if a.strip()]
-    _ech_on, _ech_sni, _ech_doh = resolve_ech_for_link(link)
-    if _ech_on and _ech_sni and _ech_doh:
-        tls_settings["echConfigList"] = _ech_sni + "+" + _ech_doh
+    _ech_value = ech_config_list_value(link)
+    if _ech_value:
+        tls_settings["echConfigList"] = _ech_value
+        tls_settings["minVersion"] = "1.3"
     stream_settings["tlsSettings"] = tls_settings
 
     _ipv6_on = bool(link.get("enable_ipv6", True))
