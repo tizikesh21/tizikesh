@@ -64,6 +64,15 @@ fi
 if ! grep -q "^TG_WEB_SECRET=" "$ENV_FILE"; then
   printf '%s\n' "TG_WEB_SECRET='$(sulgx_derive_tg_web_secret "$SULGX_SECRET_KEY")'" >> "$ENV_FILE"
 fi
+SULGX_TG_WEB_CURRENT="$(sulgx_env_value TG_WEB_SECRET)"
+SULGX_TG_WEB_VALID="$(SULGX_TG_WEB_CHECK="$SULGX_TG_WEB_CURRENT" python3 -c "import os, re; print('yes' if re.fullmatch(r'(dd)?[0-9a-fA-F]{32}', os.environ.get('SULGX_TG_WEB_CHECK', '').strip()) else 'no')")"
+if [ "$SULGX_TG_WEB_VALID" != "yes" ]; then
+  SULGX_TG_WEB_DERIVED="$(sulgx_derive_tg_web_secret "$SULGX_SECRET_KEY")"
+  SULGX_TMP_ENV="$(mktemp)"
+  grep -v "^TG_WEB_SECRET=" "$ENV_FILE" > "$SULGX_TMP_ENV" || true
+  printf '%s\n' "TG_WEB_SECRET=$SULGX_TG_WEB_DERIVED" >> "$SULGX_TMP_ENV"
+  mv "$SULGX_TMP_ENV" "$ENV_FILE"
+fi
 if ! grep -q "^PORT=" "$ENV_FILE"; then
   printf '%s\n' "PORT=8000" >> "$ENV_FILE"
 fi
