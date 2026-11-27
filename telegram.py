@@ -40,12 +40,20 @@ _LOG = logging.getLogger("sulgx.telegram")
 
 TG_NETWORKS = [
     ipaddress.ip_network("91.108.4.0/22"),
+    ipaddress.ip_network("91.108.8.0/22"),
+    ipaddress.ip_network("91.108.12.0/22"),
+    ipaddress.ip_network("91.108.16.0/22"),
+    ipaddress.ip_network("91.108.20.0/22"),
     ipaddress.ip_network("91.108.56.0/22"),
     ipaddress.ip_network("149.154.160.0/20"),
-    ipaddress.ip_network("149.154.164.0/22"),
-    ipaddress.ip_network("149.154.168.0/22"),
-    ipaddress.ip_network("149.154.172.0/22"),
+    ipaddress.ip_network("185.76.151.0/24"),
+    ipaddress.ip_network("95.161.64.0/20"),
     ipaddress.ip_network("91.105.192.0/18"),
+    ipaddress.ip_network("2001:67c:4e8::/48"),
+    ipaddress.ip_network("2001:b28:f23c::/48"),
+    ipaddress.ip_network("2001:b28:f23d::/48"),
+    ipaddress.ip_network("2001:b28:f23f::/48"),
+    ipaddress.ip_network("2a0a:f280::/32"),
 ]
 
 TELEMT_VERSION = "3.5.17"
@@ -202,6 +210,24 @@ def is_telegram_ip(ip_str):
     return False
 
 
+def _telegram_targets(ips):
+    targets = []
+    for ip in ips or []:
+        if is_telegram_ip(ip):
+            targets.append(ip)
+    targets.sort(key=lambda item: ipaddress.ip_address(item).version)
+    return targets
+
+
+async def _connect_telegram(targets, port):
+    for target_ip in targets:
+        try:
+            return await asyncio.wait_for(asyncio.open_connection(target_ip, port), timeout=10)
+        except (OSError, asyncio.TimeoutError):
+            continue
+    return None, None
+
+
 async def _read_exact(reader, n, timeout=10.0):
     data = b""
     deadline = time.monotonic() + timeout
@@ -331,7 +357,7 @@ def _could_be_http_or_socks5(prefix):
 
 async def _peek_prefix(reader):
     prefix = b""
-    deadline = time.monotonic() + 1.0
+    deadline = time.monotonic() + 10.0
     while len(prefix) < 8:
         try:
             remaining = deadline - time.monotonic()
@@ -640,12 +666,18 @@ async def _handle_multi(reader, writer):
     if _looks_http(prefix):
         while b" " not in prefix and len(prefix) < 16:
             try:
-                chunk = await asyncio.wait_for(reader.read(16 - len(prefix)), timeout=1.0)
+                chunk = await asyncio.wait_for(reader.read(16 - len(prefix)), timeout=5.0)
             except (asyncio.TimeoutError, ConnectionError, OSError):
                 break
             if not chunk:
                 break
             prefix += bytes(chunk)
+        if b" " not in prefix:
+            try:
+                writer.close()
+            except OSError:
+                pass
+            return
         if prefix.split(b" ", 1)[0].upper() == b"CONNECT":
             await _handle_http_proxy(_PrefixedReader(reader, prefix), writer)
             return
@@ -724,7 +756,13 @@ async def _handle_socks5(reader, writer):
             dlen = (await _read_exact(reader, 1))[0]
             host = (await _read_exact(reader, dlen)).decode("utf-8", "ignore")
             loop = asyncio.get_running_loop()
-            infos = await loop.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+            try:
+                infos = await asyncio.wait_for(loop.getaddrinfo(host, None, proto=socket.IPPROTO_TCP), timeout=10.0)
+            except (OSError, asyncio.TimeoutError):
+                writer.write(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")
+                await writer.drain()
+                writer.close()
+                return
             ips = list({info[4][0] for info in infos})
         elif atyp == 0x04:
             addr_bytes = await _read_exact(reader, 16)
@@ -736,12 +774,8 @@ async def _handle_socks5(reader, writer):
             writer.close()
             return
         port = struct.unpack(">H", await _read_exact(reader, 2))[0]
-        target_ip = None
-        for ip in ips:
-            if is_telegram_ip(ip):
-                target_ip = ip
-                break
-        if target_ip is None:
+        targets = _telegram_targets(ips)
+        if not targets:
             writer.write(b"\x05\x02\x00\x01\x00\x00\x00\x00\x00\x00")
             await writer.drain()
             writer.close()
@@ -753,11 +787,8 @@ async def _handle_socks5(reader, writer):
                 await writer.drain()
                 writer.close()
                 return
-        try:
-            target_reader, target_writer = await asyncio.wait_for(
-                asyncio.open_connection(target_ip, port), timeout=10
-            )
-        except (OSError, asyncio.TimeoutError):
+        target_reader, target_writer = await _connect_telegram(targets, port)
+        if target_writer is None:
             writer.write(b"\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00")
             await writer.drain()
             writer.close()
@@ -926,28 +957,25 @@ async def _handle_http_proxy(reader, writer):
             await writer.drain()
             writer.close()
             return
+        if host.startswith("[") and host.endswith("]"):
+            host = host[1:-1]
         loop = asyncio.get_running_loop()
         try:
-            infos = await loop.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+            infos = await asyncio.wait_for(loop.getaddrinfo(host, None, proto=socket.IPPROTO_TCP), timeout=10.0)
             ips = list({info[4][0] for info in infos})
         except (OSError, asyncio.TimeoutError):
             writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             await writer.drain()
             writer.close()
             return
-        target_ip = None
-        for ip in ips:
-            if is_telegram_ip(ip):
-                target_ip = ip
-                break
-        if target_ip is None:
+        targets = _telegram_targets(ips)
+        if not targets:
             writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             await writer.drain()
             writer.close()
             return
-        try:
-            target_reader, target_writer = await asyncio.wait_for(asyncio.open_connection(target_ip, port), timeout=10)
-        except (OSError, asyncio.TimeoutError):
+        target_reader, target_writer = await _connect_telegram(targets, port)
+        if target_writer is None:
             writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             await writer.drain()
             writer.close()
@@ -1752,7 +1780,7 @@ async def _telemt_mtproto_wait_live(entry, username, timeout=10.0):
     while time.monotonic() < deadline:
         status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "GET", "/v1/users/" + _url_path_quote(username, safe=""))
         if status is None:
-            return True
+            return False
         if status == 404:
             return False
         if status == 200 and payload.get("ok"):
