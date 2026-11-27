@@ -38,6 +38,8 @@ ENV_FILE="$DATA_DIR/.sulgx-env"
 CRED_FILE="$DATA_DIR/initial-credentials.txt"
 export DB_PATH="${DB_PATH:-$DATA_DIR/panel.db}"
 
+export PYTHONPATH="/home/sulgx/.local/lib/python3.11/site-packages:${PYTHONPATH:-}"
+
 DB_DIR="$(dirname "$DB_PATH")"
 mkdir -p "$DB_DIR" 2>/dev/null || true
 
@@ -150,9 +152,9 @@ if [ "$(id -u)" = "0" ] && command -v gosu >/dev/null 2>&1 && id sulgx >/dev/nul
   if gosu sulgx "$@"; then
     exit 0
   else
-    echo "SulgX entrypoint: WARNING - gosu failed (missing SETUID capability or no-new-privileges). Falling back to running as uid=$(id -u)." >&2
+    echo "SulgX entrypoint: WARNING - gosu failed. Falling back to running as uid=$(id -u)." >&2
   fi
 fi
 
-echo "SulgX entrypoint: executing $* as uid=$(id -u)"
+echo "SulgX entrypoint: executing $* as uid=$(id -u) with PYTHONPATH=$PYTHONPATH"
 exec "$@"
