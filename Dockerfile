@@ -34,13 +34,13 @@ ENV HOME=/home/sulgx \
 RUN apt-get update && apt-get install -y --no-install-recommends \
         gosu ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
-RUN useradd -m sulgx && chown -R sulgx /app
+RUN useradd -m sulgx && chown -R sulgx:sulgx /app
 RUN mkdir -p /data && chown -R sulgx:sulgx /data
 COPY --from=builder /root/.local /home/sulgx/.local
 RUN chown -R sulgx:sulgx /home/sulgx/.local
 COPY --from=telemt /usr/local/bin/telemt /usr/local/bin/telemt
 COPY --from=telemt /usr/local/share/telemt/LICENSE /usr/local/share/telemt/LICENSE
-COPY --chown=sulgx . .
+COPY --chown=sulgx:sulgx . .
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 EXPOSE 8000
