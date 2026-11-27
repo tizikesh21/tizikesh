@@ -1,19 +1,39 @@
 #!/bin/bash
 set -eu
 
-export HOME=/home/sulgx
+echo "SulgX entrypoint starting: uid=$(id -u) gid=$(id -g) user=$(id -un 2>/dev/null || echo unknown) HOME=${HOME:-unset}"
 
-# --- Detect writable data dir with fallback ---
-DEFAULT_DATA_DIR="${SULGX_DATA_DIR:-/data}"
-DATA_DIR="$DEFAULT_DATA_DIR"
-mkdir -p "$DATA_DIR" 2>/dev/null || true
-
-if ! touch "$DATA_DIR/.write-test" 2>/dev/null; then
-  echo "SulgX entrypoint: $DEFAULT_DATA_DIR is not writable, falling back to $HOME/data"
-  DATA_DIR="$HOME/data"
-  mkdir -p "$DATA_DIR"
+# --- Find writable HOME ---
+if [ -z "${HOME:-}" ] || [ ! -d "${HOME:-}" ] || [ ! -w "${HOME:-}" ]; then
+  for candidate in "/tmp/sulgx-home-$(id -u)" "/tmp/sulgx-home" "/var/tmp/sulgx-home"; do
+    if mkdir -p "$candidate" 2>/dev/null && [ -w "$candidate" ]; then
+      export HOME="$candidate"
+      break
+    fi
+  done
 fi
-rm -f "$DATA_DIR/.write-test" 2>/dev/null || true
+
+if [ -z "${HOME:-}" ] || [ ! -w "${HOME:-}" ]; then
+  echo "SulgX entrypoint: ERROR - no writable HOME found" >&2
+  exit 1
+fi
+
+# --- Find writable DATA_DIR ---
+DATA_DIR=""
+for candidate in "${SULGX_DATA_DIR:-/data}" "$HOME/data" "/tmp/sulgx-data-$(id -u)" "/tmp/sulgx-data" "/var/tmp/sulgx-data"; do
+  if mkdir -p "$candidate" 2>/dev/null && touch "$candidate/.write-test" 2>/dev/null; then
+    rm -f "$candidate/.write-test" 2>/dev/null || true
+    DATA_DIR="$candidate"
+    break
+  fi
+done
+
+if [ -z "$DATA_DIR" ]; then
+  echo "SulgX entrypoint: ERROR - no writable data directory found" >&2
+  exit 1
+fi
+
+echo "SulgX entrypoint: HOME=$HOME DATA_DIR=$DATA_DIR"
 
 export SULGX_DATA_DIR="$DATA_DIR"
 ENV_FILE="$DATA_DIR/.sulgx-env"
@@ -23,12 +43,12 @@ export DB_PATH="${DB_PATH:-$DATA_DIR/panel.db}"
 DB_DIR="$(dirname "$DB_PATH")"
 mkdir -p "$DB_DIR" 2>/dev/null || true
 
-# Best-effort ownership fix; mounted volumes may not permit chown even for root.
+# Best-effort ownership fix (may fail in restricted environments)
 chown -R sulgx:sulgx "$DATA_DIR" 2>/dev/null || true
 
 if [ -f "$ENV_FILE" ]; then
   set -a
-  . "$ENV_FILE" || true
+  . "$ENV_FILE" 2>/dev/null || true
   set +a
 fi
 
@@ -128,4 +148,11 @@ if [ -z "${1:-}" ]; then
   set -- python main.py
 fi
 
-exec gosu sulgx "$@"
+# Only use gosu if we are root AND the sulgx user exists
+if [ "$(id -u)" = "0" ] && command -v gosu >/dev/null 2>&1 && id sulgx >/dev/null 2>&1; then
+  echo "SulgX entrypoint: exec gosu sulgx $*"
+  exec gosu sulgx "$@"
+else
+  echo "SulgX entrypoint: exec $* (as uid=$(id -u))"
+  exec "$@"
+fi
