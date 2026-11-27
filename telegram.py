@@ -172,6 +172,14 @@ def panel_forward():
     return _PANEL_FORWARD
 
 
+def configure_proxy_callbacks(auth_lookup, count_traffic, mtproxy_quota_ok, session_allowed=None):
+    global _AUTH_LOOKUP, _COUNT_TRAFFIC, _MTPROXY_QUOTA_OK, _SESSION_ALLOWED
+    _AUTH_LOOKUP = auth_lookup
+    _COUNT_TRAFFIC = count_traffic
+    _MTPROXY_QUOTA_OK = mtproxy_quota_ok
+    _SESSION_ALLOWED = session_allowed
+
+
 def _bind_error_text(port, exc):
     text = str(exc)
     try:
@@ -1851,7 +1859,7 @@ async def telemt_start_web(uid, token, secret_hex, host, max_sessions=8, max_str
     if not telemt_available():
         return {"enabled": False, "port": 0, "api_port": 0, "error": "telemt binary not found at " + _telemt_binary()}
     if not _valid_secret_hex(secret_hex):
-        return {"enabled": False, "port": 0, "api_port": 0, "error": "TG_WEB_SECRET for uid " + key + " is invalid: WEB secret must be 32 hex characters"}
+        return {"enabled": False, "port": 0, "api_port": 0, "error": "WEB secret for uid " + key + " is invalid: WEB secret must be 32 hex characters"}
     if not isinstance(token, str) or not _TELEMT_TOKEN_RE.match(token):
         return {"enabled": False, "port": 0, "api_port": 0, "error": "WEB token for uid " + key + " is invalid: base_path must use [A-Za-z0-9_-] segments"}
     if not _valid_web_host(host):
