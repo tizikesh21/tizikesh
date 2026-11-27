@@ -1077,11 +1077,10 @@ def validate_ech_config_url(url):
     return False
 
 
-RESTRICTION_PROFILES = ("default", "normal", "relative", "severe", "emergency", "custom")
+RESTRICTION_PROFILES = ("default", "relative", "severe", "emergency", "custom")
 LEGACY_SERVICE_PROFILES = ("youtube", "instagram", "twitter", "tiktok", "whatsapp", "telegram", "netflix", "spotify", "google")
 RESTRICTION_PROFILE_PARAMS = {
     "default": {"fragment_mode": "off", "fragment": "", "fragment_length": "100-200", "fragment_interval": "10-20", "fingerprint": "chrome", "alpn": "smart", "ech_enabled": 0, "ech_sni": "", "ech_doh": "", "ech_preset": "", "random_path": 0, "tfo": 0, "udp_enabled": 1, "enable_ipv6": 1, "xray_dns_mode": "direct"},
-    "normal": {"fragment_mode": "off", "fragment": "", "fragment_length": "100-200", "fragment_interval": "10-20", "fingerprint": "chrome", "alpn": "smart", "ech_enabled": 0, "ech_sni": "", "ech_doh": "", "ech_preset": "", "random_path": 0, "tfo": 0, "udp_enabled": 1, "enable_ipv6": 1, "xray_dns_mode": "direct"},
     "relative": {"fragment_mode": "tlshello", "fragment": "tlshello", "fragment_length": "100-200", "fragment_interval": "10-20", "fingerprint": "chrome", "alpn": "smart", "ech_enabled": 1, "ech_sni": "cloudflare.com", "ech_doh": "https://cloudflare-dns.com/dns-query", "ech_preset": "cloudflare", "random_path": 1, "tfo": 1, "udp_enabled": 1, "enable_ipv6": 1, "xray_dns_mode": "doh"},
     "severe": {"fragment_mode": "tlshello", "fragment": "tlshello", "fragment_length": "100-500", "fragment_interval": "5-10", "fingerprint": "chrome", "alpn": "smart", "ech_enabled": 1, "ech_sni": "cloudflare.com", "ech_doh": "https://cloudflare-dns.com/dns-query", "ech_preset": "cloudflare", "random_path": 1, "tfo": 1, "udp_enabled": 0, "enable_ipv6": 1, "xray_dns_mode": "doh"},
     "emergency": {"fragment_mode": "tlshello", "fragment": "tlshello", "fragment_length": "50-100", "fragment_interval": "1-5", "fingerprint": "chrome", "alpn": "smart", "ech_enabled": 1, "ech_sni": "cloudflare.com", "ech_doh": "https://cloudflare-dns.com/dns-query", "ech_preset": "cloudflare", "random_path": 1, "tfo": 1, "udp_enabled": 0, "enable_ipv6": 0, "xray_dns_mode": "fakedns"},
@@ -3557,7 +3556,10 @@ async def _listener_cards(public_port, request=None):
             except (TypeError, ValueError):
                 _shown_port = _pport
         if _on and _code == "local_only":
-            _why = "Listener is bound on port " + str(_shown_port) + " and the local handshake passes, but the public address is not reachable from outside on this host (single HTTPS port only, or the TCP port is closed)"
+            if _pid in ("socks5", "http-proxy"):
+                _why = "Listener is bound on port " + str(_shown_port) + " and the local relay test passes (MTProto ping/pong through the local listener), but the public address is not reachable from outside on this host (single HTTPS port only, or the TCP port is closed), so a remote Telegram client cannot use this port"
+            else:
+                _why = "Listener is bound on port " + str(_shown_port) + " and the local handshake passes, but the public address is not reachable from outside on this host (single HTTPS port only, or the TCP port is closed)"
         cards.append({"id": _pid, "name": _pname, "protocol": _pid, "port": str(_shown_port) if _shown_port else "—", "enabled": bool(_on), "reason": _why, "reason_code": _code})
     _web_on, _web_code = usable.get("webproxy", (_proxy_listener_enabled("webproxy"), "running_panel" if _proxy_listener_enabled("webproxy") else "not_configured"))
     cards.append({"id": "webproxy", "name": "WEB proxy", "protocol": "webproxy", "port": str(WEBPROXY_PUBLIC_PORT), "enabled": bool(_web_on), "reason": "" if _web_on else _proxy_disabled_reason("webproxy"), "reason_code": "running_panel" if _web_on else _web_code, "shared": _webproxy_shared_443(), "tg_web_secret": _WEB_BASE_SECRET_HEX or "", "tg_web_secret_source": _WEB_BASE_SECRET_SOURCE or ""})
@@ -4006,11 +4008,10 @@ async def _telemt_mtproto_sync_once():
         except Exception:
             stats = None
         if not isinstance(stats, dict) or not stats:
-            if uid in _TELEMT_PROVISIONED.get("mtproto", set()):
-                try:
-                    await _telemt_provision_mtproto(link)
-                except Exception:
-                    pass
+            try:
+                await _telemt_provision_mtproto(link)
+            except Exception:
+                pass
             continue
         try:
             total = int(stats.get("total_octets") or 0)
@@ -4739,6 +4740,7 @@ def _normalize_link_dict(link_dict):
 
 async def load_initial_data():
     global DEFAULT_PATH, DOH_ENABLED, DEFAULT_XHTTP_PATH, DEFAULT_INBOUND_UID
+    await db_execute("UPDATE links SET profile = 'default' WHERE profile = 'normal'", "UPDATE links SET profile = 'default' WHERE profile = 'normal'")
     rows = await db_fetchall("SELECT * FROM links", "SELECT * FROM links")
     async with LINKS_LOCK:
         for r in rows:
@@ -8593,6 +8595,8 @@ async def create_link(request: Request, _=Depends(require_auth)):
     xray_allowed_domains = body.get("xray_allowed_domains", "")
     xray_blocked_domains = ",".join(parse_domain_list(body.get("xray_blocked_domains", "")))
     profile = str(body.get("profile", "default") or "default").strip()
+    if profile == "normal":
+        profile = "default"
     if profile not in RESTRICTION_PROFILES:
         raise HTTPException(status_code=400, detail="Invalid profile")
     ech_preset = str(body.get("ech_preset", "") or "").strip()
@@ -9913,6 +9917,8 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
         body["ss_method"] = _norm_ss
     if "vmess_security" in body and str(body["vmess_security"]).strip() not in VMESS_SECURITY_METHODS:
         raise HTTPException(status_code=400, detail="Invalid vmess_security")
+    if "profile" in body and body["profile"] == "normal":
+        body["profile"] = "default"
     if "profile" in body and body["profile"] not in RESTRICTION_PROFILES:
         raise HTTPException(status_code=400, detail="Invalid profile")
     if "ech_preset" in body and body["ech_preset"] not in ECH_PRESET_IDS and body["ech_preset"] != "custom" and body["ech_preset"] != "":
@@ -12824,6 +12830,42 @@ async def _test_raw_tcp_public_first(handshake, domain, raw_port, uid):
     return False, "fail", "Public address " + public_target + " is not reachable (" + probe_reason + " in " + str(probe_ms) + " ms); local listener handshake failed: " + local_detail + ". " + _PAAS_TCP_NOTE, local_target + " (local listener)"
 
 
+def _mtproto_ping_packet():
+    msg_id = (int(time.time()) << 32) | (int.from_bytes(os.urandom(4), "little") & 0xFFFFFFFC)
+    payload = struct.pack("<I", 0x7ABE77EC) + os.urandom(8)
+    body = struct.pack("<Q", 0) + struct.pack("<Q", msg_id) + struct.pack("<I", len(payload)) + payload
+    length = 4 + 4 + len(body) + 4
+    head = struct.pack("<I", length) + struct.pack("<I", 0)
+    crc = zlib.crc32(head + body) & 0xFFFFFFFF
+    return head + body + struct.pack("<I", crc), msg_id
+
+
+async def _mtproto_ping_exchange(reader, writer, timeout=5):
+    packet, msg_id = _mtproto_ping_packet()
+    try:
+        writer.write(packet)
+        await writer.drain()
+        head = await asyncio.wait_for(reader.readexactly(4), timeout=timeout)
+    except (asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError, OSError):
+        return False, "no reply from the Telegram DC to the MTProto ping within " + str(timeout) + "s, the relay stalls after CONNECT"
+    length = struct.unpack("<I", head)[0]
+    if length < 52 or length > 65536:
+        return False, "the Telegram DC sent an invalid MTProto reply length " + str(length)
+    try:
+        rest = await asyncio.wait_for(reader.readexactly(length - 4), timeout=timeout)
+    except (asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError, OSError):
+        return False, "the Telegram DC reply was cut off after " + str(length) + " bytes"
+    reply = head + rest
+    crc = struct.unpack("<I", reply[-4:])[0]
+    if zlib.crc32(reply[:-4]) & 0xFFFFFFFF != crc:
+        return False, "the Telegram DC reply failed the MTProto CRC check"
+    if reply[28:32] != struct.pack("<I", 0x347773C5):
+        return False, "the Telegram DC reply was not an MTProto pong"
+    if struct.unpack("<Q", reply[32:40])[0] != msg_id:
+        return False, "the Telegram DC pong did not match the ping"
+    return True, "the Telegram DC answered the MTProto ping with a pong"
+
+
 async def _test_socks5_handshake(host, port, uid, timeout=5):
     reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
     try:
@@ -12841,10 +12883,23 @@ async def _test_socks5_handshake(host, port, uid, timeout=5):
             return False, "SOCKS5 auth rejected: " + resp.hex()
         writer.write(b"\x05\x01\x00\x01\x95\x9a\xaf\x32" + struct.pack(">H", 443))
         await writer.drain()
-        resp = await asyncio.wait_for(reader.readexactly(10), timeout=10)
-        if resp[1] == 0x00:
-            return True, "SOCKS5 handshake accepted, CONNECT to Telegram DC 149.154.175.50:443 succeeded"
-        return False, "SOCKS5 CONNECT refused, reply " + str(resp[1])
+        head = await asyncio.wait_for(reader.readexactly(4), timeout=10)
+        if head[1] != 0x00:
+            return False, "SOCKS5 CONNECT refused, reply " + str(head[1])
+        atyp = head[3]
+        if atyp == 0x01:
+            await asyncio.wait_for(reader.readexactly(6), timeout=timeout)
+        elif atyp == 0x03:
+            dlen = (await asyncio.wait_for(reader.readexactly(1), timeout=timeout))[0]
+            await asyncio.wait_for(reader.readexactly(dlen + 2), timeout=timeout)
+        elif atyp == 0x04:
+            await asyncio.wait_for(reader.readexactly(18), timeout=timeout)
+        else:
+            return False, "SOCKS5 CONNECT reply had unknown address type " + str(atyp)
+        ok, detail = await _mtproto_ping_exchange(reader, writer)
+        if ok:
+            return True, "SOCKS5 relay proven: CONNECT to Telegram DC 149.154.175.50:443 succeeded and " + detail
+        return False, "SOCKS5 CONNECT to Telegram DC 149.154.175.50:443 succeeded but the relay failed: " + detail
     finally:
         writer.close()
 
@@ -12858,11 +12913,85 @@ async def _test_http_proxy_handshake(host, port, uid, timeout=5):
         writer.write(req.encode())
         await writer.drain()
         head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=10)
-        if head.startswith(b"HTTP/1.1 200"):
-            return True, "HTTP proxy CONNECT to Telegram DC 149.154.175.50:443 succeeded"
-        return False, "HTTP proxy CONNECT failed: " + head.decode("iso-8859-1", "ignore").split("\r\n")[0]
+        if not head.startswith(b"HTTP/1.1 200"):
+            return False, "HTTP proxy CONNECT failed: " + head.decode("iso-8859-1", "ignore").split("\r\n")[0]
+        ok, detail = await _mtproto_ping_exchange(reader, writer)
+        if ok:
+            return True, "HTTP proxy relay proven: CONNECT to Telegram DC 149.154.175.50:443 succeeded and " + detail
+        return False, "HTTP proxy CONNECT to Telegram DC 149.154.175.50:443 succeeded but the relay failed: " + detail
     finally:
         writer.close()
+
+
+def _mtproto_check_respq_intermediate(dc_buf):
+    if len(dc_buf) < 4:
+        return None
+    pkt_len = struct.unpack("<I", bytes(dc_buf[:4]))[0]
+    if pkt_len < 28 or pkt_len > 4096:
+        return False
+    if len(dc_buf) < pkt_len:
+        return None
+    if bytes(dc_buf[4:12]) != b"\x00" * 8:
+        return False
+    if bytes(dc_buf[24:28]) == struct.pack("<i", 0x05162463):
+        return True
+    return False
+
+
+def _mtproto_build_reqpq_packet(cipher, framing):
+    nonce = os.urandom(16)
+    msg_id = (int(time.time()) << 32) | (int.from_bytes(os.urandom(4), "big") & 0xFFFFFFFC)
+    req_body = struct.pack("<i", 0x60469778) + nonce
+    req_msg = struct.pack("<q", 0) + struct.pack("<q", msg_id) + struct.pack("<i", len(req_body)) + req_body
+    if framing == "abridged":
+        req_total = 1 + len(req_msg)
+        req_pad = (-req_total) % 4
+        packet = bytes([(req_total + req_pad) // 4]) + req_msg + b"\x00" * req_pad
+    else:
+        req_total = 4 + len(req_msg)
+        req_pad = (-req_total) % 4
+        packet = struct.pack("<I", req_total + req_pad) + req_msg + b"\x00" * req_pad
+    return cipher.update(packet)
+
+
+async def _mtproto_wait_respq(read_chunk, decryptor, framing, timeout=8.0):
+    plain_buf = bytearray()
+    got_data = False
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            chunk = await asyncio.wait_for(read_chunk(), timeout=max(0.1, deadline - time.time()))
+        except asyncio.TimeoutError:
+            break
+        if not chunk:
+            if got_data:
+                return False, "MTProto handshake accepted but the DC connection closed after DC data arrived (DC stage failure, no traffic flows through the DC)"
+            return False, "MTProto handshake rejected: the connection closed before any DC data arrived"
+        got_data = True
+        plain_buf += decryptor.update(bytes(chunk))
+        if framing == "abridged":
+            checked = _webproxy_check_respq(bytes(plain_buf))
+        else:
+            checked = _mtproto_check_respq_intermediate(bytes(plain_buf))
+        if checked is True:
+            return True, "MTProto real session: handshake accepted, auth request sent to Telegram DC1 and the DC answered (resPQ) — traffic flows"
+        if checked is False:
+            return False, "Telegram DC reply was not a valid MTProto response (handshake works, but the DC leg carries no real traffic)"
+    if got_data:
+        return False, "Telegram DC gave no valid MTProto answer to the auth request within " + str(int(timeout)) + "s (handshake works, but no traffic flows through the DC)"
+    return False, "Telegram DC gave no answer to the auth request within " + str(int(timeout)) + "s (handshake works, but no traffic flows through the DC)"
+
+
+async def _mtproto_failure_hint(uid, closed_early):
+    try:
+        stats = await _tg_call("telemt_mtproto_user_stats", uid)
+    except Exception:
+        return ""
+    if isinstance(stats, dict) and not stats:
+        return ". telemt reports no such MTProto user, so the inbound secret is not live in the telemt child; the panel re-provisions missing users automatically, retry the test in a few seconds"
+    if closed_early and isinstance(stats, dict) and stats:
+        return ". the MTProto user is live in telemt, so the connection was closed on the DC leg (the DC is unreachable from this host or resets the connection)"
+    return ""
 
 
 async def _test_mtproto_plain(host, port, uid, tag, timeout=5):
@@ -12872,21 +13001,25 @@ async def _test_mtproto_plain(host, port, uid, tag, timeout=5):
         init[0] = os.urandom(1)[0]
     init[56:60] = tag
     init[60:62] = struct.pack("<h", 1)
-    enc_key, enc_iv, _dk, _di = _mtproto_obfs_keys(bytes(init), secret)
+    enc_key, enc_iv, dec_key, dec_iv = _mtproto_obfs_keys(bytes(init), secret)
     cipher = _mtproto_aes_ctr(enc_key, enc_iv)
     encrypted = cipher.update(bytes(init))
     sent = bytes(init[:56]) + encrypted[56:64]
+    framing = "intermediate" if bytes(tag) == b"\xdd\xdd\xdd\xdd" else "abridged"
+    packet = _mtproto_build_reqpq_packet(cipher, framing)
     reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
     try:
-        writer.write(sent)
+        writer.write(sent + packet)
         await writer.drain()
-        try:
-            data = await asyncio.wait_for(reader.read(1), timeout=2.0)
-            if data:
-                return True, "MTProto handshake accepted, server replied"
-            return False, "MTProto listener closed the handshake"
-        except asyncio.TimeoutError:
-            return True, "MTProto handshake accepted, connection held open waiting for DC"
+        decryptor = _mtproto_aes_ctr(dec_key, dec_iv)
+
+        async def _read_plain():
+            return await reader.read(65536)
+
+        ok, detail = await _mtproto_wait_respq(_read_plain, decryptor, framing, timeout=8.0)
+        if not ok:
+            detail += await _mtproto_failure_hint(uid, "closed before any DC data" in detail)
+        return ok, detail
     finally:
         writer.close()
 
@@ -12920,9 +13053,16 @@ async def _test_mtproto_faketls(host, port, uid, timeout=5, domain="www.google.c
     try:
         writer.write(bytes(hello))
         await writer.drain()
-        rec = await asyncio.wait_for(reader.readexactly(5), timeout=timeout)
+        try:
+            rec = await asyncio.wait_for(reader.readexactly(5), timeout=timeout)
+        except (asyncio.TimeoutError, asyncio.IncompleteReadError):
+            detail = "MTProto fake-TLS server did not answer the ClientHello within " + str(int(timeout)) + "s (no matching MTProto user for this secret in telemt, or the front door refused the handshake)"
+            detail += await _mtproto_failure_hint(uid, False)
+            return False, detail
         if rec[0] != 0x16:
-            return False, "MTProto fake-TLS server did not answer with a ServerHello"
+            detail = "MTProto fake-TLS server did not answer with a ServerHello"
+            detail += await _mtproto_failure_hint(uid, False)
+            return False, detail
         ln = struct.unpack(">H", rec[3:5])[0]
         await asyncio.wait_for(reader.readexactly(ln), timeout=timeout)
         rec = await asyncio.wait_for(reader.readexactly(5), timeout=timeout)
@@ -12940,24 +13080,48 @@ async def _test_mtproto_faketls(host, port, uid, timeout=5, domain="www.google.c
             init[0] = os.urandom(1)[0]
         init[56:60] = b"\xee\xee\xee\xee"
         init[60:62] = struct.pack("<h", 1)
-        enc_key, enc_iv, _dk, _di = _mtproto_obfs_keys(bytes(init), secret)
+        enc_key, enc_iv, dec_key, dec_iv = _mtproto_obfs_keys(bytes(init), secret)
         cipher = _mtproto_aes_ctr(enc_key, enc_iv)
         encrypted = cipher.update(bytes(init))
         sent = bytes(init[:56]) + encrypted[56:64]
+        packet = _mtproto_build_reqpq_packet(cipher, "intermediate")
         writer.write(b"\x17\x03\x03" + struct.pack(">H", len(sent)) + sent)
+        writer.write(b"\x17\x03\x03" + struct.pack(">H", len(packet)) + packet)
         await writer.drain()
-        try:
-            data = await asyncio.wait_for(reader.read(1), timeout=2.0)
-            if data:
-                return True, "MTProto fake-TLS handshake accepted, server replied"
-            return False, "MTProto fake-TLS handshake accepted but the DC connection closed"
-        except asyncio.TimeoutError:
-            return True, "MTProto fake-TLS handshake accepted, connection held open waiting for DC"
+        decryptor = _mtproto_aes_ctr(dec_key, dec_iv)
+        record_buf = bytearray()
+
+        async def _read_faketls_app():
+            nonlocal record_buf
+            while True:
+                while len(record_buf) >= 5:
+                    ln = struct.unpack(">H", bytes(record_buf[3:5]))[0]
+                    if len(record_buf) < 5 + ln:
+                        break
+                    rec_type = record_buf[0]
+                    payload = bytes(record_buf[5:5 + ln])
+                    del record_buf[:5 + ln]
+                    if rec_type == 0x17:
+                        return payload
+                chunk = await reader.read(65536)
+                if not chunk:
+                    return b""
+                record_buf += chunk
+
+        ok, detail = await _mtproto_wait_respq(_read_faketls_app, decryptor, "intermediate", timeout=8.0)
+        if not ok:
+            detail += await _mtproto_failure_hint(uid, "closed before any DC data" in detail)
+        return ok, detail
     finally:
         writer.close()
 
 
 WEBPROXY_HANDSHAKE = bytes([0x10, 0, 0, 0, 0, 0, 0, 1, 1])
+WEBPROXY_CARRIER_CAPABILITIES = "https,https-lanes,websocket,websocket-lanes"
+WEBPROXY_TEST_WINDOW_TIMEOUT = 15.0
+WEBPROXY_TEST_DC_TIMEOUT = 20.0
+WEBPROXY_TEST_LANE_DEADLINE = 60.0
+WEBPROXY_TEST_DCS = (1, 2)
 
 
 def _mtproto_obfs_keys(init, secret):
@@ -12980,8 +13144,8 @@ def _webproxy_aes_ctr_at(key, iv, position, data):
     iv_int = int.from_bytes(bytes(iv), "big") + block
     new_iv = iv_int.to_bytes(16, "big")
     cipher = Cipher(AES(bytes(key)), CTR(new_iv)).encryptor()
-    out = cipher.update(bytes(data))
-    return out[skip:] if skip else out
+    out = cipher.update(b"\x00" * skip + bytes(data))
+    return out[skip:]
 
 
 def _webproxy_build_client_obfs_header(secret, dc=1):
@@ -13055,81 +13219,98 @@ def _webproxy_check_respq(dc_buf):
     return False
 
 
-async def _test_webproxy_lane_ws(ws_url, session_token, header, parsed, dc_timeout, port, token):
-    lane_id = 1
+def _webproxy_lane_new_state(lane_id, dc, write_key, write_iv):
+    return {"lane_id": lane_id, "dc": dc, "write_key": write_key, "write_iv": write_iv, "dc_pos": 0, "dc_buf": bytearray(), "window_ok": False, "got_data": False, "passed": False, "fail": ""}
+
+
+def _webproxy_lane_consume(state, frames):
+    for frame_type, stream_id, payload in frames:
+        if stream_id != state["lane_id"]:
+            continue
+        if frame_type == 2 and payload:
+            state["got_data"] = True
+            if _webproxy_lane_intercept_hint(payload):
+                state["fail"] = "WEB proxy lane to Telegram DC" + str(state["dc"]) + " received a plaintext non-Telegram response instead of MTProto data: outbound TCP to Telegram DCs is intercepted on this host (host-egress failure), the proxy itself is configured correctly"
+                return
+            plain = _webproxy_aes_ctr_at(state["write_key"], state["write_iv"], state["dc_pos"], payload)
+            state["dc_pos"] += len(payload)
+            state["dc_buf"] += plain
+            checked = _webproxy_check_respq(state["dc_buf"])
+            if checked is True:
+                state["passed"] = True
+                return
+            if checked is False:
+                state["fail"] = "Telegram DC" + str(state["dc"]) + " reply was not a valid MTProto response (bridge and session work, but the DC leg carries no real traffic)"
+                return
+        elif frame_type == 4:
+            state["window_ok"] = True
+        elif frame_type == 3:
+            if state["got_data"]:
+                state["fail"] = "WEB proxy lane to Telegram DC" + str(state["dc"]) + " was closed by the server after DC data arrived (DC stage failure, no traffic flows through the DC)"
+            else:
+                state["fail"] = "WEB proxy lane to Telegram DC" + str(state["dc"]) + " was closed by the server before any DC data arrived: the inner MTProto handshake was rejected by telemt (no matching user for this WEB secret)"
+            return
+
+
+def _webproxy_lane_pass_detail(port, token, lane_id, dc, carrier):
+    return "WEB proxy real session: capability verified for port " + str(port) + (" token " + token if token else "") + ", session issued (carrier " + carrier + "), lane " + str(lane_id) + " opened to Telegram DC" + str(dc) + " and the DC answered the auth handshake (resPQ) — traffic flows"
+
+
+def _webproxy_lane_auth_request(parsed):
+    nonce = os.urandom(16)
+    msg_id = (int(time.time()) << 32) | (int.from_bytes(os.urandom(4), "big") & 0xFFFFFFFC)
+    req_body = struct.pack("<i", 0x60469778) + nonce
+    req_msg = struct.pack("<q", 0) + struct.pack("<q", msg_id) + struct.pack("<i", len(req_body)) + req_body
+    req_total = 1 + len(req_msg)
+    req_pad = (-req_total) % 4
+    req_packet = bytes([(req_total + req_pad) // 4]) + req_msg + b"\x00" * req_pad
+    return _webproxy_aes_ctr_at(parsed["read_key"], parsed["read_iv"], 64, req_packet)
+
+
+async def _test_webproxy_lane_ws(ws_url, session_token, header, parsed, dc_timeout, port, token, dc=1, carrier="", negotiated=False, lane_id=1, window_timeout=WEBPROXY_TEST_WINDOW_TIMEOUT):
+    if carrier.startswith("websocket-lanes"):
+        subprotocol = ("tproxy-auto-lane-v1." if negotiated else "tproxy-lane-v1.") + session_token + "." + str(lane_id)
+    else:
+        subprotocol = ("tproxy-auto-v1." if negotiated else "tproxy-v1.") + session_token
+    state = _webproxy_lane_new_state(lane_id, dc, parsed["write_key"], parsed["write_iv"])
     ws = None
     try:
-        ws = await websockets.connect(ws_url, subprotocols=["tproxy-v1." + session_token], open_timeout=10, close_timeout=2, max_size=1024 * 1024)
+        ws = await websockets.connect(ws_url, subprotocols=[subprotocol], open_timeout=15, close_timeout=2, max_size=1024 * 1024)
         await ws.send(_webproxy_test_frame(1, lane_id, b"") + _webproxy_test_frame(2, lane_id, header))
-        deadline = time.time() + 10.0
-        window_ok = False
-        got_data = False
-        while time.time() < deadline and not window_ok:
+        window_deadline = time.time() + window_timeout
+        while time.time() < window_deadline and not state["window_ok"] and not state["fail"] and not state["passed"]:
             try:
-                message = await asyncio.wait_for(ws.recv(), timeout=max(0.1, deadline - time.time()))
+                message = await asyncio.wait_for(ws.recv(), timeout=max(0.1, window_deadline - time.time()))
             except asyncio.TimeoutError:
                 break
             if isinstance(message, str):
                 continue
-            for frame_type, stream_id, _payload in _webproxy_test_split_frames(bytes(message)):
-                if stream_id != lane_id:
-                    continue
-                if frame_type == 2 and _payload:
-                    got_data = True
-                    if _webproxy_lane_intercept_hint(_payload):
-                        return False, "fail", "WEB proxy lane to Telegram DC1 received a plaintext non-Telegram response instead of MTProto data: outbound TCP to Telegram DCs is intercepted on this host (host-egress failure), the proxy itself is configured correctly"
-                if frame_type == 4:
-                    window_ok = True
-                if frame_type == 3:
-                    if got_data:
-                        return False, "fail", "WEB proxy lane to Telegram DC1 was closed by the server after DC data arrived (DC stage failure, no traffic flows through the DC)"
-                    return False, "fail", "WEB proxy lane to Telegram DC1 was closed by the server before any DC data arrived: the inner MTProto handshake was rejected by telemt (no matching user for this WEB secret)"
-        if not window_ok:
-            return False, "fail", "WEB proxy lane to Telegram DC1 got no answer within 10s"
-        nonce = os.urandom(16)
-        msg_id = (int(time.time()) << 32) | (int.from_bytes(os.urandom(4), "big") & 0xFFFFFFFC)
-        req_body = struct.pack("<i", 0x60469778) + nonce
-        req_msg = struct.pack("<q", 0) + struct.pack("<q", msg_id) + struct.pack("<i", len(req_body)) + req_body
-        req_total = 1 + len(req_msg)
-        req_pad = (-req_total) % 4
-        req_packet = bytes([(req_total + req_pad) // 4]) + req_msg + b"\x00" * req_pad
-        req_cipher = _webproxy_aes_ctr_at(parsed["read_key"], parsed["read_iv"], 64, req_packet)
-        await ws.send(_webproxy_test_frame(2, lane_id, req_cipher))
-        dc_buf = bytearray()
-        dc_pos = 0
+            _webproxy_lane_consume(state, _webproxy_test_split_frames(bytes(message)))
+        if state["fail"]:
+            return False, "fail", state["fail"], state["got_data"], False
+        if state["passed"]:
+            return True, "pass", _webproxy_lane_pass_detail(port, token, lane_id, dc, carrier), True, False
+        if not state["window_ok"]:
+            return False, "fail", "WEB proxy lane to Telegram DC" + str(dc) + " got no answer within " + str(int(window_timeout)) + "s", state["got_data"], not state["got_data"]
+        await ws.send(_webproxy_test_frame(2, lane_id, _webproxy_lane_auth_request(parsed)))
         dc_deadline = time.time() + dc_timeout
-        while time.time() < dc_deadline:
+        while time.time() < dc_deadline and not state["passed"] and not state["fail"]:
             try:
                 message = await asyncio.wait_for(ws.recv(), timeout=max(0.1, dc_deadline - time.time()))
             except asyncio.TimeoutError:
                 break
             if isinstance(message, str):
                 continue
-            for frame_type, stream_id, payload in _webproxy_test_split_frames(bytes(message)):
-                if stream_id != lane_id:
-                    continue
-                if frame_type == 3:
-                    if got_data:
-                        return False, "fail", "Telegram DC1 closed the lane after the auth request (no traffic flows through the DC)"
-                    return False, "fail", "Telegram DC1 closed the lane after the auth request before any DC data arrived: the inner MTProto handshake was rejected by telemt (no matching user for this WEB secret)"
-                if frame_type != 2 or not payload:
-                    continue
-                if _webproxy_lane_intercept_hint(payload):
-                    return False, "fail", "WEB proxy lane to Telegram DC1 received a plaintext non-Telegram response instead of MTProto data: outbound TCP to Telegram DCs is intercepted on this host (host-egress failure), the proxy itself is configured correctly"
-                got_data = True
-                plain = _webproxy_aes_ctr_at(parsed["write_key"], parsed["write_iv"], dc_pos, payload)
-                dc_pos += len(payload)
-                dc_buf += plain
-                checked = _webproxy_check_respq(dc_buf)
-                if checked is True:
-                    return True, "pass", "WEB proxy real session: capability verified for port " + str(port) + (" token " + token if token else "") + ", session issued, lane 1 opened to Telegram DC1 and the DC answered the auth handshake (resPQ) — traffic flows"
-                if checked is False:
-                    return False, "fail", "Telegram DC1 reply was not a valid MTProto response (bridge and session work, but the DC leg carries no real traffic)"
-        return False, "fail", "Telegram DC1 gave no valid MTProto answer to the auth request within " + str(int(dc_timeout)) + "s (bridge and session work, but no traffic flows through the DC)"
+            _webproxy_lane_consume(state, _webproxy_test_split_frames(bytes(message)))
+        if state["passed"]:
+            return True, "pass", _webproxy_lane_pass_detail(port, token, lane_id, dc, carrier), True, False
+        if state["fail"]:
+            return False, "fail", state["fail"], state["got_data"], False
+        return False, "fail", "Telegram DC" + str(dc) + " gave no valid MTProto answer to the auth request within " + str(int(dc_timeout)) + "s (bridge and session work, but no traffic flows through the DC)", state["got_data"], not state["got_data"]
     except websockets.exceptions.ConnectionClosed as exc:
-        return False, "fail", "WEB proxy websocket closed during the lane handshake (code " + str(exc.code) + ")"
+        return False, "fail", "WEB proxy websocket closed during the lane handshake (code " + str(exc.code) + ")", state["got_data"], False
     except Exception as exc:
-        return False, "fail", "WEB proxy lane handshake failed: " + str(exc)
+        return False, "fail", "WEB proxy lane handshake failed: " + str(exc), state["got_data"], False
     finally:
         if ws is not None:
             try:
@@ -13138,39 +13319,32 @@ async def _test_webproxy_lane_ws(ws_url, session_token, header, parsed, dc_timeo
                 pass
 
 
-async def _test_webproxy_lane_https(loopback, token, domain, session_token, header, parsed, dc_timeout, port):
-    lane_id = 1
-    up_seq = 1
-    down_cursor = 0
+async def _test_webproxy_lane_https(loopback, token, domain, session_token, header, parsed, dc_timeout, port, dc=1, lane_id=1, window_timeout=WEBPROXY_TEST_WINDOW_TIMEOUT, https_state=None):
+    if https_state is None:
+        https_state = {"up_seq": 1, "down_cursor": 0}
+    state = _webproxy_lane_new_state(lane_id, dc, parsed["write_key"], parsed["write_iv"])
     auth_headers = {"Host": domain, "Authorization": "Bearer " + session_token}
-    nonce = os.urandom(16)
-    msg_id = (int(time.time()) << 32) | (int.from_bytes(os.urandom(4), "big") & 0xFFFFFFFC)
-    req_body = struct.pack("<i", 0x60469778) + nonce
-    req_msg = struct.pack("<q", 0) + struct.pack("<q", msg_id) + struct.pack("<i", len(req_body)) + req_body
-    req_total = 1 + len(req_msg)
-    req_pad = (-req_total) % 4
-    req_packet = bytes([(req_total + req_pad) // 4]) + req_msg + b"\x00" * req_pad
-    req_cipher = _webproxy_aes_ctr_at(parsed["read_key"], parsed["read_iv"], 64, req_packet)
 
     async def _up(client, frames):
-        nonlocal up_seq
-        resp = await client.post(loopback + "/" + token + "/api/v1/up", content=frames, headers=dict(auth_headers, **{"Content-Type": "application/octet-stream", "X-Up-Seq": str(up_seq)}))
+        resp = await client.post(loopback + "/" + token + "/api/v1/up", content=frames, headers=dict(auth_headers, **{"Content-Type": "application/octet-stream", "X-Up-Seq": str(https_state["up_seq"])}))
         if resp.status_code == 204:
-            up_seq += 1
+            https_state["up_seq"] += 1
             return
         if resp.status_code == 409:
             raise ValueError("uplink sequence rejected (HTTP 409)")
         raise ValueError("uplink failed (HTTP " + str(resp.status_code) + ")")
 
     async def _down(client, deadline, per_poll_timeout):
-        nonlocal down_cursor
         while time.time() < deadline:
             remaining = max(0.5, deadline - time.time())
-            resp = await client.post(loopback + "/" + token + "/api/v1/down", content=b"", headers=dict(auth_headers, **{"X-Down-Cursor": str(down_cursor)}), timeout=min(per_poll_timeout, remaining))
+            try:
+                resp = await client.post(loopback + "/" + token + "/api/v1/down", content=b"", headers=dict(auth_headers, **{"X-Down-Cursor": str(https_state["down_cursor"])}), timeout=min(per_poll_timeout, remaining))
+            except httpx.TimeoutException:
+                return b"", False
             cursor_header = resp.headers.get("X-Down-Cursor", "")
             if cursor_header:
                 try:
-                    down_cursor = int(cursor_header)
+                    https_state["down_cursor"] = int(cursor_header)
                 except ValueError:
                     pass
             closed = resp.headers.get("X-Lane-Closed", "") == "1"
@@ -13186,70 +13360,43 @@ async def _test_webproxy_lane_https(loopback, token, domain, session_token, head
     try:
         async with httpx.AsyncClient(timeout=35.0, trust_env=False) as client:
             await _up(client, _webproxy_test_frame(1, lane_id, b"") + _webproxy_test_frame(2, lane_id, header))
-            window_deadline = time.time() + 10.0
-            window_ok = False
-            got_data = False
-            while time.time() < window_deadline and not window_ok:
-                frames, closed = await _down(client, window_deadline, 10.0)
-                if closed:
-                    if got_data:
-                        return False, "fail", "WEB proxy lane to Telegram DC1 was closed by the server after DC data arrived (DC stage failure, no traffic flows through the DC)"
-                    return False, "fail", "WEB proxy lane to Telegram DC1 was closed by the server before any DC data arrived: the inner MTProto handshake was rejected by telemt (no matching user for this WEB secret)"
+            window_deadline = time.time() + window_timeout
+            while time.time() < window_deadline and not state["window_ok"] and not state["fail"] and not state["passed"]:
+                frames, closed = await _down(client, window_deadline, window_timeout)
                 if frames:
-                    for frame_type, stream_id, _payload in _webproxy_test_split_frames(bytes(frames)):
-                        if stream_id != lane_id:
-                            continue
-                        if frame_type == 2 and _payload:
-                            got_data = True
-                            if _webproxy_lane_intercept_hint(_payload):
-                                return False, "fail", "WEB proxy lane to Telegram DC1 received a plaintext non-Telegram response instead of MTProto data: outbound TCP to Telegram DCs is intercepted on this host (host-egress failure), the proxy itself is configured correctly"
-                        if frame_type == 4:
-                            window_ok = True
-                        if frame_type == 3:
-                            if got_data:
-                                return False, "fail", "WEB proxy lane to Telegram DC1 was closed by the server after DC data arrived (DC stage failure, no traffic flows through the DC)"
-                            return False, "fail", "WEB proxy lane to Telegram DC1 was closed by the server before any DC data arrived: the inner MTProto handshake was rejected by telemt (no matching user for this WEB secret)"
-            if not window_ok:
-                return False, "fail", "WEB proxy lane to Telegram DC1 got no answer within 10s"
-            await _up(client, _webproxy_test_frame(2, lane_id, req_cipher))
-            dc_buf = bytearray()
-            dc_pos = 0
+                    _webproxy_lane_consume(state, _webproxy_test_split_frames(bytes(frames)))
+                if state["fail"]:
+                    return False, "fail", state["fail"], state["got_data"], False
+                if state["passed"]:
+                    return True, "pass", _webproxy_lane_pass_detail(port, token, lane_id, dc, "https"), True, False
+                if closed:
+                    if state["got_data"]:
+                        return False, "fail", "WEB proxy lane to Telegram DC" + str(dc) + " was closed by the server after DC data arrived (DC stage failure, no traffic flows through the DC)", True, False
+                    return False, "fail", "WEB proxy lane to Telegram DC" + str(dc) + " was closed by the server before any DC data arrived: the inner MTProto handshake was rejected by telemt (no matching user for this WEB secret)", False, False
+            if not state["window_ok"]:
+                return False, "fail", "WEB proxy lane to Telegram DC" + str(dc) + " got no answer within " + str(int(window_timeout)) + "s", state["got_data"], not state["got_data"]
+            await _up(client, _webproxy_test_frame(2, lane_id, _webproxy_lane_auth_request(parsed)))
             dc_deadline = time.time() + dc_timeout
-            while time.time() < dc_deadline:
+            while time.time() < dc_deadline and not state["passed"] and not state["fail"]:
                 frames, closed = await _down(client, dc_deadline, 35.0)
                 if frames:
-                    for frame_type, stream_id, payload in _webproxy_test_split_frames(bytes(frames)):
-                        if stream_id != lane_id:
-                            continue
-                        if frame_type == 3:
-                            if got_data:
-                                return False, "fail", "Telegram DC1 closed the lane after the auth request (no traffic flows through the DC)"
-                            return False, "fail", "Telegram DC1 closed the lane after the auth request before any DC data arrived: the inner MTProto handshake was rejected by telemt (no matching user for this WEB secret)"
-                        if frame_type != 2 or not payload:
-                            continue
-                        if _webproxy_lane_intercept_hint(payload):
-                            return False, "fail", "WEB proxy lane to Telegram DC1 received a plaintext non-Telegram response instead of MTProto data: outbound TCP to Telegram DCs is intercepted on this host (host-egress failure), the proxy itself is configured correctly"
-                        got_data = True
-                        plain = _webproxy_aes_ctr_at(parsed["write_key"], parsed["write_iv"], dc_pos, payload)
-                        dc_pos += len(payload)
-                        dc_buf += plain
-                        checked = _webproxy_check_respq(dc_buf)
-                        if checked is True:
-                            return True, "pass", "WEB proxy real session: capability verified for port " + str(port) + (" token " + token if token else "") + ", session issued, lane 1 opened to Telegram DC1 and the DC answered the auth handshake (resPQ) — traffic flows"
-                        if checked is False:
-                            return False, "fail", "Telegram DC1 reply was not a valid MTProto response (bridge and session work, but the DC leg carries no real traffic)"
+                    _webproxy_lane_consume(state, _webproxy_test_split_frames(bytes(frames)))
+                if state["passed"]:
+                    return True, "pass", _webproxy_lane_pass_detail(port, token, lane_id, dc, "https"), True, False
+                if state["fail"]:
+                    return False, "fail", state["fail"], state["got_data"], False
                 if closed:
-                    if got_data:
-                        return False, "fail", "Telegram DC1 closed the lane after the auth request (no traffic flows through the DC)"
-                    return False, "fail", "Telegram DC1 closed the lane after the auth request before any DC data arrived: the inner MTProto handshake was rejected by telemt (no matching user for this WEB secret)"
-            return False, "fail", "Telegram DC1 gave no valid MTProto answer to the auth request within " + str(int(dc_timeout)) + "s (bridge and session work, but no traffic flows through the DC)"
+                    if state["got_data"]:
+                        return False, "fail", "Telegram DC" + str(dc) + " closed the lane after the auth request (no traffic flows through the DC)", True, False
+                    return False, "fail", "Telegram DC" + str(dc) + " closed the lane after the auth request before any DC data arrived: the inner MTProto handshake was rejected by telemt (no matching user for this WEB secret)", False, False
+            return False, "fail", "Telegram DC" + str(dc) + " gave no valid MTProto answer to the auth request within " + str(int(dc_timeout)) + "s (bridge and session work, but no traffic flows through the DC)", state["got_data"], not state["got_data"]
     except ValueError as exc:
-        return False, "fail", "WEB proxy HTTPS carrier lane failed: " + str(exc)
+        return False, "fail", "WEB proxy HTTPS carrier lane failed: " + str(exc), state["got_data"], False
     except Exception as exc:
-        return False, "fail", "WEB proxy HTTPS carrier lane failed: " + str(exc)
+        return False, "fail", "WEB proxy HTTPS carrier lane failed: " + str(exc), state["got_data"], False
 
 
-async def _test_webproxy_real_session(link, domain, port, dc_timeout=8.0):
+async def _test_webproxy_real_session(link, domain, port, dc_timeout=WEBPROXY_TEST_DC_TIMEOUT):
     panel_port = int(os.environ.get("PORT", CONFIG.get("port", 8000)))
     loopback = "http://127.0.0.1:" + str(panel_port)
     ws_base = "ws://127.0.0.1:" + str(panel_port)
@@ -13264,6 +13411,7 @@ async def _test_webproxy_real_session(link, domain, port, dc_timeout=8.0):
     bootstrap = ""
     session_token = ""
     carrier = ""
+    negotiated = False
     try:
         async with httpx.AsyncClient(timeout=10.0, trust_env=False) as client:
             bridge_path = "/" + token + "/?bridge=" + capability
@@ -13274,13 +13422,14 @@ async def _test_webproxy_real_session(link, domain, port, dc_timeout=8.0):
             if not found:
                 return False, "fail", "WEB proxy bridge page has no session bootstrap token"
             bootstrap = found.group(1)
-            session_resp = await client.post(loopback + "/" + token + "/api/v1/session", content=WEBPROXY_HANDSHAKE, headers={"Host": domain, "Authorization": "Bearer " + bootstrap, "Content-Type": "application/octet-stream"})
+            session_resp = await client.post(loopback + "/" + token + "/api/v1/session", content=WEBPROXY_HANDSHAKE, headers={"Host": domain, "Authorization": "Bearer " + bootstrap, "Content-Type": "application/octet-stream", "X-Carrier-Capabilities": WEBPROXY_CARRIER_CAPABILITIES, "X-Carrier-Attempt": "1", "X-Telemt-Up-Window": "4"})
             if session_resp.status_code != 200:
                 return False, "fail", "WEB proxy session creation rejected (HTTP " + str(session_resp.status_code) + ")"
             session_token = session_resp.headers.get("X-Session-Token", "")
             if not session_token:
                 return False, "fail", "WEB proxy session creation returned no session token"
             carrier = (session_resp.headers.get("X-Carrier-Mode", "") or "").strip().lower()
+            negotiated = bool((session_resp.headers.get("X-Carrier-Attempt", "") or "").strip())
     except Exception as exc:
         return False, "fail", "WEB proxy bridge/session step failed: " + str(exc)
     if port != int(WEBPROXY_PUBLIC_PORT):
@@ -13293,13 +13442,34 @@ async def _test_webproxy_real_session(link, domain, port, dc_timeout=8.0):
             return False, "fail", "WEB bridge on port " + str(port) + " is not reachable: " + str(exc)
     try:
         secret = _web_secret_bytes_for_link(link)
-        header = _webproxy_build_client_obfs_header(secret, dc=1)
-        parsed = _webproxy_parse_obfs_header(header, secret)
-        if carrier.startswith("websocket"):
-            return await _test_webproxy_lane_ws(ws_base + "/" + token + "/api/v1/ws", session_token, header, parsed, dc_timeout, port, token)
-        if carrier.startswith("https"):
-            return await _test_webproxy_lane_https(loopback, token, domain, session_token, header, parsed, dc_timeout, port)
-        return False, "fail", "WEB proxy session carrier is not recognized: " + (carrier or "(empty)") + " (bridge and session work, but the lane test cannot run)"
+        https_state = {"up_seq": 1, "down_cursor": 0}
+        lane_deadline = time.time() + WEBPROXY_TEST_LANE_DEADLINE
+        last_verdict = "fail"
+        last_detail = "WEB proxy lane test did not run"
+        for attempt_index, dc in enumerate(WEBPROXY_TEST_DCS):
+            remaining = lane_deadline - time.time()
+            if remaining <= 0:
+                break
+            window_budget = min(WEBPROXY_TEST_WINDOW_TIMEOUT, remaining)
+            dc_budget = min(dc_timeout, max(0.0, remaining - window_budget))
+            if dc_budget <= 0:
+                break
+            header = _webproxy_build_client_obfs_header(secret, dc=dc)
+            parsed = _webproxy_parse_obfs_header(header, secret)
+            lane_id = attempt_index + 1
+            if carrier.startswith("websocket"):
+                ok, verdict, detail, got_data, retry_dc = await _test_webproxy_lane_ws(ws_base + "/" + token + "/api/v1/ws", session_token, header, parsed, dc_budget, port, token, dc=dc, carrier=carrier, negotiated=negotiated, lane_id=lane_id, window_timeout=window_budget)
+            elif carrier.startswith("https"):
+                ok, verdict, detail, got_data, retry_dc = await _test_webproxy_lane_https(loopback, token, domain, session_token, header, parsed, dc_budget, port, dc=dc, lane_id=lane_id, window_timeout=window_budget, https_state=https_state)
+            else:
+                return False, "fail", "WEB proxy session carrier is not recognized: " + (carrier or "(empty)") + " (bridge and session work, but the lane test cannot run)"
+            if ok:
+                return True, "pass", detail
+            last_verdict = verdict
+            last_detail = detail
+            if not retry_dc:
+                return False, verdict, detail
+        return False, last_verdict, last_detail
     finally:
         if session_token:
             try:
@@ -13307,7 +13477,6 @@ async def _test_webproxy_real_session(link, domain, port, dc_timeout=8.0):
                     await client.request("DELETE", loopback + "/" + token + "/api/v1/session", headers={"Host": domain, "Authorization": "Bearer " + session_token})
             except Exception:
                 pass
-
 
 
 ECH_PING_TIMEOUT = 6.0
@@ -13434,6 +13603,9 @@ async def test_inbound(uid: str, request: Request, _=Depends(require_auth)):
                     detail = _proxy_inbound_disabled_reason(link) + " " + _PAAS_TCP_NOTE
                 else:
                     ok, verdict, detail, tested_via = await _test_raw_tcp_public_first(_test_socks5_handshake, domain, raw_port, uid)
+                    if verdict == "local_only":
+                        ok = False
+                        detail = detail + " Only the local listener was measured; this does not prove a remote Telegram client can use the proxy."
             elif proto == "http-proxy":
                 raw_port = int(link.get("port") or PROXY_DEFAULT_PORTS.get("http-proxy", 3128))
                 target = format_host_port(domain, raw_port)
@@ -13443,6 +13615,9 @@ async def test_inbound(uid: str, request: Request, _=Depends(require_auth)):
                     detail = _proxy_inbound_disabled_reason(link) + " " + _PAAS_TCP_NOTE
                 else:
                     ok, verdict, detail, tested_via = await _test_raw_tcp_public_first(_test_http_proxy_handshake, domain, raw_port, uid)
+                    if verdict == "local_only":
+                        ok = False
+                        detail = detail + " Only the local listener was measured; this does not prove a remote Telegram client can use the proxy."
             elif proto == "mtproto":
                 raw_port = int(link.get("port") or PROXY_DEFAULT_PORTS.get("mtproto", 8443))
                 variant = (link.get("mtproto_variant") or "dd").lower()
@@ -18522,6 +18697,7 @@ example.com
       <div class="card" style="margin-bottom:16px;"><div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg></span><span class="card-title" data-en="Features" data-fa="ویژگی‌ها">Features</span></span></div><ul style="margin:0;padding-inline-start:20px;display:grid;gap:8px;color:var(--text-2);line-height:1.7;"><li data-en="Multi-protocol inbounds: VLESS, VMess, Trojan, Shadowsocks, HTTP, SOCKS5 and MTProto." data-fa="اینباندهای چندپروتکله: VLESS، VMess، Trojan، Shadowsocks، HTTP، SOCKS5 و MTProto.">Multi-protocol inbounds: VLESS, VMess, Trojan, Shadowsocks, HTTP, SOCKS5 and MTProto.</li><li data-en="Traffic, quota and expiry control per inbound, with live sessions and active users." data-fa="کنترل ترافیک، سقف مصرف و انقضا برای هر اینباند، با نشست‌های زنده و کاربران فعال.">Traffic, quota and expiry control per inbound, with live sessions and active users.</li><li data-en="Clean-IP profiles and an IP scanner for finding fast, working addresses." data-fa="پروفایل‌های آی‌پی تمیز و اسکنر آی‌پی برای یافتن آدرس‌های سریع و سالم.">Clean-IP profiles and an IP scanner for finding fast, working addresses.</li><li data-en="Telegram bot, notifications and Telegram proxy (WEB and MTProto) with subscription links." data-fa="ربات تلگرام، اعلان‌ها و پروکسی تلگرام (WEB و MTProto) با لینک اشتراک.">Telegram bot, notifications and Telegram proxy (WEB and MTProto) with subscription links.</li><li data-en="Subscription links for VLESS, Clash and Sing-box, plus QR codes and health checks." data-fa="لینک اشتراک VLESS، Clash و Sing-box، به‌همراه کد QR و بررسی سلامت.">Subscription links for VLESS, Clash and Sing-box, plus QR codes and health checks.</li><li data-en="Logs, login history and settings, all in Persian and English." data-fa="لاگ‌ها، تاریخچه ورود و تنظیمات، همه به فارسی و انگلیسی.">Logs, login history and settings, all in Persian and English.</li></ul></div>
       <div class="card" style="margin-bottom:16px;"><div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></span><span class="card-title" data-en="How it works" data-fa="نحوه کار">How it works</span></span></div><ol style="margin:0;padding-inline-start:20px;display:grid;gap:8px;color:var(--text-2);line-height:1.7;"><li data-en="Create an inbound from the Inbounds page and set its traffic limit and expiry." data-fa="از صفحه اینباندها یک اینباند بسازید و سقف مصرف و انقضا را تعیین کنید.">Create an inbound from the Inbounds page and set its traffic limit and expiry.</li><li data-en="Copy its link, subscription or QR code and import it into your client app, such as v2rayNG." data-fa="لینک، اشتراک یا کد QR آن را کپی کنید و در برنامه کلاینت خود، مانند v2rayNG، وارد کنید.">Copy its link, subscription or QR code and import it into your client app, such as v2rayNG.</li><li data-en="Watch traffic, sessions and health from the Dashboard and Active Users pages." data-fa="ترافیک، نشست‌ها و سلامت را از صفحات داشبورد و کاربران فعال ببینید.">Watch traffic, sessions and health from the Dashboard and Active Users pages.</li><li data-en="For Telegram, create a WEB or MTProto proxy from the Telegram page and share its link." data-fa="برای تلگرام، از صفحه تلگرام یک پروکسی WEB یا MTProto بسازید و لینک آن را به اشتراک بگذارید.">For Telegram, create a WEB or MTProto proxy from the Telegram page and share its link.</li></ol></div>
       <div class="card" style="margin-bottom:16px;"><div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg></span><span class="card-title" data-en="Links" data-fa="پیوندها">Links</span></span></div><div style="display:flex;gap:8px;flex-wrap:wrap;"><a class="btn btn-outline" href="https://t.me/SulgX" target="_blank" rel="noopener"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg></span><span data-en="Telegram @SulgX" data-fa="تلگرام @SulgX">Telegram @SulgX</span></a><a class="btn btn-outline" href="https://github.com/SulgX" target="_blank" rel="noopener"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z"/></svg></span><span data-en="Creator on GitHub" data-fa="سازنده در گیت‌هاب">Creator on GitHub</span></a><a class="btn btn-outline" href="https://github.com/SulgX/SulgX-Panel" target="_blank" rel="noopener"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg></span><span data-en="Project page" data-fa="صفحه پروژه">Project page</span></a></div></div>
+      <div class="card" style="margin-bottom:16px;"><div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 7H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2z"/><path d="M16 7V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v2"/></svg></span><span class="card-title" data-en="Support SulgX" data-fa="حمایت از SulgX">Support SulgX</span></span></div><div style="color:var(--text-2);line-height:1.7;" data-en="You can support the project through this TON wallet address." data-fa="می‌توانید از طریق این آدرس کیف پول TON از پروژه حمایت کنید.">You can support the project through this TON wallet address.</div><div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:12px;"><input class="fi" id="ton-donate-address" readonly value="UQACYNjCyXjIuXu5Y89wqyxlqdIPan9hWFo6CC-3Zz6jnKZW" style="flex:1;direction:ltr;text-align:left;" onclick="this.select()"><button class="btn btn-outline btn-sm" onclick="copyToClipboard(document.getElementById('ton-donate-address').value)" style="white-space:nowrap;"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></span><span data-en="Copy" data-fa="کپی">Copy</span></button></div></div>
     </section>
   </main>
   <nav class="mobile-nav">
@@ -18633,7 +18809,7 @@ example.com
     <div class="hint" id="adv-hint-create" style="color:var(--text-3);font-size:0.85rem;" data-en="SNI, Host, Fingerprint, ALPN, ECH, SMUX, Xray DNS, Bypass rules and Fragment only change the generated client configs — they do not change how this server relays traffic." data-fa="SNI، Host، Fingerprint، ALPN، ECH، SMUX، Xray DNS، قوانین Bypass و Fragment فقط کانفیگ‌های ساخته‌شده کلاینت را تغییر می‌دهند و بر نحوه عبور ترافیک از این سرور تأثیری ندارند.">SNI, Host, Fingerprint, ALPN, ECH, SMUX, Xray DNS, Bypass rules and Fragment only change the generated client configs — they do not change how this server relays traffic.</div>
       <div id="adv-create" class="adv-section">
         <div class="fg" data-adv="profile"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Profile" data-fa="پروفایل">Profile</span></label>
-          <select class="fs" id="ares-profile" onchange="applyProfileCreate()"><option value="" data-en="Custom" data-fa="سفارشی">Custom</option><option value="default" selected data-en="Default" data-fa="پیش‌فرض">Default</option><option value="normal" data-en="Normal" data-fa="عادی">Normal</option><option value="relative" data-en="Relative restriction" data-fa="محدودیت نسبی">Relative restriction</option><option value="severe" data-en="Severe restriction" data-fa="محدودیت شدید">Severe restriction</option><option value="emergency" data-en="Emergency" data-fa="اضطراری">Emergency</option></select>
+          <select class="fs" id="ares-profile" onchange="applyProfileCreate()"><option value="" data-en="Custom" data-fa="سفارشی">Custom</option><option value="default" selected data-en="Default" data-fa="پیش‌فرض">Default</option><option value="relative" data-en="Relative restriction" data-fa="محدودیت نسبی">Relative restriction</option><option value="severe" data-en="Severe restriction" data-fa="محدودیت شدید">Severe restriction</option><option value="emergency" data-en="Emergency" data-fa="اضطراری">Emergency</option></select>
           <small style="color:var(--text-3);font-size:0.75rem;" data-en="Restriction level sets fragment, fingerprint, ALPN, ECH, path randomisation, TFO and UDP for the current filtering level. Custom leaves every parameter as you set it." data-fa="سطح محدودیت، فرگمنت، فینگرپرینت، ALPN، ECH، تصادفی‌سازی مسیر، TFO و UDP را برای سطح فیلترینگ فعلی تنظیم می‌کند. «سفارشی» همه پارامترها را همان‌طور که تنظیم کرده‌اید باقی می‌گذارد.">Restriction level sets fragment, fingerprint, ALPN, ECH, path randomisation, TFO and UDP for the current filtering level. Custom leaves every parameter as you set it.</small>
         </div>
         <div id="aeff-summary" style="color:var(--text-2);font-size:0.85rem;border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin-bottom:12px;white-space:pre-wrap;"></div>
@@ -18841,7 +19017,7 @@ example.com
     <div class="hint" id="adv-hint-edit" style="color:var(--text-3);font-size:0.85rem;" data-en="SNI, Host, Fingerprint, ALPN, ECH, SMUX, Xray DNS, Bypass rules and Fragment only change the generated client configs — they do not change how this server relays traffic." data-fa="SNI، Host، Fingerprint، ALPN، ECH، SMUX، Xray DNS، قوانین Bypass و Fragment فقط کانفیگ‌های ساخته‌شده کلاینت را تغییر می‌دهند و بر نحوه عبور ترافیک از این سرور تأثیری ندارند.">SNI, Host, Fingerprint, ALPN, ECH, SMUX, Xray DNS, Bypass rules and Fragment only change the generated client configs — they do not change how this server relays traffic.</div>
       <div id="adv-edit" class="adv-section">
         <div class="fg" data-adv="profile"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span> <span data-en="Profile" data-fa="پروفایل">Profile</span></label>
-          <select class="fs" id="eres-profile" onchange="applyProfile()"><option value="" data-en="Custom" data-fa="سفارشی">Custom</option><option value="default" data-en="Default" data-fa="پیش‌فرض">Default</option><option value="normal" data-en="Normal" data-fa="عادی">Normal</option><option value="relative" data-en="Relative restriction" data-fa="محدودیت نسبی">Relative restriction</option><option value="severe" data-en="Severe restriction" data-fa="محدودیت شدید">Severe restriction</option><option value="emergency" data-en="Emergency" data-fa="اضطراری">Emergency</option></select>
+          <select class="fs" id="eres-profile" onchange="applyProfile()"><option value="" data-en="Custom" data-fa="سفارشی">Custom</option><option value="default" data-en="Default" data-fa="پیش‌فرض">Default</option><option value="relative" data-en="Relative restriction" data-fa="محدودیت نسبی">Relative restriction</option><option value="severe" data-en="Severe restriction" data-fa="محدودیت شدید">Severe restriction</option><option value="emergency" data-en="Emergency" data-fa="اضطراری">Emergency</option></select>
           <small style="color:var(--text-3);font-size:0.75rem;" data-en="Restriction level sets fragment, fingerprint, ALPN, ECH, path randomisation, TFO and UDP for the current filtering level. Custom leaves every parameter as you set it." data-fa="سطح محدودیت، فرگمنت، فینگرپرینت، ALPN، ECH، تصادفی‌سازی مسیر، TFO و UDP را برای سطح فیلترینگ فعلی تنظیم می‌کند. «سفارشی» همه پارامترها را همان‌طور که تنظیم کرده‌اید باقی می‌گذارد.">Restriction level sets fragment, fingerprint, ALPN, ECH, path randomisation, TFO and UDP for the current filtering level. Custom leaves every parameter as you set it.</small>
         </div>
         <div id="eeff-summary" style="color:var(--text-2);font-size:0.85rem;border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin-bottom:12px;white-space:pre-wrap;"></div>
@@ -20532,7 +20708,6 @@ const ECH_PRESETS_JS = {
 
 const RESTRICTION_PROFILE_JS = {
     "default": { fragment_mode: "off", fragment_length: "100-200", fragment_interval: "10-20", fp: "chrome", alpn: "smart", ech: 0, ech_preset: "", random_path: 0, tfo: 0, udp: 1, ipv6: 1, dns: "direct" },
-    "normal": { fragment_mode: "off", fragment_length: "100-200", fragment_interval: "10-20", fp: "chrome", alpn: "smart", ech: 0, ech_preset: "", random_path: 0, tfo: 0, udp: 1, ipv6: 1, dns: "direct" },
     "relative": { fragment_mode: "tlshello", fragment_length: "100-200", fragment_interval: "10-20", fp: "chrome", alpn: "smart", ech: 1, ech_preset: "cloudflare", random_path: 1, tfo: 1, udp: 1, ipv6: 1, dns: "doh" },
     "severe": { fragment_mode: "tlshello", fragment_length: "100-500", fragment_interval: "5-10", fp: "chrome", alpn: "smart", ech: 1, ech_preset: "cloudflare", random_path: 1, tfo: 1, udp: 0, ipv6: 1, dns: "doh" },
     "emergency": { fragment_mode: "tlshello", fragment_length: "50-100", fragment_interval: "1-5", fp: "chrome", alpn: "smart", ech: 1, ech_preset: "cloudflare", random_path: 1, tfo: 1, udp: 0, ipv6: 0, dns: "fakedns" }
@@ -20703,12 +20878,11 @@ function renderEffectiveParams(context) {
   } else if (dnsMode === 'fakedns') {
     dnsText = 'FakeDNS (198.18.0.0/15)';
   }
-  const profileFa = {'': 'سفارشی', 'default': 'پیش‌فرض', 'normal': 'عادی', 'relative': 'محدودیت نسبی', 'severe': 'محدودیت شدید', 'emergency': 'اضطراری'}[profile] || profile;
+  const profileFa = {'': 'سفارشی', 'default': 'پیش‌فرض', 'relative': 'محدودیت نسبی', 'severe': 'محدودیت شدید', 'emergency': 'اضطراری'}[profile] || profile;
   const fpFa = fpText === 'none' ? 'هیچ‌کدام' : fpText === 'random' ? 'تصادفی' : fpText === 'randomized' ? 'تصادفی‌سازی‌شده' : fpText === 'custom' ? 'سفارشی' : fpText;
   const alpnFa = alpnText === 'smart' ? 'هوشمند' : alpnText === 'none' ? 'هیچ‌کدام' : alpnText === 'custom' ? 'سفارشی' : alpnText;
-  const profileNote = profile === 'default' ? (lang === 'fa' ? ' (تنظیمات یکسان با Normal)' : ' (same settings as Normal)') : profile === 'normal' ? (lang === 'fa' ? ' (تنظیمات یکسان با Default)' : ' (same settings as Default)') : '';
   const lines = [
-    (lang === 'fa' ? 'پروفایل: ' : 'Profile: ') + (lang === 'fa' ? profileFa : profile) + profileNote,
+    (lang === 'fa' ? 'پروفایل: ' : 'Profile: ') + (lang === 'fa' ? profileFa : profile),
     (lang === 'fa' ? 'فرگمنت: ' : 'Fragment: ') + fragText,
     (lang === 'fa' ? 'فینگرپرینت: ' : 'Fingerprint: ') + ((lang === 'fa' ? fpFa : fpText) || 'chrome') + ' · ALPN: ' + ((lang === 'fa' ? alpnFa : alpnText) || 'smart'),
     'ECH: ' + echText,
@@ -22350,7 +22524,7 @@ async function showEditMo(uid) {
   if($m('ewebproxy-token')) $m('ewebproxy-token').value = l.webproxy_token || '';
   $m('eoutbound-mode').value = l.outbound_mode || 'auto';
   $m('egaming-profile').value = l.gaming_profile || 'off';
-  $m('eres-profile').value = l.profile === 'custom' ? '' : (l.profile || 'default');
+  $m('eres-profile').value = l.profile === 'custom' ? '' : (l.profile === 'normal' ? 'default' : (l.profile || 'default'));
   if ($m('ech-preset-edit')) $m('ech-preset-edit').value = l.ech_preset || 'custom';
   renderEchPingResults('edit');
   if ($m('xray-blocked-domains')) $m('xray-blocked-domains').value = (l.xray_blocked_domains || '').replace(/,/g, '\n');
