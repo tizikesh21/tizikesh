@@ -3,7 +3,6 @@ set -eu
 
 echo "SulgX entrypoint starting: uid=$(id -u) gid=$(id -g) user=$(id -un 2>/dev/null || echo unknown) HOME=${HOME:-unset}"
 
-# --- Find writable HOME ---
 if [ -z "${HOME:-}" ] || [ ! -d "${HOME:-}" ] || [ ! -w "${HOME:-}" ]; then
   for candidate in "/tmp/sulgx-home-$(id -u)" "/tmp/sulgx-home" "/var/tmp/sulgx-home"; do
     if mkdir -p "$candidate" 2>/dev/null && [ -w "$candidate" ]; then
@@ -18,7 +17,6 @@ if [ -z "${HOME:-}" ] || [ ! -w "${HOME:-}" ]; then
   exit 1
 fi
 
-# --- Find writable DATA_DIR ---
 DATA_DIR=""
 for candidate in "${SULGX_DATA_DIR:-/data}" "$HOME/data" "/tmp/sulgx-data-$(id -u)" "/tmp/sulgx-data" "/var/tmp/sulgx-data"; do
   if mkdir -p "$candidate" 2>/dev/null && touch "$candidate/.write-test" 2>/dev/null; then
@@ -43,7 +41,6 @@ export DB_PATH="${DB_PATH:-$DATA_DIR/panel.db}"
 DB_DIR="$(dirname "$DB_PATH")"
 mkdir -p "$DB_DIR" 2>/dev/null || true
 
-# Best-effort ownership fix (may fail in restricted environments)
 chown -R sulgx:sulgx "$DATA_DIR" 2>/dev/null || true
 
 if [ -f "$ENV_FILE" ]; then
@@ -148,11 +145,14 @@ if [ -z "${1:-}" ]; then
   set -- python main.py
 fi
 
-# Only use gosu if we are root AND the sulgx user exists
 if [ "$(id -u)" = "0" ] && command -v gosu >/dev/null 2>&1 && id sulgx >/dev/null 2>&1; then
-  echo "SulgX entrypoint: exec gosu sulgx $*"
-  exec gosu sulgx "$@"
-else
-  echo "SulgX entrypoint: exec $* (as uid=$(id -u))"
-  exec "$@"
+  echo "SulgX entrypoint: attempting gosu sulgx $*"
+  if gosu sulgx "$@"; then
+    exit 0
+  else
+    echo "SulgX entrypoint: WARNING - gosu failed (missing SETUID capability or no-new-privileges). Falling back to running as uid=$(id -u)." >&2
+  fi
 fi
+
+echo "SulgX entrypoint: executing $* as uid=$(id -u)"
+exec "$@"
