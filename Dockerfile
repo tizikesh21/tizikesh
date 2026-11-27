@@ -36,8 +36,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 RUN useradd -m sulgx && chown -R sulgx:sulgx /app
 RUN mkdir -p /data && chown -R sulgx:sulgx /data
-COPY --from=builder /root/.local /home/sulgx/.local
-RUN chown -R sulgx:sulgx /home/sulgx/.local
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 COPY --from=telemt /usr/local/bin/telemt /usr/local/bin/telemt
 COPY --from=telemt /usr/local/share/telemt/LICENSE /usr/local/share/telemt/LICENSE
 COPY --chown=sulgx:sulgx . .
