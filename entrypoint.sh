@@ -77,6 +77,19 @@ if [ -z "${DATABASE_URL:-}" ]; then
     export TG_WEB_SECRET="$SULGX_NEW_TG_WEB_SECRET"
   fi
 fi
+TG_WEB_SECRET_EFFECTIVE="${TG_WEB_SECRET:-}"
+TG_WEB_SECRET_VALID="$(TG_WEB_SECRET_CHECK="$TG_WEB_SECRET_EFFECTIVE" python3 -c "import os, re; print('yes' if re.fullmatch(r'(dd)?[0-9a-fA-F]{32}', os.environ.get('TG_WEB_SECRET_CHECK', '').strip()) else 'no')")"
+if [ "$TG_WEB_SECRET_VALID" != "yes" ]; then
+  SULGX_NEW_TG_WEB_SECRET="$(python3 -c "import secrets; print(secrets.token_hex(16))")"
+  if grep -q "^TG_WEB_SECRET=" "$ENV_FILE" 2>/dev/null; then
+    sed -i "/^TG_WEB_SECRET=/d" "$ENV_FILE"
+    printf '%s\n' "TG_WEB_SECRET=$SULGX_NEW_TG_WEB_SECRET" >> "$ENV_FILE"
+  else
+    printf '%s\n' "TG_WEB_SECRET=$SULGX_NEW_TG_WEB_SECRET" >> "$ENV_FILE"
+  fi
+  export TG_WEB_SECRET="$SULGX_NEW_TG_WEB_SECRET"
+  printf '%s\n' "SulgX entrypoint: TG_WEB_SECRET was missing or invalid, a valid secret was generated and stored for this deployment"
+fi
 if [ -f "$ENV_FILE" ]; then
   chmod 600 "$ENV_FILE"
   chown sulgx:sulgx "$ENV_FILE"
