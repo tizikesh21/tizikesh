@@ -1,4 +1,0 @@
-name = "tizikesh"
-main = "src/main.py"
-compatibility_date = "2026-11-27"
-compatibility_flags = ["python_workers"]
