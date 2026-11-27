@@ -9,6 +9,7 @@ never implements the MTProto or WEB wire protocols itself any more.
 """
 import asyncio
 import base64
+import errno
 import hashlib
 import hmac as hmac_mod
 import ipaddress
@@ -48,7 +49,10 @@ _TELEMT_MAX_FAILURES = 5
 _TELEMT_FAILURE_WINDOW = 60.0
 _TELEMT_BOOT_LOG_MAX = 40
 _TELEMT_DECOY_HTML = "<!doctype html><html><head><meta charset=\"utf-8\"><title>OK</title></head><body>OK</body></html>"
-_HTTP_METHODS = (b"CONNECT ", b"GET ", b"POST ", b"HEAD ", b"PUT ", b"DELETE ", b"OPTIONS ", b"PATCH ")
+_HTTP_METHODS = (b"CONNECT ", b"GET ", b"POST ", b"HEAD ", b"PUT ", b"DELETE ", b"OPTIONS ", b"PATCH ", b"TRACE ")
+_HTTP_KNOWN_TOKENS = frozenset((b"CONNECT", b"GET", b"POST", b"HEAD", b"PUT", b"DELETE", b"OPTIONS", b"PATCH", b"TRACE"))
+_HTTP_HOP_BY_HOP = frozenset((b"connection", b"proxy-connection", b"keep-alive", b"te", b"trailer", b"transfer-encoding", b"upgrade", b"proxy-authorization", b"proxy-authenticate"))
+_HTTP_TOKEN_BYTES = frozenset(b"!#$%&'*+-.^_`|~0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 _TELEMT_USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 _TELEMT_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
@@ -195,13 +199,38 @@ def _ordered_targets(ips):
     return targets
 
 
+def _socks_rep_for_error(exc):
+    if isinstance(exc, asyncio.TimeoutError):
+        return 0x01
+    err = getattr(exc, "errno", None)
+    if err == errno.ECONNREFUSED:
+        return 0x05
+    if err == errno.EHOSTUNREACH:
+        return 0x04
+    if err == errno.ENETUNREACH:
+        return 0x03
+    if err == errno.EACCES or err == errno.EPERM:
+        return 0x02
+    return 0x01
+
+
 async def _connect_target(targets, port):
+    deadline = time.monotonic() + 30.0
+    seen = []
     for target_ip in targets:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         try:
-            return await asyncio.wait_for(asyncio.open_connection(target_ip, port), timeout=10)
-        except (OSError, asyncio.TimeoutError):
+            reader, writer = await asyncio.wait_for(asyncio.open_connection(target_ip, port), timeout=min(10.0, remaining))
+            return reader, writer, 0x00
+        except (OSError, asyncio.TimeoutError) as exc:
+            seen.append(_socks_rep_for_error(exc))
             continue
-    return None, None
+    for rep in (0x05, 0x04, 0x03, 0x02):
+        if rep in seen:
+            return None, None, rep
+    return None, None, 0x01
 
 
 async def _read_exact(reader, n, timeout=10.0):
@@ -288,10 +317,11 @@ class _PrefixedReader:
 def _looks_http(prefix):
     if not prefix:
         return False
+    upper = bytes(prefix).upper()
     for method in _HTTP_METHODS:
-        if prefix.startswith(method):
+        if upper.startswith(method):
             return True
-        if len(prefix) >= 3 and len(prefix) < len(method) and method.startswith(prefix):
+        if len(upper) >= 3 and len(upper) < len(method) and method.startswith(upper):
             return True
     return False
 
@@ -313,8 +343,9 @@ def _looks_socks5(prefix):
 def _could_be_http_or_socks5(prefix):
     if not prefix:
         return True
+    upper = bytes(prefix).upper()
     for method in _HTTP_METHODS:
-        if method.startswith(prefix):
+        if method.startswith(upper):
             return True
     if prefix[0] == 0x05:
         if len(prefix) < 2:
@@ -334,7 +365,7 @@ def _could_be_http_or_socks5(prefix):
 async def _peek_prefix(reader):
     prefix = b""
     deadline = time.monotonic() + 10.0
-    while len(prefix) < 8:
+    while len(prefix) < 8 or (len(prefix) >= 2 and prefix[0] == 0x05 and len(prefix) < min(2 + prefix[1], 16)):
         try:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -637,32 +668,608 @@ async def _handle_panel_forward(reader, writer):
             pass
 
 
+async def _http_send_error(writer, status, reason, extra_headers=None):
+    try:
+        lines = [b"HTTP/1.1 " + str(status).encode("ascii") + b" " + reason.encode("ascii")]
+        for header in extra_headers or ():
+            lines.append(header)
+        lines.append(b"Content-Length: 0")
+        lines.append(b"Connection: close")
+        writer.write(b"\r\n".join(lines) + b"\r\n\r\n")
+        await asyncio.wait_for(writer.drain(), timeout=5.0)
+    except Exception:
+        pass
+
+
+def _http_split_token(prefix):
+    for idx, byte in enumerate(bytes(prefix or b"")):
+        if byte in (0x20, 0x09, 0x0d, 0x0a):
+            return bytes(prefix[:idx]), idx
+    return None, None
+
+
+async def _extend_http_prefix(reader, prefix):
+    while len(prefix) < 32:
+        _token, sep = _http_split_token(prefix)
+        if sep is not None and len(prefix) >= sep + 9:
+            break
+        if sep is None and len(prefix) >= 16 and not bytes(prefix).isalpha():
+            break
+        try:
+            chunk = await asyncio.wait_for(reader.read(32 - len(prefix)), timeout=5.0)
+        except (asyncio.TimeoutError, ConnectionError, OSError):
+            break
+        if not chunk:
+            break
+        prefix += bytes(chunk)
+    return prefix
+
+
+def _http_headers_get(headers, name):
+    wanted = bytes(name).lower()
+    for entry_name, _orig, value in headers:
+        if entry_name == wanted:
+            return value
+    return None
+
+
+def _http_connection_tokens(headers):
+    tokens = set()
+    for entry_name, _orig, value in headers:
+        if entry_name == b"connection":
+            for item in bytes(value).split(b","):
+                item = item.strip().lower()
+                if item:
+                    tokens.add(item)
+    return tokens
+
+
+def _parse_http_request_head(head):
+    if not head.endswith(b"\r\n\r\n"):
+        return None
+    lines = bytes(head[:-4]).split(b"\r\n")
+    if not lines or not lines[0]:
+        return None
+    parts = lines[0].split()
+    if len(parts) < 2 or len(parts) > 3:
+        return None
+    method = parts[0]
+    if not method or len(method) > 32 or any(byte not in _HTTP_TOKEN_BYTES for byte in method):
+        return None
+    target = parts[1]
+    if not target or any(byte < 0x21 or byte == 0x7f for byte in target):
+        return None
+    version = None
+    if len(parts) == 3:
+        version = parts[2]
+        if len(version) != 8 or not version.startswith(b"HTTP/") or version[5] not in b"0123456789" or version[6:7] != b"." or version[7] not in b"0123456789":
+            return None
+    headers = []
+    for line in lines[1:]:
+        if not line:
+            continue
+        if b":" not in line:
+            return None
+        name, value = line.split(b":", 1)
+        name = bytes(name).strip()
+        if not name or any(byte not in _HTTP_TOKEN_BYTES for byte in name):
+            return None
+        value = bytes(value).strip(b" \t")
+        if any(byte < 0x20 and byte != 0x09 or byte == 0x7f for byte in value):
+            return None
+        headers.append((name.lower(), name, value))
+    return method.decode("ascii"), target, version, headers
+
+
+def _parse_http_response_head(head):
+    if not head.endswith(b"\r\n\r\n"):
+        return None
+    lines = bytes(head[:-4]).split(b"\r\n")
+    if not lines or not lines[0]:
+        return None
+    parts = lines[0].split(b" ", 2)
+    if len(parts) < 2:
+        return None
+    version = parts[0]
+    if len(version) != 8 or not version.startswith(b"HTTP/") or version[5] not in b"0123456789" or version[6:7] != b"." or version[7] not in b"0123456789":
+        return None
+    code = parts[1]
+    if len(code) != 3 or not code.isdigit():
+        return None
+    reason = parts[2] if len(parts) > 2 else b""
+    headers = []
+    for line in lines[1:]:
+        if not line:
+            continue
+        if b":" not in line:
+            continue
+        name, value = line.split(b":", 1)
+        name = bytes(name).strip()
+        if not name or any(byte not in _HTTP_TOKEN_BYTES for byte in name):
+            continue
+        value = bytes(value).strip(b" \t")
+        if any(byte < 0x20 and byte != 0x09 or byte == 0x7f for byte in value):
+            continue
+        headers.append((name.lower(), name, value))
+    return version, int(code), reason, headers
+
+
+def _parse_proxy_auth(headers):
+    raw = _http_headers_get(headers, b"proxy-authorization")
+    if raw is None:
+        return None
+    parts = bytes(raw).split(None, 1)
+    if len(parts) != 2 or parts[0].lower() != b"basic":
+        return None
+    try:
+        decoded = base64.b64decode(parts[1].strip(), validate=True)
+    except ValueError:
+        return None
+    if b":" not in decoded:
+        return None
+    username, password = decoded.split(b":", 1)
+    if not username:
+        return None
+    try:
+        return username.decode("utf-8"), password.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _parse_host_port(authority, default_port):
+    if not authority or any(byte < 0x21 or byte == 0x7f for byte in authority):
+        return None
+    try:
+        authority.decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    if authority.startswith(b"["):
+        close = authority.find(b"]")
+        if close < 0:
+            return None
+        host_raw = authority[1:close]
+        try:
+            ipaddress.IPv6Address(host_raw.decode("ascii"))
+        except ValueError:
+            return None
+        rest = authority[close + 1:]
+        if not rest:
+            return authority, default_port
+        if not rest.startswith(b":") or not rest[1:].isdigit():
+            return None
+        port = int(rest[1:])
+        if port < 1 or port > 65535:
+            return None
+        return authority, port
+    if authority.count(b":") != 1:
+        return None
+    host_raw, port_text = authority.split(b":", 1)
+    if not host_raw or not port_text.isdigit():
+        return None
+    port = int(port_text)
+    if port < 1 or port > 65535:
+        return None
+    if len(host_raw) > 253:
+        return None
+    if any(byte not in b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.~!$&'()*+,;=%" for byte in host_raw):
+        return None
+    return host_raw, port
+
+
+def _parse_connect_authority(target):
+    if any(byte in target for byte in (b"/", b"?", b"#", b"@")):
+        return None
+    parsed = _parse_host_port(target, 0)
+    if parsed is None:
+        return None
+    host_raw, port = parsed
+    if port == 0:
+        return None
+    return host_raw.decode("ascii"), port
+
+
+def _parse_absolute_uri(target):
+    lowered = bytes(target).lower()
+    if lowered.startswith(b"https://"):
+        return "https"
+    if not lowered.startswith(b"http://"):
+        return None
+    rest = bytes(target)[7:]
+    if not rest:
+        return None
+    end = len(rest)
+    for sep in (b"/", b"?", b"#"):
+        pos = rest.find(sep)
+        if pos >= 0 and pos < end:
+            end = pos
+    authority = rest[:end]
+    if not authority or b"@" in authority:
+        return None
+    parsed = _parse_host_port(authority, 80)
+    if parsed is None:
+        return None
+    host_raw, port = parsed
+    tail = rest[end:]
+    if tail.startswith(b"#"):
+        tail = b""
+    elif b"#" in tail:
+        tail = tail.split(b"#", 1)[0]
+    if not tail:
+        path = b"/"
+    elif tail.startswith(b"?"):
+        path = b"/" + tail
+    else:
+        path = tail
+    return host_raw.decode("ascii"), port, authority, path
+
+
+async def _http_connect_target(targets, port):
+    deadline = time.monotonic() + 10.0
+    for target_ip in targets:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None, "timeout"
+        try:
+            return await asyncio.wait_for(asyncio.open_connection(target_ip, port), timeout=remaining), ""
+        except asyncio.TimeoutError:
+            return None, "timeout"
+        except (OSError, ConnectionError):
+            continue
+    return None, "refused"
+
+
+async def _http_resolve_and_connect(host, port):
+    loop = asyncio.get_running_loop()
+    try:
+        infos = await asyncio.wait_for(loop.getaddrinfo(host, None, proto=socket.IPPROTO_TCP), timeout=10.0)
+    except asyncio.TimeoutError:
+        return None, None, "timeout"
+    except (OSError, UnicodeError):
+        return None, None, "refused"
+    ips = list({info[4][0] for info in infos})
+    targets = _ordered_targets(ips)
+    if not targets:
+        return None, None, "refused"
+    pair, reason = await _http_connect_target(targets, port)
+    if pair is None:
+        return None, None, reason
+    return pair[0], pair[1], ""
+
+
+def _http_connect_failure_status(reason):
+    if reason == "timeout":
+        return 504, "Gateway Timeout"
+    return 502, "Bad Gateway"
+
+
 async def _handle_multi(reader, writer):
     prefix = await _peek_prefix(reader)
-    if _looks_http(prefix):
-        while b" " not in prefix and len(prefix) < 16:
-            try:
-                chunk = await asyncio.wait_for(reader.read(16 - len(prefix)), timeout=5.0)
-            except (asyncio.TimeoutError, ConnectionError, OSError):
-                break
-            if not chunk:
-                break
-            prefix += bytes(chunk)
-        if b" " not in prefix:
+    if not prefix:
+        await _http_send_error(writer, 408, "Request Timeout")
+        try:
+            writer.close()
+        except OSError:
+            pass
+        return
+    if _looks_socks5(prefix):
+        await _handle_socks5(_PrefixedReader(reader, prefix), writer)
+        return
+    if len(prefix) >= 2 and prefix[0] == 0x05 and 1 <= prefix[1] <= 253 and len(prefix) >= 2 + prefix[1]:
+        await _handle_socks5(_PrefixedReader(reader, prefix), writer)
+        return
+    token, _sep = _http_split_token(prefix)
+    if token is not None and token.upper() in _HTTP_KNOWN_TOKENS:
+        prefix = await _extend_http_prefix(reader, prefix)
+        token, sep = _http_split_token(prefix)
+        if token is not None and token.upper() == b"CONNECT":
+            await _handle_http_proxy(_PrefixedReader(reader, prefix), writer)
+            return
+        if sep is not None:
+            after = bytes(prefix[sep + 1:sep + 9]).lower()
+            if after.startswith(b"http://") or after.startswith(b"https://"):
+                await _handle_http_proxy(_PrefixedReader(reader, prefix), writer)
+                return
+        await _handle_panel_forward(_PrefixedReader(reader, prefix), writer)
+        return
+    if prefix and prefix[:1].isalpha() and all(0x20 <= byte <= 0x7e or byte in (0x0d, 0x0a) for byte in prefix):
+        if b"\n" in bytes(prefix):
+            await _handle_http_proxy(_PrefixedReader(reader, prefix), writer)
+            return
+        extra = b""
+        try:
+            extra = bytes(await asyncio.wait_for(reader.readuntil(b"\n"), timeout=2.0))
+        except asyncio.LimitOverrunError:
+            await _handle_http_proxy(_PrefixedReader(reader, prefix), writer)
+            return
+        except (asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError, OSError):
+            if any(method.startswith(bytes(prefix).upper()) for method in _HTTP_METHODS):
+                await _handle_http_proxy(_PrefixedReader(reader, prefix), writer)
+                return
             try:
                 writer.close()
             except OSError:
                 pass
             return
-        if prefix.split(b" ", 1)[0].upper() == b"CONNECT":
-            await _handle_http_proxy(_PrefixedReader(reader, prefix), writer)
-            return
-        await _handle_panel_forward(_PrefixedReader(reader, prefix), writer)
-        return
-    if _looks_socks5(prefix):
-        await _handle_socks5(_PrefixedReader(reader, prefix), writer)
-        return
+        else:
+            combined = bytes(prefix) + extra
+            if extra and all(0x20 <= byte <= 0x7e or byte in (0x0d, 0x0a) for byte in extra):
+                await _handle_http_proxy(_PrefixedReader(reader, combined), writer)
+                return
+            if extra:
+                await _handle_mtproto_relay(reader, writer, combined)
+                return
     await _handle_mtproto_relay(reader, writer, prefix)
+
+
+async def _socks_send(writer, data):
+    try:
+        writer.write(data)
+        await writer.drain()
+        return True
+    except (ConnectionError, asyncio.TimeoutError, OSError, RuntimeError):
+        return False
+
+
+def _socks_failure_reply(rep):
+    return b"\x05" + bytes([rep]) + b"\x00\x01\x00\x00\x00\x00\x00\x00"
+
+
+async def _socks5_read_address(reader, atyp):
+    if atyp == 0x01:
+        addr_bytes = await _read_exact(reader, 4)
+        host = socket.inet_ntoa(addr_bytes)
+        ips = [host]
+    elif atyp == 0x03:
+        dlen = (await _read_exact(reader, 1))[0]
+        if dlen == 0:
+            return None, None, None, 0x04
+        host = (await _read_exact(reader, dlen)).decode("utf-8", "ignore")
+        loop = asyncio.get_running_loop()
+        try:
+            infos = await asyncio.wait_for(loop.getaddrinfo(host, None, proto=socket.IPPROTO_TCP), timeout=10.0)
+        except Exception:
+            return None, None, None, 0x04
+        ips = list({info[4][0] for info in infos})
+    elif atyp == 0x04:
+        addr_bytes = await _read_exact(reader, 16)
+        host = socket.inet_ntop(socket.AF_INET6, addr_bytes)
+        ips = [host]
+    else:
+        return None, None, None, 0x08
+    port = struct.unpack(">H", await _read_exact(reader, 2))[0]
+    return host, port, ips, None
+
+
+def _socks5_udp_parse(data):
+    if len(data) < 4:
+        return None
+    if data[2] != 0:
+        return None
+    atyp = data[3]
+    pos = 4
+    if atyp == 0x01:
+        if len(data) < pos + 4 + 2:
+            return None
+        host = socket.inet_ntoa(data[pos:pos + 4])
+        pos += 4
+    elif atyp == 0x03:
+        if len(data) < pos + 1:
+            return None
+        dlen = data[pos]
+        pos += 1
+        if dlen == 0 or len(data) < pos + dlen + 2:
+            return None
+        host = data[pos:pos + dlen].decode("utf-8", "ignore")
+        pos += dlen
+    elif atyp == 0x04:
+        if len(data) < pos + 16 + 2:
+            return None
+        host = socket.inet_ntop(socket.AF_INET6, data[pos:pos + 16])
+        pos += 16
+    else:
+        return None
+    if pos + 2 > len(data):
+        return None
+    port = struct.unpack(">H", data[pos:pos + 2])[0]
+    return atyp, host, port, data[pos + 2:]
+
+
+def _socks5_udp_reply_header(src_ip, src_port):
+    try:
+        if ":" in src_ip:
+            return b"\x00\x00\x00\x04" + socket.inet_pton(socket.AF_INET6, src_ip) + struct.pack(">H", int(src_port))
+        return b"\x00\x00\x00\x01" + socket.inet_aton(src_ip) + struct.pack(">H", int(src_port))
+    except (OSError, ValueError):
+        return None
+
+
+async def _handle_socks5_udp_associate(reader, writer, username, link):
+    uid = link.get("uid", "")
+    total_bytes = 0
+    up_flushed = 0
+    down_flushed = 0
+    sid = None
+    entry = None
+    udp_sock = None
+    try:
+        if _COUNT_TRAFFIC is not None:
+            if not await _COUNT_TRAFFIC(uid, 0):
+                await _socks_send(writer, _socks_failure_reply(0x02))
+                return
+        local = writer.get_extra_info("sockname")
+        local_ip = ""
+        if local:
+            local_ip = str(local[0])
+        try:
+            local_addr = ipaddress.ip_address(local_ip)
+        except ValueError:
+            local_addr = ipaddress.ip_address("0.0.0.0")
+        if local_addr.version == 6:
+            udp_sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+            udp_sock.bind(("::", 0))
+        else:
+            udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            udp_sock.bind(("0.0.0.0", 0))
+        udp_sock.setblocking(False)
+        udp_port = udp_sock.getsockname()[1]
+        try:
+            if local_addr.version == 6:
+                reply = b"\x05\x00\x00\x04" + socket.inet_pton(socket.AF_INET6, str(local_addr)) + struct.pack(">H", udp_port)
+            else:
+                reply = b"\x05\x00\x00\x01" + socket.inet_aton(str(local_addr)) + struct.pack(">H", udp_port)
+        except (OSError, ValueError):
+            reply = b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+        if not await _socks_send(writer, reply):
+            return
+        peer = writer.get_extra_info("peername")
+        peer_ip = ""
+        if peer:
+            peer_ip = str(peer[0])
+        try:
+            peer_addr = ipaddress.ip_address(peer_ip)
+        except ValueError:
+            peer_addr = None
+        sid = "socks5-udp-" + os.urandom(6).hex()
+        entry = {"id": sid, "username": username, "protocol": "socks5", "client_ip": peer_ip, "started_at": datetime.now(timezone.utc).isoformat(), "bytes_up": 0, "bytes_down": 0, "bytes_flushed": 0, "writer": writer}
+        ACTIVE_PROXY[sid] = entry
+        loop = asyncio.get_running_loop()
+        routes = {}
+        dns_cache = {}
+        last_activity = time.monotonic()
+
+        async def _count(n, direction):
+            nonlocal total_bytes, up_flushed, down_flushed
+            total_bytes += n
+            _STATS["socks_bytes"] += n
+            pending = 0
+            if direction == "up":
+                entry["bytes_up"] += n
+                pending = entry["bytes_up"] - up_flushed
+            else:
+                entry["bytes_down"] += n
+                pending = entry["bytes_down"] - down_flushed
+            if _COUNT_TRAFFIC is not None and pending >= 1048576:
+                if await _COUNT_TRAFFIC(uid, pending):
+                    if direction == "up":
+                        up_flushed += pending
+                    else:
+                        down_flushed += pending
+                    entry["bytes_flushed"] = up_flushed + down_flushed
+                    return True
+                return False
+            return True
+
+        async def _udp_recv():
+            return await loop.sock_recvfrom(udp_sock, 65535)
+
+        async def _control_read():
+            return await reader.read(1)
+
+        udp_task = asyncio.create_task(_udp_recv())
+        control_task = asyncio.create_task(_control_read())
+        try:
+            while True:
+                remaining = 300.0 - (time.monotonic() - last_activity)
+                if remaining <= 0:
+                    break
+                done, pending = await asyncio.wait((udp_task, control_task), timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
+                if not done:
+                    break
+                if udp_task in done:
+                    try:
+                        data, src = udp_task.result()
+                    except (ConnectionError, OSError):
+                        data = None
+                        src = None
+                    udp_task = asyncio.create_task(_udp_recv())
+                    if data is None:
+                        await asyncio.sleep(0.01)
+                        continue
+                    last_activity = time.monotonic()
+                    src_key = (str(src[0]), int(src[1]))
+                    if src_key in routes:
+                        client_src = routes[src_key]
+                        header = _socks5_udp_reply_header(str(src[0]), int(src[1]))
+                        if header is None:
+                            continue
+                        try:
+                            await loop.sock_sendto(udp_sock, header + data, client_src)
+                        except OSError:
+                            continue
+                        if not await _count(len(data), "down"):
+                            return
+                        continue
+                    if peer_addr is not None:
+                        try:
+                            src_ip = ipaddress.ip_address(str(src[0]))
+                        except ValueError:
+                            continue
+                        if src_ip != peer_addr:
+                            continue
+                    parsed = _socks5_udp_parse(data)
+                    if parsed is None:
+                        continue
+                    atyp, target_host, target_port, payload = parsed
+                    if atyp == 0x03:
+                        cached = dns_cache.get(target_host)
+                        if cached is None:
+                            try:
+                                infos = await asyncio.wait_for(loop.getaddrinfo(target_host, None, proto=socket.IPPROTO_UDP), timeout=10.0)
+                            except Exception:
+                                continue
+                            cached = list({info[4][0] for info in infos})
+                            dns_cache[target_host] = cached
+                        target_ips = _ordered_targets(cached)
+                    else:
+                        target_ips = [target_host]
+                    if not target_ips:
+                        continue
+                    used_ip = None
+                    for target_ip in target_ips:
+                        try:
+                            await loop.sock_sendto(udp_sock, payload, (target_ip, target_port))
+                            used_ip = target_ip
+                            break
+                        except OSError:
+                            if atyp == 0x03:
+                                dns_cache.pop(target_host, None)
+                            continue
+                    if used_ip is None:
+                        continue
+                    if not await _count(len(payload), "up"):
+                        return
+                    routes[(used_ip, target_port)] = src
+                if control_task in done:
+                    try:
+                        chunk = control_task.result()
+                    except (ConnectionError, OSError):
+                        chunk = b""
+                    control_task = asyncio.create_task(_control_read())
+                    if not chunk:
+                        break
+                    last_activity = time.monotonic()
+        finally:
+            for task in (udp_task, control_task):
+                try:
+                    task.cancel()
+                except (OSError, RuntimeError):
+                    pass
+            await asyncio.gather(udp_task, control_task, return_exceptions=True)
+    except (ConnectionError, asyncio.IncompleteReadError, asyncio.TimeoutError, OSError):
+        pass
+    finally:
+        if link is not None and _COUNT_TRAFFIC is not None and total_bytes - (up_flushed + down_flushed) > 0:
+            try:
+                await _COUNT_TRAFFIC(link.get("uid", ""), total_bytes - (up_flushed + down_flushed))
+            except (ConnectionError, asyncio.TimeoutError, OSError):
+                pass
+        if sid is not None:
+            ACTIVE_PROXY.pop(sid, None)
+        if udp_sock is not None:
+            try:
+                udp_sock.close()
+            except OSError:
+                pass
 
 
 async def _handle_socks5(reader, writer):
@@ -673,112 +1280,102 @@ async def _handle_socks5(reader, writer):
     down_flushed = 0
     sid = None
     entry = None
+    target_writer = None
     try:
-        greeting = await _read_exact(reader, 2)
+        try:
+            greeting = await _read_exact(reader, 2)
+        except (asyncio.IncompleteReadError, asyncio.TimeoutError, ConnectionError, OSError):
+            await _socks_send(writer, b"\x05\xff")
+            return
         if greeting[0] != 0x05:
-            writer.close()
+            await _socks_send(writer, b"\x05\xff")
             return
         nmethods = greeting[1]
-        methods = await _read_exact(reader, nmethods)
+        try:
+            methods = await _read_exact(reader, nmethods)
+        except (asyncio.IncompleteReadError, asyncio.TimeoutError, ConnectionError, OSError):
+            await _socks_send(writer, b"\x05\xff")
+            return
         if 0x02 in methods:
-            writer.write(b"\x05\x02")
+            if not await _socks_send(writer, b"\x05\x02"):
+                return
         else:
-            writer.write(b"\x05\xff")
-            await writer.drain()
-            writer.close()
+            await _socks_send(writer, b"\x05\xff")
             return
-        await writer.drain()
-        auth_head = await _read_exact(reader, 2)
-        if auth_head[0] != 0x01:
-            writer.close()
+        try:
+            auth_head = await _read_exact(reader, 2)
+            if auth_head[0] != 0x01:
+                await _socks_send(writer, b"\x01\x01")
+                return
+            ulen = auth_head[1]
+            username = (await _read_exact(reader, ulen)).decode("utf-8", "ignore")
+            plen = (await _read_exact(reader, 1))[0]
+            password = (await _read_exact(reader, plen)).decode("utf-8", "ignore")
+        except (asyncio.IncompleteReadError, asyncio.TimeoutError, ConnectionError, OSError):
+            await _socks_send(writer, b"\x01\x01")
             return
-        ulen = auth_head[1]
-        username = (await _read_exact(reader, ulen)).decode("utf-8", "ignore")
-        plen = (await _read_exact(reader, 1))[0]
-        password = (await _read_exact(reader, plen)).decode("utf-8", "ignore")
         if _AUTH_LOOKUP is not None:
             link = _AUTH_LOOKUP(username, password)
         if link is None:
-            writer.write(b"\x01\x01")
-            await writer.drain()
-            writer.close()
+            await _socks_send(writer, b"\x01\x01")
             return
         if _SESSION_ALLOWED is not None:
             peer = writer.get_extra_info("peername")
             cip = peer[0] if peer else ""
             if not _SESSION_ALLOWED(username, cip):
-                writer.write(b"\x01\x01")
-                await writer.drain()
-                writer.close()
+                await _socks_send(writer, b"\x01\x01")
                 return
-        writer.write(b"\x01\x00")
-        await writer.drain()
-        req = await _read_exact(reader, 4)
+        if not await _socks_send(writer, b"\x01\x00"):
+            return
+        try:
+            req = await _read_exact(reader, 4)
+        except (asyncio.IncompleteReadError, asyncio.TimeoutError, ConnectionError, OSError):
+            await _socks_send(writer, _socks_failure_reply(0x01))
+            return
         if req[0] != 0x05:
-            writer.close()
+            await _socks_send(writer, _socks_failure_reply(0x01))
             return
         cmd = req[1]
         atyp = req[3]
-        if cmd != 0x01:
-            writer.write(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00")
-            await writer.drain()
-            writer.close()
+        if cmd not in (0x01, 0x03):
+            await _socks_send(writer, _socks_failure_reply(0x07))
             return
-        if atyp == 0x01:
-            addr_bytes = await _read_exact(reader, 4)
-            host = socket.inet_ntoa(addr_bytes)
-            ips = [host]
-        elif atyp == 0x03:
-            dlen = (await _read_exact(reader, 1))[0]
-            host = (await _read_exact(reader, dlen)).decode("utf-8", "ignore")
-            loop = asyncio.get_running_loop()
-            try:
-                infos = await asyncio.wait_for(loop.getaddrinfo(host, None, proto=socket.IPPROTO_TCP), timeout=10.0)
-            except (OSError, asyncio.TimeoutError):
-                writer.write(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")
-                await writer.drain()
-                writer.close()
-                return
-            ips = list({info[4][0] for info in infos})
-        elif atyp == 0x04:
-            addr_bytes = await _read_exact(reader, 16)
-            host = socket.inet_ntop(socket.AF_INET6, addr_bytes)
-            ips = [host]
-        else:
-            writer.write(b"\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00")
-            await writer.drain()
-            writer.close()
+        try:
+            host, port, ips, addr_err = await _socks5_read_address(reader, atyp)
+        except (asyncio.IncompleteReadError, asyncio.TimeoutError, ConnectionError, OSError):
+            await _socks_send(writer, _socks_failure_reply(0x01))
             return
-        port = struct.unpack(">H", await _read_exact(reader, 2))[0]
+        if addr_err is not None:
+            await _socks_send(writer, _socks_failure_reply(addr_err))
+            return
+        if cmd == 0x03:
+            await _handle_socks5_udp_associate(reader, writer, username, link)
+            return
         targets = _ordered_targets(ips)
         if not targets:
-            writer.write(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")
-            await writer.drain()
-            writer.close()
+            await _socks_send(writer, _socks_failure_reply(0x04))
             return
         uid = link.get("uid", "")
         if _COUNT_TRAFFIC is not None:
             if not await _COUNT_TRAFFIC(uid, 0):
-                writer.write(b"\x05\x02\x00\x01\x00\x00\x00\x00\x00\x00")
-                await writer.drain()
-                writer.close()
+                await _socks_send(writer, _socks_failure_reply(0x02))
                 return
-        target_reader, target_writer = await _connect_target(targets, port)
+        target_reader, target_writer, rep = await _connect_target(targets, port)
         if target_writer is None:
-            writer.write(b"\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00")
-            await writer.drain()
-            writer.close()
+            await _socks_send(writer, _socks_failure_reply(rep))
             return
         bound = target_writer.get_extra_info("sockname")
-        if bound and ":" in str(bound[0]):
-            reply = b"\x05\x00\x00\x04" + socket.inet_pton(socket.AF_INET6, bound[0]) + struct.pack(">H", bound[1])
-        elif bound:
-            reply = b"\x05\x00\x00\x01" + socket.inet_aton(bound[0]) + struct.pack(">H", bound[1])
-        else:
+        try:
+            if bound and ":" in str(bound[0]):
+                reply = b"\x05\x00\x00\x04" + socket.inet_pton(socket.AF_INET6, bound[0]) + struct.pack(">H", bound[1])
+            elif bound:
+                reply = b"\x05\x00\x00\x01" + socket.inet_aton(bound[0]) + struct.pack(">H", bound[1])
+            else:
+                reply = b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+        except (OSError, ValueError):
             reply = b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00"
-        writer.write(reply)
-        await writer.drain()
-
+        if not await _socks_send(writer, reply):
+            return
         peer = writer.get_extra_info("peername")
         sid = "socks5-" + os.urandom(6).hex()
         entry = {"id": sid, "username": username, "protocol": "socks5", "client_ip": peer[0] if peer else "", "started_at": datetime.now(timezone.utc).isoformat(), "bytes_up": 0, "bytes_down": 0, "bytes_flushed": 0, "writer": writer}
@@ -849,119 +1446,163 @@ async def _handle_socks5(reader, writer):
                 pass
         if sid is not None:
             ACTIVE_PROXY.pop(sid, None)
+        if target_writer is not None:
+            try:
+                target_writer.close()
+            except OSError:
+                pass
         try:
             writer.close()
         except OSError:
             pass
 
-async def _handle_http_proxy(reader, writer):
-    _STATS["http_connections"] += 1
+
+async def _http_check_proxy_access(writer, headers):
+    creds = _parse_proxy_auth(headers)
+    if creds is None:
+        return None, "", (407, "Proxy Authentication Required", (b"Proxy-Authenticate: Basic realm=\"SulgX\"",))
+    username, password = creds
     link = None
+    if _AUTH_LOOKUP is not None:
+        link = _AUTH_LOOKUP(username, password)
+    if link is None:
+        return None, "", (407, "Proxy Authentication Required", (b"Proxy-Authenticate: Basic realm=\"SulgX\"",))
+    if _SESSION_ALLOWED is not None:
+        peer = writer.get_extra_info("peername")
+        cip = peer[0] if peer else ""
+        if not _SESSION_ALLOWED(username, cip):
+            return None, "", (403, "Forbidden", None)
+    uid = link.get("uid", "")
+    if _COUNT_TRAFFIC is not None and not await _COUNT_TRAFFIC(uid, 0):
+        return None, "", (403, "Forbidden", None)
+    return link, username, None
+
+
+def _http_register_session(writer, username):
+    peer = writer.get_extra_info("peername")
+    sid = "http-" + os.urandom(6).hex()
+    entry = {"id": sid, "username": username, "protocol": "http-proxy", "client_ip": peer[0] if peer else "", "started_at": datetime.now(timezone.utc).isoformat(), "bytes_up": 0, "bytes_down": 0, "bytes_flushed": 0, "writer": writer}
+    ACTIVE_PROXY[sid] = entry
+    return sid, entry
+
+
+async def _http_forward_exact(src, dst, count, direction, n):
+    remaining = n
+    while remaining > 0:
+        try:
+            chunk = await asyncio.wait_for(src.read(min(65536, remaining)), timeout=30.0)
+        except (asyncio.TimeoutError, ConnectionError, OSError):
+            return False
+        if not chunk:
+            return False
+        try:
+            dst.write(chunk)
+            await dst.drain()
+        except (ConnectionError, OSError):
+            return False
+        await count(len(chunk), direction)
+        remaining -= len(chunk)
+    return True
+
+
+async def _http_forward_chunked(src, dst, count, direction):
+    trailer_total = 0
+    while True:
+        try:
+            line = await asyncio.wait_for(src.readuntil(b"\r\n"), timeout=30.0)
+        except (asyncio.TimeoutError, asyncio.IncompleteReadError, asyncio.LimitOverrunError, ConnectionError, OSError):
+            return False
+        size_text = bytes(line).split(b";", 1)[0].strip()
+        try:
+            size = int(size_text, 16)
+        except ValueError:
+            return False
+        if size < 0:
+            return False
+        try:
+            dst.write(line)
+            await dst.drain()
+        except (ConnectionError, OSError):
+            return False
+        await count(len(line), direction)
+        if size == 0:
+            while True:
+                try:
+                    trailer = await asyncio.wait_for(src.readuntil(b"\r\n"), timeout=30.0)
+                except (asyncio.TimeoutError, asyncio.IncompleteReadError, asyncio.LimitOverrunError, ConnectionError, OSError):
+                    return False
+                trailer_total += len(trailer)
+                if trailer_total > 65536:
+                    return False
+                try:
+                    dst.write(trailer)
+                    await dst.drain()
+                except (ConnectionError, OSError):
+                    return False
+                await count(len(trailer), direction)
+                if trailer == b"\r\n":
+                    return True
+        if not await _http_forward_exact(src, dst, count, direction, size):
+            return False
+        try:
+            ending = await asyncio.wait_for(src.readexactly(2), timeout=30.0)
+        except (asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError, OSError):
+            return False
+        if ending != b"\r\n":
+            return False
+        try:
+            dst.write(ending)
+            await dst.drain()
+        except (ConnectionError, OSError):
+            return False
+        await count(2, direction)
+
+
+async def _http_forward_until_eof(src, dst, count, direction, deadline):
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        try:
+            chunk = await asyncio.wait_for(src.read(65536), timeout=min(30.0, remaining))
+        except (asyncio.TimeoutError, ConnectionError, OSError):
+            return False
+        if not chunk:
+            return True
+        try:
+            dst.write(chunk)
+            await dst.drain()
+        except (ConnectionError, OSError):
+            return False
+        await count(len(chunk), direction)
+
+
+async def _http_serve_connect(reader, writer, target, headers):
+    parsed = _parse_connect_authority(target)
+    if parsed is None:
+        await _http_send_error(writer, 400, "Bad Request")
+        return
+    host, port = parsed
+    link, username, error = await _http_check_proxy_access(writer, headers)
+    if error is not None:
+        await _http_send_error(writer, error[0], error[1], error[2])
+        return
+    target_reader, target_writer, reason = await _http_resolve_and_connect(host, port)
+    if target_reader is None:
+        status, phrase = _http_connect_failure_status(reason)
+        await _http_send_error(writer, status, phrase)
+        return
+    uid = link.get("uid", "")
     total_bytes = 0
     up_flushed = 0
     down_flushed = 0
     sid = None
     entry = None
-    target_writer = None
     try:
-        try:
-            head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=10.0)
-        except (asyncio.IncompleteReadError, asyncio.TimeoutError, asyncio.LimitOverrunError, ConnectionError, OSError):
-            writer.close()
-            return
-        text = head.decode("iso-8859-1", "ignore")
-        lines = text.split("\r\n")
-        parts = lines[0].split(" ")
-        if len(parts) < 2 or parts[0].upper() != "CONNECT":
-            writer.write(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            await writer.drain()
-            writer.close()
-            return
-        target = parts[1].strip()
-        if ":" not in target:
-            writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            await writer.drain()
-            writer.close()
-            return
-        host, port_text = target.rsplit(":", 1)
-        try:
-            port = int(port_text)
-        except ValueError:
-            writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            await writer.drain()
-            writer.close()
-            return
-        if port < 1 or port > 65535:
-            writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            await writer.drain()
-            writer.close()
-            return
-        headers = {}
-        for line in lines[1:]:
-            if ":" in line:
-                key, val = line.split(":", 1)
-                headers[key.strip().lower()] = val.strip()
-        username = ""
-        password = ""
-        auth = headers.get("proxy-authorization", "") or headers.get("authorization", "")
-        if auth.lower().startswith("basic "):
-            try:
-                decoded = base64.b64decode(auth[6:].strip()).decode("utf-8", "ignore")
-                if ":" in decoded:
-                    username, password = decoded.split(":", 1)
-            except (ValueError, TypeError):
-                username = ""
-                password = ""
-        if _AUTH_LOOKUP is not None:
-            link = _AUTH_LOOKUP(username, password)
-        if link is None:
-            writer.write(b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"SulgX\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            await writer.drain()
-            writer.close()
-            return
-        if _SESSION_ALLOWED is not None:
-            peer = writer.get_extra_info("peername")
-            cip = peer[0] if peer else ""
-            if not _SESSION_ALLOWED(username, cip):
-                writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                await writer.drain()
-                writer.close()
-                return
-        uid = link.get("uid", "")
-        if _COUNT_TRAFFIC is not None and not await _COUNT_TRAFFIC(uid, 0):
-            writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            await writer.drain()
-            writer.close()
-            return
-        if host.startswith("[") and host.endswith("]"):
-            host = host[1:-1]
-        loop = asyncio.get_running_loop()
-        try:
-            infos = await asyncio.wait_for(loop.getaddrinfo(host, None, proto=socket.IPPROTO_TCP), timeout=10.0)
-            ips = list({info[4][0] for info in infos})
-        except (OSError, asyncio.TimeoutError):
-            writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            await writer.drain()
-            writer.close()
-            return
-        targets = _ordered_targets(ips)
-        if not targets:
-            writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            await writer.drain()
-            writer.close()
-            return
-        target_reader, target_writer = await _connect_target(targets, port)
-        if target_writer is None:
-            writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            await writer.drain()
-            writer.close()
-            return
         writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         await writer.drain()
-        peer = writer.get_extra_info("peername")
-        sid = "http-" + os.urandom(6).hex()
-        entry = {"id": sid, "username": username, "protocol": "http-proxy", "client_ip": peer[0] if peer else "", "started_at": datetime.now(timezone.utc).isoformat(), "bytes_up": 0, "bytes_down": 0, "bytes_flushed": 0, "writer": writer}
-        ACTIVE_PROXY[sid] = entry
+        sid, entry = _http_register_session(writer, username)
+
         async def _count(n, direction):
             nonlocal total_bytes, up_flushed, down_flushed
             total_bytes += n
@@ -991,6 +1632,7 @@ async def _handle_http_proxy(reader, writer):
                         target_writer.close()
                     except OSError:
                         pass
+
         async def _relay(src, dst, direction):
             try:
                 while True:
@@ -1010,11 +1652,8 @@ async def _handle_http_proxy(reader, writer):
                         dst.close()
                     except OSError:
                         pass
+
         await asyncio.gather(_relay(reader, target_writer, "up"), _relay(target_reader, writer, "down"))
-        try:
-            target_writer.close()
-        except OSError:
-            pass
     except (ConnectionError, asyncio.IncompleteReadError, asyncio.TimeoutError, OSError):
         pass
     finally:
@@ -1025,11 +1664,243 @@ async def _handle_http_proxy(reader, writer):
                 pass
         if sid is not None:
             ACTIVE_PROXY.pop(sid, None)
-        if target_writer is not None:
+        try:
+            target_writer.close()
+        except OSError:
+            pass
+
+
+async def _http_serve_absolute(reader, writer, method, target, version, headers):
+    parsed = _parse_absolute_uri(target)
+    if parsed is None or parsed == "https":
+        await _http_send_error(writer, 400, "Bad Request")
+        return
+    host, port, authority, path = parsed
+    link, username, error = await _http_check_proxy_access(writer, headers)
+    if error is not None:
+        await _http_send_error(writer, error[0], error[1], error[2])
+        return
+    expect = _http_headers_get(headers, b"expect")
+    if expect is not None and expect.strip().lower() != b"100-continue":
+        await _http_send_error(writer, 417, "Expectation Failed")
+        return
+    te_raw = _http_headers_get(headers, b"transfer-encoding")
+    cl_raw = _http_headers_get(headers, b"content-length")
+    te_chunked = False
+    if te_raw is not None:
+        codings = [item.strip().lower() for item in bytes(te_raw).split(b",")]
+        if not codings or codings[-1] != b"chunked" or any(item == b"" for item in codings):
+            await _http_send_error(writer, 501, "Not Implemented")
+            return
+        te_chunked = True
+    content_length = None
+    if cl_raw is not None and not te_chunked:
+        seen_lengths = set()
+        for entry_name, _orig, value in headers:
+            if entry_name == b"content-length":
+                seen_lengths.add(bytes(value).strip())
+        if len(seen_lengths) != 1:
+            await _http_send_error(writer, 400, "Bad Request")
+            return
+        only_length = next(iter(seen_lengths))
+        if not only_length.isdigit():
+            await _http_send_error(writer, 400, "Bad Request")
+            return
+        content_length = int(only_length)
+    target_reader, target_writer, reason = await _http_resolve_and_connect(host, port)
+    if target_reader is None:
+        status, phrase = _http_connect_failure_status(reason)
+        await _http_send_error(writer, status, phrase)
+        return
+    uid = link.get("uid", "")
+    total_bytes = 0
+    up_flushed = 0
+    down_flushed = 0
+    sid = None
+    entry = None
+    try:
+        sid, entry = _http_register_session(writer, username)
+
+        async def _count(n, direction):
+            nonlocal total_bytes, up_flushed, down_flushed
+            total_bytes += n
+            _STATS["http_bytes"] += n
+            pending = 0
+            if entry is not None:
+                if direction == "up":
+                    entry["bytes_up"] += n
+                    pending = entry["bytes_up"] - up_flushed
+                else:
+                    entry["bytes_down"] += n
+                    pending = entry["bytes_down"] - down_flushed
+            if _COUNT_TRAFFIC is not None and pending >= 1048576:
+                if await _COUNT_TRAFFIC(uid, pending):
+                    if direction == "up":
+                        up_flushed += pending
+                    else:
+                        down_flushed += pending
+                    if entry is not None:
+                        entry["bytes_flushed"] = up_flushed + down_flushed
+                else:
+                    try:
+                        writer.close()
+                    except OSError:
+                        pass
+                    try:
+                        target_writer.close()
+                    except OSError:
+                        pass
+
+        if expect is not None:
+            writer.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+            await writer.drain()
+        conn_tokens = _http_connection_tokens(headers)
+        request_version = version if version is not None else b"HTTP/1.1"
+        out_lines = [method.encode("ascii") + b" " + bytes(path) + b" " + bytes(request_version)]
+        for entry_name, _orig_name, value in headers:
+            if entry_name == b"transfer-encoding" and te_chunked:
+                out_lines.append(entry_name + b": " + bytes(value))
+                continue
+            if entry_name in _HTTP_HOP_BY_HOP or entry_name in conn_tokens:
+                continue
+            if entry_name == b"host":
+                continue
+            if entry_name == b"expect":
+                continue
+            if entry_name == b"content-length" and te_chunked:
+                continue
+            out_lines.append(entry_name + b": " + bytes(value))
+        out_lines.append(b"Host: " + bytes(authority))
+        out_lines.append(b"Connection: close")
+        request_head = b"\r\n".join(out_lines) + b"\r\n\r\n"
+        try:
+            target_writer.write(request_head)
+            await target_writer.drain()
+        except (ConnectionError, OSError):
+            await _http_send_error(writer, 502, "Bad Gateway")
+            return
+        await _count(len(request_head), "up")
+        if te_chunked:
+            if not await _http_forward_chunked(reader, target_writer, _count, "up"):
+                await _http_send_error(writer, 400, "Bad Request")
+                return
+        elif content_length is not None:
+            if not await _http_forward_exact(reader, target_writer, _count, "up", content_length):
+                await _http_send_error(writer, 400, "Bad Request")
+                return
+        try:
+            resp_head = await asyncio.wait_for(target_reader.readuntil(b"\r\n\r\n"), timeout=30.0)
+        except asyncio.TimeoutError:
+            await _http_send_error(writer, 504, "Gateway Timeout")
+            return
+        except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, ConnectionError, OSError):
+            await _http_send_error(writer, 502, "Bad Gateway")
+            return
+        resp_parsed = _parse_http_response_head(resp_head)
+        if resp_parsed is None:
+            await _http_send_error(writer, 502, "Bad Gateway")
+            return
+        resp_version, resp_code, resp_reason, resp_headers = resp_parsed
+        resp_conn_tokens = _http_connection_tokens(resp_headers)
+        resp_te = _http_headers_get(resp_headers, b"transfer-encoding")
+        resp_cl_values = set()
+        for entry_name, _orig, value in resp_headers:
+            if entry_name == b"content-length":
+                resp_cl_values.add(bytes(value).strip())
+        no_body = method.upper() == "HEAD" or resp_code in (204, 304) or 100 <= resp_code < 200
+        body_mode = "close"
+        body_length = 0
+        if not no_body:
+            if resp_te is not None:
+                resp_codings = [item.strip().lower() for item in bytes(resp_te).split(b",")]
+                if resp_codings and resp_codings[-1] == b"chunked":
+                    body_mode = "chunked"
+                else:
+                    body_mode = "close"
+            elif resp_cl_values:
+                if len(resp_cl_values) != 1 or not next(iter(resp_cl_values)).isdigit():
+                    await _http_send_error(writer, 502, "Bad Gateway")
+                    return
+                body_mode = "length"
+                body_length = int(next(iter(resp_cl_values)))
+        status_line = bytes(resp_version) + b" " + str(resp_code).encode("ascii")
+        if resp_reason:
+            status_line += b" " + bytes(resp_reason)
+        resp_lines = [status_line]
+        for entry_name, _orig_name, value in resp_headers:
+            if entry_name == b"transfer-encoding" and resp_te is not None:
+                resp_lines.append(entry_name + b": " + bytes(value))
+                continue
+            if entry_name in _HTTP_HOP_BY_HOP or entry_name in resp_conn_tokens:
+                continue
+            if entry_name == b"content-length" and body_mode == "chunked":
+                continue
+            resp_lines.append(entry_name + b": " + bytes(value))
+        resp_lines.append(b"Connection: close")
+        response_head = b"\r\n".join(resp_lines) + b"\r\n\r\n"
+        try:
+            writer.write(response_head)
+            await writer.drain()
+        except (ConnectionError, OSError):
+            return
+        await _count(len(response_head), "down")
+        if no_body:
+            return
+        if body_mode == "chunked":
+            await _http_forward_chunked(target_reader, writer, _count, "down")
+        elif body_mode == "length":
+            await _http_forward_exact(target_reader, writer, _count, "down", body_length)
+        else:
+            await _http_forward_until_eof(target_reader, writer, _count, "down", time.monotonic() + 120.0)
+    except (ConnectionError, asyncio.IncompleteReadError, asyncio.TimeoutError, OSError):
+        pass
+    finally:
+        if link is not None and _COUNT_TRAFFIC is not None and total_bytes - (up_flushed + down_flushed) > 0:
             try:
-                target_writer.close()
-            except OSError:
+                await _COUNT_TRAFFIC(link.get("uid", ""), total_bytes - (up_flushed + down_flushed))
+            except (ConnectionError, asyncio.TimeoutError, OSError):
                 pass
+        if sid is not None:
+            ACTIVE_PROXY.pop(sid, None)
+        try:
+            target_writer.close()
+        except OSError:
+            pass
+
+
+async def _handle_http_proxy(reader, writer):
+    _STATS["http_connections"] += 1
+    try:
+        try:
+            head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=10.0)
+        except asyncio.TimeoutError:
+            await _http_send_error(writer, 408, "Request Timeout")
+            return
+        except asyncio.LimitOverrunError:
+            await _http_send_error(writer, 431, "Request Header Fields Too Large")
+            return
+        except (asyncio.IncompleteReadError, ConnectionError, OSError):
+            return
+        parsed = _parse_http_request_head(head)
+        if parsed is None:
+            await _http_send_error(writer, 400, "Bad Request")
+            return
+        method, target, version, headers = parsed
+        if method.upper() == "CONNECT":
+            await _http_serve_connect(reader, writer, target, headers)
+            return
+        lowered = bytes(target).lower()
+        if lowered.startswith(b"http://") or lowered.startswith(b"https://"):
+            await _http_serve_absolute(reader, writer, method, target, version, headers)
+            return
+        if method.upper().encode("ascii") in _HTTP_KNOWN_TOKENS:
+            await _handle_panel_forward(_PrefixedReader(reader, head), writer)
+            return
+        await _http_send_error(writer, 501, "Not Implemented")
+        return
+    except (ConnectionError, asyncio.IncompleteReadError, asyncio.TimeoutError, OSError):
+        pass
+    finally:
         try:
             writer.close()
         except OSError:
@@ -1098,6 +1969,10 @@ def _telemt_username(uid):
     return "u" + hashlib.sha256(name.encode("utf-8")).hexdigest()[:40]
 
 
+def telemt_web_username(uid):
+    return _telemt_username(uid)
+
+
 def _valid_secret_hex(value):
     return isinstance(value, str) and len(value) == 32 and all(c in _HEXDIGITS for c in value)
 
@@ -1142,7 +2017,38 @@ def _write_text(path, text):
         handle.write(text)
 
 
-def _mtproto_config_text(api_port, token, port, bootstrap_secret, users=None):
+def _telemt_tls_host_ok(value):
+    if not isinstance(value, str):
+        return False
+    text = value.strip().lower()
+    if not text or ".." in text:
+        return False
+    if text.startswith((".", "-")) or text.endswith((".", "-")):
+        return False
+    for ch in text:
+        if ch.isspace() or ch in ("/", "\\"):
+            return False
+    return True
+
+
+def _telemt_tls_set(primary, extras=None):
+    domain = str(primary or "").strip().lower()
+    if not _telemt_tls_host_ok(domain):
+        domain = "www.google.com"
+    domains = []
+    for item in extras or []:
+        text = str(item or "").strip().lower()
+        if not text or text == domain:
+            continue
+        if not _telemt_tls_host_ok(text):
+            continue
+        if text not in domains:
+            domains.append(text)
+    return domain, domains
+
+
+def _mtproto_config_text(api_port, token, port, bootstrap_secret, users=None, tls_domain="www.google.com", tls_domains=None):
+    primary, extra_domains = _telemt_tls_set(tls_domain, tls_domains)
     lines = [
         "[general]",
         "use_middle_proxy = false",
@@ -1165,7 +2071,11 @@ def _mtproto_config_text(api_port, token, port, bootstrap_secret, users=None):
         'transport = "mtproxy"',
         "",
         "[censorship]",
-        'tls_domain = "www.google.com"',
+        'tls_domain = "' + _toml_escape(primary) + '"',
+    ]
+    if extra_domains:
+        lines.append('tls_domains = ["' + '", "'.join(_toml_escape(item) for item in extra_domains) + '"]')
+    lines.extend([
         "mask = true",
         "tls_emulation = true",
         "",
@@ -1175,7 +2085,7 @@ def _mtproto_config_text(api_port, token, port, bootstrap_secret, users=None):
         "",
         "[access.users]",
         'bootstrap = "' + bootstrap_secret + '"',
-    ]
+    ])
     entries = []
     if users:
         for username in sorted(users):
@@ -1554,7 +2464,10 @@ async def _spawn_entry(entry):
     elif entry["kind"] == "mtproto":
         fields = entry["fields"]
         fields["generation"] = int(fields.get("generation") or 0) + 1
-        entry["config_text"] = _mtproto_config_text(entry["api_port"], entry["token"], entry["port"], str(fields.get("bootstrap_secret") or ""), users=_TELEMT_MTPROTO_USERS)
+        live_primary, live_extras = _telemt_tls_set(str(fields.get("tls_domain") or "www.google.com"), fields.get("tls_domains"))
+        entry["config_text"] = _mtproto_config_text(entry["api_port"], entry["token"], entry["port"], str(fields.get("bootstrap_secret") or ""), users=_TELEMT_MTPROTO_USERS, tls_domain=live_primary, tls_domains=live_extras)
+        fields["tls_domain_live"] = live_primary
+        fields["tls_domains_live"] = live_extras
         _write_text(entry["config_path"], entry["config_text"])
         entry["config_written"] = True
     elif not entry.get("config_written"):
@@ -1664,7 +2577,7 @@ def telemt_mtproto_port():
     return entry["port"]
 
 
-async def telemt_start_mtproto():
+async def telemt_start_mtproto(tls_domain=None, tls_domains=None):
     global _TELEMT_MTPROTO
     if not telemt_available():
         return {"enabled": False, "port": 0, "api_port": 0, "error": "telemt binary not found at " + _telemt_binary()}
@@ -1672,6 +2585,13 @@ async def telemt_start_mtproto():
         entry = _TELEMT_MTPROTO
         if entry is not None and entry.get("proc") is not None and entry["proc"].returncode is None and entry.get("ready"):
             return {"enabled": True, "port": entry["port"], "api_port": entry["api_port"], "error": ""}
+        prev_fields = {}
+        if entry is not None:
+            prev_fields = entry.get("fields") or {}
+        if tls_domain is None:
+            tls_domain = prev_fields.get("tls_domain")
+        if tls_domains is None:
+            tls_domains = prev_fields.get("tls_domains")
         if entry is not None:
             await _stop_entry(entry)
         base = _telemt_dir()
@@ -1681,8 +2601,8 @@ async def telemt_start_mtproto():
         port = _free_loopback_port()
         api_port = _free_loopback_port()
         token = _random_bearer()
-        fields = {"bootstrap_secret": secrets.token_hex(16)}
-        config_text = _mtproto_config_text(api_port, token, port, fields["bootstrap_secret"])
+        fields = {"bootstrap_secret": secrets.token_hex(16), "tls_domain": tls_domain, "tls_domains": tls_domains}
+        config_text = _mtproto_config_text(api_port, token, port, fields["bootstrap_secret"], tls_domain=str(tls_domain or "www.google.com"), tls_domains=tls_domains)
         entry = _new_telemt_entry("mtproto", "mtproto", run_dir, config_path, port, api_port, token)
         entry["config_text"] = config_text
         entry["fields"] = fields
@@ -1715,7 +2635,8 @@ def _rfc3339(value):
 
 
 def _write_mtproto_config(entry):
-    entry["config_text"] = _mtproto_config_text(entry["api_port"], entry["token"], entry["port"], str((entry.get("fields") or {}).get("bootstrap_secret") or ""), users=_TELEMT_MTPROTO_USERS)
+    fields = entry.get("fields") or {}
+    entry["config_text"] = _mtproto_config_text(entry["api_port"], entry["token"], entry["port"], str(fields.get("bootstrap_secret") or ""), users=_TELEMT_MTPROTO_USERS, tls_domain=str(fields.get("tls_domain") or "www.google.com"), tls_domains=fields.get("tls_domains"))
     _write_text(entry["config_path"], entry["config_text"])
 
 
@@ -1737,6 +2658,49 @@ def telemt_mtproto_generation():
         return int((entry.get("fields") or {}).get("generation") or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _telemt_mtproto_tls_live(entry):
+    fields = entry.get("fields") or {}
+    primary = str(fields.get("tls_domain_live") or fields.get("tls_domain") or "")
+    extras = fields.get("tls_domains_live")
+    if extras is None:
+        extras = fields.get("tls_domains") or []
+    if not isinstance(extras, list):
+        extras = []
+    return (primary, [str(item) for item in extras])
+
+
+def telemt_mtproto_tls():
+    entry = _TELEMT_MTPROTO
+    if entry is None:
+        return ("", [])
+    return _telemt_mtproto_tls_live(entry)
+
+
+async def telemt_mtproto_set_tls(tls_domain, tls_domains=None):
+    entry = _TELEMT_MTPROTO
+    if entry is None or not entry.get("ready"):
+        return False
+    async with _telemt_lock("mtproto-upsert"):
+        entry = _TELEMT_MTPROTO
+        if entry is None or not entry.get("ready"):
+            return False
+        wanted_primary, wanted_extras = _telemt_tls_set(tls_domain, tls_domains)
+        live_primary, live_extras = _telemt_mtproto_tls_live(entry)
+        if wanted_primary == live_primary and sorted(wanted_extras) == sorted(live_extras):
+            return True
+        fields = entry.get("fields") or {}
+        fields["tls_domain"] = wanted_primary
+        fields["tls_domains"] = wanted_extras
+        entry["fields"] = fields
+        try:
+            _write_mtproto_config(entry)
+        except OSError:
+            return False
+        if not await _restart_mtproto_entry(entry):
+            return False
+        return True
 
 
 def mtproto_counted_bytes(uid):
@@ -1784,7 +2748,7 @@ async def _telemt_mtproto_wait_live(entry, username, timeout=10.0):
     return False
 
 
-async def telemt_mtproto_upsert_user(uid, secret_hex, variant="dd", domain="www.google.com", max_conns=0, limit_bytes=0, expires_at=None):
+async def telemt_mtproto_upsert_user(uid, secret_hex, variant="dd", domain="www.google.com", max_conns=0, limit_bytes=0, expires_at=None, tls_domain=None, tls_domains=None):
     if not _valid_secret_hex(secret_hex):
         _LOG.warning("telemt MTProto upsert refused for uid %s: secret must be 32 hex characters", uid)
         return False
@@ -1802,16 +2766,40 @@ async def telemt_mtproto_upsert_user(uid, secret_hex, variant="dd", domain="www.
     async with _telemt_lock("mtproto-upsert"):
         _TELEMT_MTPROTO_USERS[username] = {"uid": str(uid), "secret_hex": secret_hex.lower(), "max_conns": int(max_conns or 0), "limit_bytes": int(limit_bytes or 0), "expires_at": expires_text}
         entry = _TELEMT_MTPROTO
+        if tls_domain is not None or tls_domains is not None:
+            if entry is not None:
+                fields = entry.get("fields") or {}
+                if tls_domain is not None:
+                    fields["tls_domain"] = tls_domain
+                if tls_domains is not None:
+                    fields["tls_domains"] = tls_domains
+                entry["fields"] = fields
         if entry is None or not entry.get("ready"):
-            started = await telemt_start_mtproto()
-            if not started.get("enabled"):
-                return False
-            entry = _TELEMT_MTPROTO
-            return await _telemt_mtproto_wait_live(entry, username)
+            if entry is not None and not entry.get("gave_up"):
+                if await _wait_entry_ready(entry, timeout=30.0):
+                    entry = _TELEMT_MTPROTO
+                else:
+                    started = await telemt_start_mtproto(tls_domain, tls_domains)
+                    if not started.get("enabled"):
+                        return False
+                    entry = _TELEMT_MTPROTO
+                    return await _telemt_mtproto_wait_live(entry, username)
+            else:
+                started = await telemt_start_mtproto(tls_domain, tls_domains)
+                if not started.get("enabled"):
+                    return False
+                entry = _TELEMT_MTPROTO
+                return await _telemt_mtproto_wait_live(entry, username)
         try:
             _write_mtproto_config(entry)
         except OSError:
             pass
+        _want_primary, _want_extras = _telemt_tls_set(str((entry.get("fields") or {}).get("tls_domain") or "www.google.com"), (entry.get("fields") or {}).get("tls_domains"))
+        _live_primary, _live_extras = _telemt_mtproto_tls_live(entry)
+        if _want_primary != _live_primary or sorted(_want_extras) != sorted(_live_extras):
+            if not await _restart_mtproto_entry(entry):
+                return False
+            return await _telemt_mtproto_wait_live(_TELEMT_MTPROTO, username)
         if await _telemt_mtproto_wait_live(entry, username, timeout=12.0):
             return True
         await _telemt_mtproto_reload(entry)
@@ -1947,112 +2935,6 @@ async def telemt_stop_web(uid):
         return True
 
 
-async def _web_patch_root(entry, enabled):
-    status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "GET", "/v1/config")
-    if status != 200 or not payload.get("ok"):
-        entry["root_error"] = "telemt config read failed: " + _telemt_api_error(payload)
-        _LOG.warning("telemt WEB root PATCH aborted for uid %s: config read failed: %s", entry["key"], _telemt_api_error(payload))
-        return False
-    try:
-        vhosts = list(((payload.get("data") or {}).get("web") or {}).get("vhosts") or [])
-    except (AttributeError, TypeError):
-        entry["root_error"] = "telemt config has no web vhosts"
-        _LOG.warning("telemt WEB root PATCH aborted for uid %s: config has no web vhosts", entry["key"])
-        return False
-    fields = entry["fields"]
-    target_base = "" if enabled else fields["web_token"]
-    replaced = False
-    new_vhosts = []
-    for vhost in vhosts:
-        if isinstance(vhost, dict) and str(vhost.get("host", "")).lower() == fields["host"]:
-            item = dict(vhost)
-            item["base_path"] = target_base
-            new_vhosts.append(item)
-            replaced = True
-        else:
-            new_vhosts.append(vhost)
-    if not replaced:
-        new_vhosts.append(_web_root_vhost(fields, enabled))
-    patched = False
-    patch_ok = False
-    status, payload = None, {}
-    for attempt in range(5):
-        status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "PATCH", "/v1/config?reload=instant", {"web": {"vhosts": new_vhosts}})
-        if status == 200 and payload.get("ok"):
-            patched = True
-            patch_ok = True
-            break
-        if status == 202 and payload.get("ok"):
-            patched = True
-            break
-        if status == 409 and _telemt_error_code(payload) == "reload_in_progress":
-            await asyncio.sleep(1.0)
-            continue
-        break
-    if not patched:
-        entry["root_error"] = "telemt config PATCH failed: " + _telemt_api_error(payload)
-        _LOG.warning("telemt WEB root PATCH failed for uid %s: %s", entry["key"], _telemt_api_error(payload))
-        return False
-    if patch_ok:
-        entry["root_error"] = ""
-        return True
-    reload_id = None
-    try:
-        reload_id = ((payload.get("data") or {}).get("reload") or {}).get("reload_id")
-    except (AttributeError, TypeError):
-        reload_id = None
-    if reload_id is None:
-        entry["root_error"] = "telemt config PATCH failed: reload id missing"
-        _LOG.warning("telemt WEB root PATCH failed for uid %s: reload id missing", entry["key"])
-        return False
-    deadline = time.monotonic() + 30.0
-    while time.monotonic() < deadline:
-        status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "GET", "/v1/system/reload/" + str(reload_id))
-        if status == 200 and payload.get("ok"):
-            state = (payload.get("data") or {}).get("state")
-            if state == "succeeded":
-                entry["root_error"] = ""
-                return True
-            if state in ("failed", "rolled_back"):
-                entry["root_error"] = "telemt config reload " + str(state) + ": " + _telemt_api_error(payload)
-                _LOG.warning("telemt WEB root reload %s for uid %s: %s", state, entry["key"], _telemt_api_error(payload))
-                return False
-        await asyncio.sleep(0.5)
-    entry["root_error"] = "telemt config reload timed out after 30s (reload stayed in preparing state)"
-    _LOG.warning("telemt WEB root reload timed out for uid %s", entry["key"])
-    return False
-
-
-async def _web_restart_with_root(key, enabled):
-    entry = _TELEMT_WEB.get(key)
-    if entry is None:
-        return False
-    entry["fields"]["root_enabled"] = bool(enabled)
-    await _stop_entry(entry)
-    _TELEMT_WEB.pop(key, None)
-    fresh = _new_telemt_entry("web", key, entry["run_dir"], entry["config_path"], entry["port"], entry["api_port"], entry["token"])
-    fresh["fields"] = entry["fields"]
-    fresh["root_error"] = ""
-    _TELEMT_WEB[key] = fresh
-    fresh["task"] = asyncio.create_task(_supervise_entry(fresh))
-    ready = await _wait_entry_ready(fresh, timeout=30.0)
-    if not ready:
-        fresh["root_error"] = "telemt WEB child did not become ready within 30s after restart: " + str(fresh.get("error") or "")
-        return False
-    base_path, base_err = await telemt_web_base_path(key)
-    if base_err:
-        fresh["root_error"] = "telemt WEB child is ready but its root vhost could not be verified: " + str(base_err)
-        return False
-    if bool(enabled) and base_path != "":
-        fresh["root_error"] = "telemt WEB child is ready but its vhost base_path is still " + repr(base_path) + " instead of root"
-        return False
-    if not bool(enabled) and base_path == "":
-        fresh["root_error"] = "telemt WEB child is ready but its vhost is still at the root instead of its token path"
-        return False
-    fresh["root_error"] = ""
-    return True
-
-
 async def telemt_web_base_path(uid):
     key = str(uid)
     entry = _TELEMT_WEB.get(key)
@@ -2077,28 +2959,6 @@ def telemt_web_root_error(uid):
     if entry is None:
         return ""
     return str(entry.get("root_error") or "")
-
-
-async def telemt_web_set_root(uid, enabled):
-    key = str(uid)
-    entry = _TELEMT_WEB.get(key)
-    if entry is None:
-        return False
-    async with _telemt_lock("web:" + key):
-        entry = _TELEMT_WEB.get(key)
-        if entry is None:
-            return False
-        if not entry.get("ready"):
-            entry["root_error"] = "telemt WEB child is not ready yet, root vhost cannot be enabled"
-            return False
-        fields = entry["fields"]
-        if bool(fields.get("root_enabled")) == bool(enabled):
-            return True
-        if await _web_patch_root(entry, bool(enabled)):
-            fields["root_enabled"] = bool(enabled)
-            return True
-        _LOG.warning("telemt WEB root PATCH path failed for uid %s; restarting child with root vhost", key)
-        return await _web_restart_with_root(key, bool(enabled))
 
 
 def _web_profile_row(item):
