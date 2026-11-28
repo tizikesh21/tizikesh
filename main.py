@@ -1940,6 +1940,7 @@ FOXHOLE_SKIP_HEADERS = {
 FOXHOLE_GET_ALLOWED_HOSTS = {
     "mozilla.org", "mozilla.com", "firefox.com",
     "github.com", "githubusercontent.com", "jsdelivr.net",
+    "www.gstatic.com",
 }
 FOXHOLE_GET_RELAY_NAME = "sulgx-foxhole"
 FOXHOLE_GET_TIMEOUT_SECONDS = 600.0
@@ -2426,6 +2427,19 @@ async def _foxhole_prune_usage():
         logger.error(f"Firefox Relay usage prune failed: {e}")
 
 
+async def _foxhole_all_time_total_bytes():
+    try:
+        row = await db_fetchone(
+            "SELECT COALESCE(SUM(bytes), 0) AS total FROM daily_traffic WHERE uid = ?",
+            "SELECT COALESCE(SUM(bytes), 0) AS total FROM daily_traffic WHERE uid = $1",
+            (FOXHOLE_RELAY_DASHBOARD_UID,),
+        )
+        return int((row or {}).get("total") or 0)
+    except Exception as e:
+        logger.error(f"Firefox Relay all-time total read failed: {e}")
+        return 0
+
+
 async def _foxhole_usage_stats(fingerprints=None):
     await _foxhole_ensure_schema()
     now = datetime.now(UTC)
@@ -2690,15 +2704,62 @@ async def _foxhole_fetch_open(item, client, request, allowlist=False):
     if payload and content_type:
         headers["content-type"] = str(content_type)
     follow = item.get("r") is not False
-    try:
-        stream = client.stream(method, url_text, headers=headers, content=payload if payload else None, follow_redirects=follow)
-        resp = await stream.__aenter__()
-    except httpx.TooManyRedirects:
-        raise _FoxholeFetchError("too many redirects", len(payload))
-    except Exception as e:
-        logger.error(f"Firefox Relay fetch failed for {method} {urlparse(url_text).hostname or ''}: {type(e).__name__}")
-        raise _FoxholeFetchError("fetch failed", len(payload), True)
-    return stream, resp, len(payload)
+    current_url = url_text
+    current_method = method
+    current_payload = payload
+    current_headers = headers
+    current_hop = hop
+    redirects = 0
+    while True:
+        try:
+            stream = client.stream(current_method, current_url, headers=current_headers, content=current_payload if current_payload else None, follow_redirects=False)
+            resp = await stream.__aenter__()
+        except httpx.TooManyRedirects:
+            raise _FoxholeFetchError("too many redirects", len(payload))
+        except Exception as e:
+            logger.error(f"Firefox Relay fetch failed for {current_method} {urlparse(current_url).hostname or ''}: {type(e).__name__}")
+            raise _FoxholeFetchError("fetch failed", len(payload), True)
+        if not follow or resp.status_code not in (301, 302, 303, 307, 308):
+            return stream, resp, len(payload)
+        location = resp.headers.get("location")
+        if not location:
+            return stream, resp, len(payload)
+        await stream.__aexit__(None, None, None)
+        redirects += 1
+        if redirects > FOXHOLE_MAX_REDIRECTS:
+            raise _FoxholeFetchError("too many redirects", len(payload))
+        next_url = urljoin(current_url, location)
+        next_parts = urlparse(next_url)
+        if next_parts.scheme.lower() not in ("http", "https") or not next_parts.hostname:
+            raise _FoxholeFetchError("fetch failed")
+        if urlparse(current_url).scheme.lower() == "https" and next_parts.scheme.lower() != "https":
+            raise _FoxholeFetchError("fetch failed")
+        next_loop_error = _foxhole_loop_error(next_url, request)
+        if next_loop_error:
+            raise _FoxholeFetchError(next_loop_error)
+        if allowlist:
+            next_allowed = FOXHOLE_GET_ALLOWED_HOSTS if allowlist is True else set(allowlist)
+            if not _foxhole_host_allowed(next_url, next_allowed):
+                raise _FoxholeFetchError("host not allowed: " + (next_parts.hostname or "").lower())
+        if not await _foxhole_target_is_public(next_url):
+            raise _FoxholeFetchError("fetch failed")
+        next_method = current_method
+        next_payload = current_payload
+        if resp.status_code == 303 or (resp.status_code in (301, 302) and current_method == "POST"):
+            next_method = "GET"
+            next_payload = b""
+        current_hop += 1
+        if current_hop > FOXHOLE_MAX_HOPS:
+            raise _FoxholeFetchError("loop detected: too many relay hops")
+        next_headers = dict(current_headers)
+        next_headers["x-mhr-hop"] = str(current_hop)
+        if next_method == "GET" and current_method != "GET":
+            next_headers.pop("content-type", None)
+            next_headers.pop("content-length", None)
+        current_url = next_url
+        current_method = next_method
+        current_payload = next_payload
+        current_headers = next_headers
 
 
 @asynccontextmanager
@@ -10867,7 +10928,7 @@ async def foxhole_relay(request: Request):
 
 
 FOXHOLE_GET_PAGE_STATES = {
-    "works": (200, "#10b981", "Working", "Your relay is ready", "Put this page's address in Arman VPN:", ["Settings", "Connection", "If Mozilla is blocked", "Cloudflare Worker"]),
+    "works": (200, "#10b981", "Working", "Your relay is ready", "Put this page's address in your Firefox client:", []),
     "wrong": (403, "#ef4444", "Wrong secret", "This address has no secret, or the wrong one", "It must end in ?secret= followed by the key set in the panel.", []),
     "unset": (503, "#f59e0b", "Not set up", "Set a secret first", "Generate a relay key in the panel first, then open this address with ?secret= at the end.", []),
     "disabled": (503, "#f59e0b", "Relay disabled", "The relay is switched off", "Enable the relay in the panel first, then open this address again.", []),
@@ -10965,7 +11026,24 @@ def _foxhole_lenient_query_params(request):
     return found
 
 
+def _foxhole_decode_relay_target(raw_target):
+    if not isinstance(raw_target, str):
+        return ""
+    lowered = raw_target.lower()
+    if lowered.startswith("http://") or lowered.startswith("https://"):
+        return raw_target
+    try:
+        cleaned = raw_target.replace(" ", "+").replace("-", "+").replace("_", "/")
+        padded = cleaned + "=" * (-len(cleaned) % 4)
+        decoded = base64.b64decode(padded, validate=True).decode("utf-8")
+    except Exception:
+        return ""
+    return decoded
+
+
 async def _foxhole_serve_get_relay(request: Request, path_slug):
+    if request.method == "OPTIONS":
+        return Response(status_code=204, headers={"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD", "Access-Control-Allow-Headers": "*", "Access-Control-Max-Age": "86400"})
     params = _foxhole_lenient_query_params(request)
     target = params.get("url")
     probe = params.get("health") == "1"
@@ -10997,6 +11075,9 @@ async def _foxhole_serve_get_relay(request: Request, path_slug):
             return _foxhole_relay_page("wrong")
         return _foxhole_relay_fail(403, "wrong secret")
     if browser:
+        accept = request.headers.get("accept", "")
+        if "application/json" in accept:
+            return JSONResponse(content={"status": "ok", "relay": FOXHOLE_GET_RELAY_NAME, "ready": bool(row) and _foxhole_row_enabled(row) and bool(plain_key)}, headers={"Cache-Control": "no-store"})
         if not _foxhole_row_enabled(row):
             return _foxhole_relay_page("disabled")
         blocked = _foxhole_relay_blocked(row)
@@ -11009,6 +11090,7 @@ async def _foxhole_serve_get_relay(request: Request, path_slug):
     if blocked:
         return _foxhole_relay_fail(403, blocked)
     try:
+        target = _foxhole_decode_relay_target(target)
         parts = urlparse(target)
     except Exception:
         return _foxhole_relay_fail(400, "url must be an https URL")
@@ -11022,7 +11104,7 @@ async def _foxhole_serve_get_relay(request: Request, path_slug):
     raw_body = await request.body()
     if len(raw_body) > FOXHOLE_MAX_REQUEST_BYTES:
         return _foxhole_relay_fail(413, "request too large")
-    item = {"u": target, "m": request.method, "h": dict(request.headers), "r": False}
+    item = {"u": target, "m": request.method, "h": dict(request.headers), "r": True}
     if raw_body:
         item["b"] = base64.b64encode(raw_body).decode()
         content_type = request.headers.get("content-type")
@@ -11100,7 +11182,9 @@ async def foxhole_status(_=Depends(require_auth)):
 async def foxhole_stats(request: Request, _=Depends(require_auth)):
     selector = (request.query_params.get("relay") or "").strip()
     if not selector:
-        return await _foxhole_usage_stats()
+        result = await _foxhole_usage_stats()
+        result["total_bytes"] = await _foxhole_all_time_total_bytes()
+        return result
     row = await _foxhole_load_row_by_slug(selector)
     if row:
         fingerprint = _foxhole_effective_fingerprint(row, _foxhole_resolve_key(row))
@@ -19916,6 +20000,9 @@ html{scroll-padding-top:84px}
 .sys-fill{height:100%;background:var(--sx-accent-solid);border-radius:var(--sx-radius-full);transition:width 300ms ease-out}
 .hc-spin{display:inline-block;width:12px;height:12px;border:2px solid var(--sx-border);border-top-color:var(--sx-accent);border-radius:50%;animation:sxSpin 800ms linear infinite;vertical-align:-2px}
 .chart-container{height:280px;width:100%;max-width:100%;position:relative}
+.charts-2col{display:grid;grid-template-columns:1fr 1fr;gap:12px;min-width:0}
+.charts-2col>.card{min-width:0}
+@media (max-width:768px){.charts-2col{grid-template-columns:1fr}}
 .chart-container canvas{max-width:100%}
 .tbl-wrap{overflow-x:auto;overflow-y:auto;-webkit-overflow-scrolling:touch;border:1px solid var(--sx-border);border-radius:var(--sx-radius-lg);background:var(--sx-surface);max-height:560px}
 .tbl{border-collapse:collapse;min-width:560px;width:100%}
@@ -20270,7 +20357,10 @@ body[dir="rtl"] .row-act-grid{flex-direction:row}
       <div class="card"><div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg></span><span class="card-title" data-en="Protocols" data-fa="پروتکل‌ها">Protocols</span></span></div><div id="proto-summary" style="display:flex;flex-wrap:wrap;gap:8px;min-height:24px;"></div></div>
       <div class="card" id="dash-health-card" style="display:none;"><div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></span><span class="card-title" data-en="Protocol Health" data-fa="سلامت پروتکل">Protocol Health</span></span></div><div id="dash-health"></div></div>
       <div class="card"><div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg></span><span class="card-title" data-en="Hourly Traffic" data-fa="ترافیک ساعتی">Hourly Traffic</span></span></div><div class="chart-container"><canvas id="tc"></canvas></div></div>
+      <div class="charts-2col">
       <div class="card"><div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg></span><span class="card-title" data-en="Usage Distribution" data-fa="توزیع مصرف">Usage Distribution</span></span></div><div class="chart-container"><canvas id="doughnut-chart"></canvas></div><div id="doughnut-total" style="text-align:center;color:var(--text-3);font-size:0.85rem;padding:4px 0 8px;"></div></div>
+      <div class="card"><div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.21 15.89A10 10 0 1 1 8 2.83"/><path d="M22 12A10 10 0 0 0 12 2v10z"/></svg></span><span class="card-title" data-en="Usage by Protocol" data-fa="مصرف بر حسب پروتکل">Usage by Protocol</span></span></div><div class="chart-container"><canvas id="protocol-chart"></canvas></div><div id="protocol-total" style="text-align:center;color:var(--text-3);font-size:0.85rem;padding:4px 0 8px;"></div></div>
+      </div>
       <div class="card"><div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg></span><span class="card-title" data-en="Live Speed" data-fa="سرعت زنده">Live Speed</span></span></div><div class="chart-container"><canvas id="speed-chart"></canvas></div></div>
       <div class="card">
   <div class="card-hd">
@@ -21476,6 +21566,8 @@ const i18n = {
     invalidJsonTemplates: 'Invalid JSON in templates',
     largeRange: 'Large range: only first {n} IPs extracted.',
     links: 'Links',
+    firefoxRelay: 'Firefox Relay',
+    protocols: 'Protocols',
     linksBtn: 'Links',
     listenerDisabled: '(listener disabled)',
     nameRequired: 'Name required',
@@ -21692,6 +21784,8 @@ const i18n = {
     invalidJsonTemplates: 'JSON قالب‌ها نامعتبر است',
     largeRange: 'رنج بزرگ: فقط {n} آی‌پی اول استخراج شد.',
     links: 'لینک‌ها',
+    firefoxRelay: 'رله فایرفاکس',
+    protocols: 'پروتکل‌ها',
     linksBtn: 'لینک‌ها',
     listenerDisabled: '(شنونده غیرفعال)',
     nameRequired: 'نام الزامی است',
@@ -21906,6 +22000,8 @@ const stealth_i18n = {
     invalidJsonTemplates: 'Invalid JSON in templates',
     largeRange: 'Large range: only first {n} IPs extracted.',
     links: 'Links',
+    firefoxRelay: 'Firefox Relay',
+    protocols: 'Protocols',
     linksBtn: 'Links',
     listenerDisabled: '(listener disabled)',
     nameRequired: 'Name required',
@@ -22045,6 +22141,8 @@ const stealth_i18n = {
     invalidJsonTemplates: 'JSON قالب‌ها نامعتبر است',
     largeRange: 'رنج بزرگ: فقط {n} آی‌پی اول استخراج شد.',
     links: 'لینک‌ها',
+    firefoxRelay: 'رله فایرفاکس',
+    protocols: 'پروتکل‌ها',
     linksBtn: 'لینک‌ها',
     listenerDisabled: '(شنونده غیرفعال)',
     nameRequired: 'نام الزامی است',
@@ -23484,12 +23582,14 @@ function initChartsSafe(){
   if (typeof Chart === 'undefined') {
     setChartEmpty('tc', true, t('chartLibFailed'));
     setChartEmpty('doughnut-chart', true, t('chartLibFailed'));
+    setChartEmpty('protocol-chart', true, t('chartLibFailed'));
     setChartEmpty('speed-chart', true, t('chartLibFailed'));
-    setTimeout(() => { if (typeof Chart !== 'undefined') { initChart(); initDoughnutChart(); initSpeedChart(); setChartEmpty('tc', false); setChartEmpty('doughnut-chart', false); setChartEmpty('speed-chart', false); updChart(); updDoughnutChart(); } }, 1500);
+    setTimeout(() => { if (typeof Chart !== 'undefined') { initChart(); initDoughnutChart(); initProtocolChart(); initSpeedChart(); setChartEmpty('tc', false); setChartEmpty('doughnut-chart', false); setChartEmpty('protocol-chart', false); setChartEmpty('speed-chart', false); updChart(); updDoughnutChart(); updProtocolChart(); } }, 1500);
     return;
   }
   try { initChart(); } catch(e) { console.error('initChart failed', e); setChartEmpty('tc', true, t('chartFailed')); }
   try { initDoughnutChart(); } catch(e) { console.error('initDoughnutChart failed', e); setChartEmpty('doughnut-chart', true, t('chartFailed')); }
+  try { initProtocolChart(); } catch(e) { console.error('initProtocolChart failed', e); setChartEmpty('protocol-chart', true, t('chartFailed')); }
   try { initSpeedChart(); } catch(e) { console.error('initSpeedChart failed', e); setChartEmpty('speed-chart', true, t('chartFailed')); }
   } catch(e) { console.error('initChartsSafe failed', e); }
 }
@@ -24289,6 +24389,7 @@ function filterLinks() {
     usageViewReady = true;
     renderLinks(r);
     updDoughnutChart();
+    updProtocolChart();
 }
 function numUsed(l){const v=Number(l&&l.used_bytes)||0;return v>0?v:0;}
 function linkDisplayLabel(l){const f=l&&l.flag?codeText(l.flag):'';const lbl=(l&&l.label==='This Server is Free')?t('This Server is Free'):(l&&l.label?l.label:'');return (f?f+' ':'')+lbl;}
@@ -25346,6 +25447,8 @@ async function loadStats() {
 
     updChart();
     updDoughnutChart();
+    updProtocolChart();
+    loadRelayBytes();
     return true;
   } catch (err) {
     if (err.message === 'Unauthorized') {
@@ -25418,6 +25521,49 @@ function updDoughnutChart(){
   doughnutChart.update();
   const tot=$m('doughnut-total');
   if(tot)tot.textContent=t('totalWord')+' '+fmtB(total)+' ('+rows.length+' '+t('links')+')';
+}
+let protocolChart=null;
+let relayBytesTotal=0;
+const PROTOCOL_COLORS={'vless-ws':'rgb(59,130,246)','vmess-ws':'rgb(139,92,246)','trojan-ws':'rgb(239,68,68)','ss-ws':'rgb(245,158,11)','socks5':'rgb(34,197,94)','mtproto':'rgb(6,182,212)','webproxy':'rgb(236,72,153)','http-proxy':'rgb(132,204,22)'};
+const PROTOCOL_COLOR_FALLBACK=['rgb(20,184,166)','rgb(168,85,247)','rgb(234,179,8)','rgb(14,165,233)','rgb(100,116,139)'];
+const RELAY_SLICE_COLOR='rgb(249,115,22)';
+function protocolColor(p){if(PROTOCOL_COLORS[p])return PROTOCOL_COLORS[p];let h=0;for(let i=0;i<p.length;i++){h=(h*31+p.charCodeAt(i))%997;}return PROTOCOL_COLOR_FALLBACK[h%PROTOCOL_COLOR_FALLBACK.length];}
+function protocolRows(){
+  const byProto={};
+  const order=[];
+  for(const l of usageRows()){
+    const p=(l&&l.protocol)||'vless-ws';
+    const v=numUsed(l);
+    if(v<=0)continue;
+    if(!(p in byProto)){byProto[p]=0;order.push(p);}
+    byProto[p]+=v;
+  }
+  const rows=order.map(p=>({label:protoShort(p),bytes:byProto[p],color:protocolColor(p)}));
+  if(relayBytesTotal>0)rows.push({label:t('firefoxRelay'),bytes:relayBytesTotal,color:RELAY_SLICE_COLOR});
+  return rows;
+}
+function initProtocolChart(){const ctx=$m('protocol-chart');if(!ctx||protocolChart)return;if(typeof Chart==='undefined'){setChartEmpty('protocol-chart',true,t('chartLibFailed'));return;}protocolChart=new Chart(ctx,{type:'doughnut',data:{labels:[],datasets:[{data:[],backgroundColor:[]}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'bottom'},tooltip:{callbacks:{label:ctx=>`${ctx.label}: ${fmtB(ctx.raw)}`}}}}});}
+function updProtocolChart(){
+  if(!protocolChart)return;
+  const rows=protocolRows();
+  const total=rows.reduce((s,r)=>s+r.bytes,0);
+  setChartEmpty('protocol-chart',total<=0,t('noUsageData'));
+  protocolChart.data.labels=rows.map(r=>r.label);
+  protocolChart.data.datasets[0].data=rows.map(r=>r.bytes);
+  protocolChart.data.datasets[0].backgroundColor=rows.map(r=>r.color);
+  protocolChart.update();
+  const tot=$m('protocol-total');
+  if(tot)tot.textContent=t('totalWord')+' '+fmtB(total)+' ('+rows.length+' '+t('protocols')+')';
+}
+async function loadRelayBytes(){
+  try{
+    const r=await authenticatedFetch('/api/foxhole/stats');
+    if(!r.ok)return;
+    const d=await r.json();
+    const v=Number(d&&d.total_bytes);
+    if(isFinite(v)&&v>=0)relayBytesTotal=v;
+  }catch(e){}
+  updProtocolChart();
 }
 let speedChart=null,speedHistory=[];
 function initSpeedChart(){
