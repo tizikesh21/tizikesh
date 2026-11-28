@@ -1,10 +1,3 @@
-FROM python:3.11-slim AS builder
-WORKDIR /app
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
-COPY requirements.txt .
-RUN pip install --user --no-cache-dir -r requirements.txt
-
 FROM python:3.11-slim AS telemt
 ARG TARGETARCH
 ARG TELEMT_VERSION=3.5.17
@@ -28,7 +21,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 FROM python:3.11-slim
 WORKDIR /app
 ENV HOME=/home/sulgx \
-    PATH=/home/sulgx/.local/bin:$PATH \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 RUN apt-get update && apt-get install -y --no-install-recommends \
