@@ -13,7 +13,7 @@ services:
       - HTTP_PROXY_PORT=0
 
     ports:
-      - "${PORT:-8000}:${PORT:-8000}"
+      - "8000:8000"
 
     volumes:
       - sulgx-data:/data
