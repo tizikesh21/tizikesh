@@ -10934,8 +10934,39 @@ async def foxhole_get_relay_slug(request: Request, slug: str):
     return await _foxhole_serve_get_relay(request, slug)
 
 
+def _foxhole_lenient_query_params(request):
+    raw = request.scope.get("query_string", b"")
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "replace")
+    found = {}
+    current = ""
+    tokens = re.split(r"([?&])", raw)
+    index = 0
+    while index < len(tokens):
+        segment = tokens[index]
+        separator = tokens[index - 1] if index > 0 else ""
+        if segment:
+            decoded = unquote(segment.replace("+", " "))
+            if "=" in segment:
+                key, value = decoded.split("=", 1)
+                if key in ("secret", "url", "health"):
+                    if key not in found:
+                        found[key] = value
+                        current = key
+                    else:
+                        current = ""
+                elif current == "url":
+                    found["url"] = found.get("url", "") + separator + decoded
+                else:
+                    current = ""
+            elif current == "url":
+                found["url"] = found.get("url", "") + separator + decoded
+        index += 2
+    return found
+
+
 async def _foxhole_serve_get_relay(request: Request, path_slug):
-    params = request.query_params
+    params = _foxhole_lenient_query_params(request)
     target = params.get("url")
     probe = params.get("health") == "1"
     browser = target is None and not probe
@@ -11325,332 +11356,6 @@ FOXHOLE_PING_RECEIVE_URL = "https://vpn.mozilla.org/"
 FOXHOLE_PING_SEND_URL = "https://api.accounts.firefox.com/v1/oauth/token"
 FOXHOLE_PING_SEND_BODY = b'{"client_id": "5882386c6d801776", "grant_type": "fxa-credentials", "scope": "profile https://identity.mozilla.com/apps/vpn", "ttl": 86400}'
 FOXHOLE_PING_SETTINGS_KEY = "foxhole_last_ping"
-FOXHOLE_CODE_GS = r"""var RELAY_AUTH_PROPERTY = "RELAY_AUTH_KEY";
-var RELAY_QUOTA_PROPERTY_PREFIX = "RELAY_USE_";
-var RELAY_DAILY_FETCH_CAP = 18000;
-var MAX_POST_BYTES = 16777216;
-var MAX_PAYLOAD_BYTES = 10485760;
-var MAX_RESPONSE_BYTES = 20971520;
-var MAX_BATCH_ITEMS = 50;
-var MAX_URL_CHARS = 8192;
-var MAX_HEADER_COUNT = 64;
-var MAX_HEADER_VALUE_CHARS = 16384;
-var MIN_GZIP_BYTES = 1024;
-
-var SKIP_HEADERS = {
-  host: 1, connection: 1, "content-length": 1,
-  "transfer-encoding": 1, "proxy-connection": 1, "proxy-authorization": 1,
-  "priority": 1, te: 1,
-  "x-forwarded-for": 1, "x-forwarded-host": 1, "x-forwarded-proto": 1,
-  "x-forwarded-port": 1, "x-real-ip": 1, "forwarded": 1, "via": 1,
-  "x-mhr-hop": 1,
-  "accept-encoding": 1
-};
-
-var _GAS_URL_RE = /^https?:\x2f\x2fscript\.google\.com\x2fmacros\x2f/i;
-var _HTTP_URL_RE = /^https?:\x2f\x2f/i;
-var _NO_GZIP_TYPE_RE = /^(image|video|audio)\x2f/i;
-
-var SAFE_REPLAY_METHODS = { GET: 1, HEAD: 1, OPTIONS: 1 };
-var ALLOWED_METHODS = { GET: 1, HEAD: 1, POST: 1, PUT: 1, PATCH: 1, DELETE: 1, OPTIONS: 1 };
-
-function doPost(e) {
-  try {
-    if (!e || !e.postData || typeof e.postData.contents !== "string") {
-      return _json({ e: "bad request" });
-    }
-    if (e.postData.contents.length > MAX_POST_BYTES) {
-      return _json({ e: "request too large" });
-    }
-    var req;
-    try {
-      req = JSON.parse(e.postData.contents);
-    } catch (parseErr) {
-      return _json({ e: "bad json" });
-    }
-    if (!req || typeof req !== "object") {
-      return _json({ e: "bad request" });
-    }
-    var key = _authKey();
-    if (!key || !_keysEqual(String(req.k || ""), key)) {
-      return _json({ e: "unauthorized" });
-    }
-    if (Array.isArray(req.q)) return _doBatch(req.q);
-    return _doSingle(req);
-  } catch (err) {
-    return _json({ e: _errText(err) });
-  }
-}
-
-function _authKey() {
-  try {
-    var key = PropertiesService.getScriptProperties().getProperty(RELAY_AUTH_PROPERTY);
-    if (typeof key === "string" && key.length > 0) return key;
-  } catch (err) {}
-  return null;
-}
-
-function _keysEqual(a, b) {
-  if (typeof a !== "string" || typeof b !== "string") return false;
-  var n = Math.max(a.length, b.length);
-  var diff = a.length === b.length ? 0 : 1;
-  for (var i = 0; i < n; i++) {
-    var ca = i < a.length ? a.charCodeAt(i) : 0;
-    var cb = i < b.length ? b.charCodeAt(i) : 0;
-    diff = diff | (ca ^ cb);
-  }
-  return diff === 0;
-}
-
-function _errText(err) {
-  if (err && typeof err.message === "string" && err.message.length > 0) return err.message;
-  return String(err);
-}
-
-function _todayKey() {
-  var d = new Date();
-  var m = d.getUTCMonth() + 1;
-  var day = d.getUTCDate();
-  return d.getUTCFullYear() + "-" + (m < 10 ? "0" + m : "" + m) + "-" + (day < 10 ? "0" + day : "" + day);
-}
-
-function _checkQuota(n) {
-  try {
-    var props = PropertiesService.getScriptProperties();
-    var name = RELAY_QUOTA_PROPERTY_PREFIX + _todayKey();
-    var used = parseInt(props.getProperty(name) || "0", 10);
-    if (isNaN(used)) used = 0;
-    if (used + n > RELAY_DAILY_FETCH_CAP) return false;
-    props.setProperty(name, String(used + n));
-    return true;
-  } catch (err) {
-    return true;
-  }
-}
-
-function _checkUrl(u) {
-  if (!u || typeof u !== "string" || u.length > MAX_URL_CHARS || !_HTTP_URL_RE.test(u)) {
-    return "bad url";
-  }
-  if (_GAS_URL_RE.test(u)) {
-    return "loop detected: relay target cannot be a Google Apps Script URL";
-  }
-  return null;
-}
-
-function _checkMethod(m) {
-  var method = String(m || "GET").toUpperCase();
-  if (!ALLOWED_METHODS[method]) return "bad method";
-  return null;
-}
-
-function _headerValue(headers, name) {
-  if (!headers || typeof headers !== "object") return "";
-  var want = name.toLowerCase();
-  for (var k in headers) {
-    if (Object.prototype.hasOwnProperty.call(headers, k) && k.toLowerCase() === want) {
-      return String(headers[k]);
-    }
-  }
-  return "";
-}
-
-function _maybeGzip(bytes, contentType) {
-  if (bytes.length < MIN_GZIP_BYTES) return { b: bytes, gz: false };
-  var ct = String(contentType || "").toLowerCase();
-  if (_NO_GZIP_TYPE_RE.test(ct) || ct.indexOf("zip") !== -1 || ct.indexOf("gzip") !== -1 ||
-      ct.indexOf("octet-stream") !== -1 || ct.indexOf("pdf") !== -1) {
-    return { b: bytes, gz: false };
-  }
-  try {
-    var compressed = Utilities.gzip(Utilities.newBlob(bytes)).getBytes();
-    if (compressed.length < bytes.length) {
-      return { b: compressed, gz: true };
-    }
-  } catch (e) {}
-  return { b: bytes, gz: false };
-}
-
-function _resultOf(resp) {
-  var content = resp.getContent();
-  if (content.length > MAX_RESPONSE_BYTES) {
-    return { e: "response too large" };
-  }
-  var headers = _respHeaders(resp);
-  var gz = _maybeGzip(content, _headerValue(headers, "content-type"));
-  var result = {
-    s: resp.getResponseCode(),
-    h: headers,
-    b: Utilities.base64Encode(gz.b)
-  };
-  if (gz.gz) result.gz = 1;
-  return result;
-}
-
-function _doSingle(req) {
-  var urlErr = _checkUrl(req.u);
-  if (urlErr) return _json({ e: urlErr });
-  var methodErr = _checkMethod(req.m);
-  if (methodErr) return _json({ e: methodErr });
-  var opts = _buildOpts(req);
-  if (!_checkQuota(1)) return _json({ e: "quota exceeded" });
-  var resp = UrlFetchApp.fetch(req.u, opts);
-  return _json(_resultOf(resp));
-}
-
-function _doBatch(items) {
-  if (items.length > MAX_BATCH_ITEMS) {
-    return _json({ e: "batch too large" });
-  }
-  var fetchArgs = [];
-  var fetchIndex = [];
-  var fetchMethods = [];
-  var errorMap = {};
-
-  for (var i = 0; i < items.length; i++) {
-    var item = items[i];
-    if (!item || typeof item !== "object") {
-      errorMap[i] = "bad item";
-      continue;
-    }
-    var urlErr = _checkUrl(item.u);
-    if (urlErr) {
-      errorMap[i] = urlErr;
-      continue;
-    }
-    var methodErr = _checkMethod(item.m);
-    if (methodErr) {
-      errorMap[i] = methodErr;
-      continue;
-    }
-    try {
-      var opts = _buildOpts(item);
-      opts.url = item.u;
-      fetchArgs.push(opts);
-      fetchIndex.push(i);
-      fetchMethods.push(String(item.m || "GET").toUpperCase());
-    } catch (err) {
-      errorMap[i] = _errText(err);
-    }
-  }
-
-  var responses = [];
-  if (fetchArgs.length > 0) {
-    if (!_checkQuota(fetchArgs.length)) {
-      return _json({ e: "quota exceeded" });
-    }
-    try {
-      responses = UrlFetchApp.fetchAll(fetchArgs);
-    } catch (err) {
-      responses = [];
-      for (var j = 0; j < fetchArgs.length; j++) {
-        try {
-          if (!SAFE_REPLAY_METHODS[fetchMethods[j]]) {
-            errorMap[fetchIndex[j]] = "batch fetchAll failed; unsafe method not replayed";
-            responses[j] = null;
-            continue;
-          }
-          if (!_checkQuota(1)) {
-            errorMap[fetchIndex[j]] = "quota exceeded";
-            responses[j] = null;
-            continue;
-          }
-          var fallbackReq = fetchArgs[j];
-          var fallbackUrl = fallbackReq.url;
-          var fallbackOpts = {};
-          for (var key in fallbackReq) {
-            if (Object.prototype.hasOwnProperty.call(fallbackReq, key) && key !== "url") {
-              fallbackOpts[key] = fallbackReq[key];
-            }
-          }
-          responses[j] = UrlFetchApp.fetch(fallbackUrl, fallbackOpts);
-        } catch (singleErr) {
-          errorMap[fetchIndex[j]] = _errText(singleErr);
-          responses[j] = null;
-        }
-      }
-    }
-  }
-
-  var respOf = {};
-  for (var j = 0; j < fetchIndex.length; j++) respOf[fetchIndex[j]] = responses[j];
-  var results = [];
-  for (var i = 0; i < items.length; i++) {
-    if (Object.prototype.hasOwnProperty.call(errorMap, i)) {
-      results.push({ e: errorMap[i] });
-    } else {
-      var resp = respOf[i];
-      if (!resp) {
-        results.push({ e: "fetch failed" });
-      } else {
-        results.push(_resultOf(resp));
-      }
-    }
-  }
-  return _json({ q: results });
-}
-
-function _buildOpts(req) {
-  var method = String(req.m || "GET").toUpperCase();
-  var opts = {
-    method: method.toLowerCase(),
-    muteHttpExceptions: true,
-    followRedirects: req.r !== false,
-    validateHttpsCertificates: true,
-    escaping: false
-  };
-  var headers = { "x-mhr-hop": "1" };
-  var count = 1;
-  if (req.h && typeof req.h === "object") {
-    for (var k in req.h) {
-      if (!Object.prototype.hasOwnProperty.call(req.h, k)) continue;
-      if (SKIP_HEADERS[k.toLowerCase()]) continue;
-      var v = req.h[k];
-      if (v === null || v === undefined) continue;
-      var text = String(v);
-      if (text.length > MAX_HEADER_VALUE_CHARS) throw new Error("bad headers");
-      count++;
-      if (count > MAX_HEADER_COUNT) throw new Error("bad headers");
-      headers[k] = text;
-    }
-  }
-  opts.headers = headers;
-  if (req.b) {
-    var payload = Utilities.base64Decode(req.b);
-    if (payload.length > MAX_PAYLOAD_BYTES) throw new Error("payload too large");
-    opts.payload = payload;
-    if (req.ct) opts.contentType = req.ct;
-  }
-  return opts;
-}
-
-function _respHeaders(resp) {
-  try {
-    if (typeof resp.getAllHeaders === "function") {
-      return resp.getAllHeaders();
-    }
-  } catch (err) {}
-  return resp.getHeaders();
-}
-
-function doGet(e) {
-  return HtmlService.createHtmlOutput(
-    "<!DOCTYPE html><html><head><title>My App</title></head>" +
-      '<body style="font-family:sans-serif;max-width:600px;margin:40px auto">' +
-      "<h1>Welcome</h1><p>This application is running normally.</p>" +
-      "</body></html>"
-  );
-}
-
-function _json(obj) {
-  var text = JSON.stringify(obj).replace(/[<>&]/g, function (c) {
-    return "\\u00" + c.charCodeAt(0).toString(16);
-  });
-  return HtmlService.createHtmlOutput(text).setXFrameOptionsMode(
-    HtmlService.XFrameOptionsMode.ALLOWALL
-  );
-}
-"""
 
 
 async def _foxhole_ping_load():
@@ -11738,12 +11443,6 @@ async def foxhole_ping(request: Request, _=Depends(require_auth)):
     await _foxhole_ping_save(record)
     log_event("Firefox Relay", f"Relay ping {relay_slug} receive {receive_url} {receive['ms']} ms status {receive['status']}; send {send_url} {send['ms']} ms status {send['status']}")
     return record
-
-
-@app.get("/api/foxhole/code.gs")
-async def foxhole_code_gs(_=Depends(require_auth)):
-    data = FOXHOLE_CODE_GS.encode("utf-8")
-    return Response(content=data, media_type="text/plain; charset=utf-8", headers={"Content-Disposition": "attachment; filename=\"Code.gs\"", "Cache-Control": "no-store"})
 
 
 async def _resolve_owner_name(name):
@@ -20759,52 +20458,8 @@ example.com
     <section class="page" id="page-foxhole-relay">
       <div class="page-header"><div><div class="page-title" data-en="Firefox Relay" data-fa="رله فایرفاکس">Firefox Relay</div><div class="page-sub" data-en="Use your own panel as the relay for Firefox IP Protection (foxhole) instead of a Google Apps Script deployment." data-fa="از پنل خودتان به‌جای Google Apps Script به‌عنوان رله برای Firefox IP Protection (foxhole) استفاده کنید.">Use your own panel as the relay for Firefox IP Protection (foxhole) instead of a Google Apps Script deployment.</div></div><div style="display:flex;gap:6px;flex-wrap:wrap;"><button class="btn btn-outline btn-sm" onclick="loadFoxholeRelay()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg></span><span data-en="Refresh" data-fa="بروزرسانی">Refresh</span></button></div></div>
       <div class="card">
-        <div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg></span><span class="card-title" data-en="Client Relay Link" data-fa="پیوند رله کلاینت">Client Relay Link</span></span></div>
-        <div style="color:var(--text-3);font-size:0.9rem;padding-bottom:8px;" data-en="Paste this whole link into your client: Settings &gt; Connection &gt; &quot;If Mozilla is blocked&quot; &gt; &quot;Cloudflare Worker&quot;. It is a URL + secret, no port, and rides this panel's own HTTPS address." data-fa="این پیوند کامل را در کلاینت خود جای‌گذاری کنید: Settings &gt; Connection &gt; «If Mozilla is blocked» &gt; «Cloudflare Worker». این پیوند یک نشانی + کلید است، بدون پورت، و روی همان نشانی HTTPS خود پنل سوار می‌شود.">Paste this whole link into your client: Settings &gt; Connection &gt; &quot;If Mozilla is blocked&quot; &gt; &quot;Cloudflare Worker&quot;. It is a URL + secret, no port, and rides this panel's own HTTPS address.</div>
-        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg></span> <span data-en="Relay link" data-fa="پیوند رله">Relay link</span></label><div style="display:flex;gap:6px;align-items:center;"><code id="foxhole-client-link" style="direction:ltr;unicode-bidi:plaintext;flex:1;overflow-wrap:anywhere;">–</code><button class="btn btn-outline btn-sm" id="foxhole-client-link-copy-btn" onclick="foxholeCopyClientLink()" disabled><span data-en="Copy Link" data-fa="کپی پیوند">Copy Link</span></button></div></div>
-        <div id="foxhole-client-link-note" style="color:var(--text-3);font-size:0.85rem;padding:2px 0 8px;">Link masked — the key is shown only once. Rotate the key to get a new link.</div>
-        <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;"><a class="btn btn-outline btn-sm" id="foxhole-status-page-link" href="/relay" target="_blank" rel="noopener"><span data-en="Open relay status page" data-fa="باز کردن صفحه وضعیت رله">Open relay status page</span></a><span style="color:var(--text-3);font-size:0.85rem;" data-en="Opening the full link shows Working; opening the bare relay address without the secret shows Wrong secret." data-fa="باز کردن پیوند کامل «Working» را نشان می‌دهد؛ باز کردن نشانی خالی رله بدون کلید «Wrong secret» را نشان می‌دهد.">Opening the full link shows Working; opening the bare relay address without the secret shows Wrong secret.</span></div>
-      </div>
-      <div class="card">
-        <div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg></span><span class="card-title" data-en="Relay Status" data-fa="وضعیت رله">Relay Status</span></span><span id="foxhole-status-pill" class="tag tag-off" data-en="Disabled" data-fa="غیرفعال">Disabled</span></div>
-        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg></span> <span data-en="Relay URL" data-fa="نشانی رله">Relay URL</span></label><div style="display:flex;gap:6px;align-items:center;"><code id="foxhole-relay-url" style="direction:ltr;unicode-bidi:plaintext;flex:1;overflow-wrap:anywhere;">–</code><button class="btn btn-outline btn-sm" onclick="foxholeCopyRelayUrl()"><span data-en="Copy" data-fa="کپی">Copy</span></button></div></div>
-        <div id="foxhole-config-line" style="color:var(--text-3);font-size:0.9rem;padding:2px 0 8px;">–</div>
-        <div id="foxhole-health-line" style="color:var(--text-3);font-size:0.9rem;padding:2px 0 8px;">–</div>
-        <div style="display:flex;gap:6px;flex-wrap:wrap;">
-          <button class="btn btn-primary btn-sm" id="foxhole-enable-btn" onclick="foxholeRelayToggle(true)"><span data-en="Enable" data-fa="فعال‌سازی">Enable</span></button>
-          <button class="btn btn-outline btn-sm" id="foxhole-disable-btn" onclick="foxholeRelayToggle(false)"><span data-en="Disable" data-fa="غیرفعال‌سازی">Disable</span></button>
-        </div>
-      </div>
-      <div class="card">
-        <div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg></span><span class="card-title" data-en="Usage" data-fa="مصرف">Usage</span></span></div>
-        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;">
-          <div><div style="color:var(--text-3);font-size:0.85rem;" data-en="Requests" data-fa="درخواست‌ها">Requests</div><div id="foxhole-stat-requests" style="font-weight:700;font-size:1.1rem;">–</div></div>
-          <div><div style="color:var(--text-3);font-size:0.85rem;" data-en="Bytes Up" data-fa="بایت ارسالی">Bytes Up</div><div id="foxhole-stat-up" style="font-weight:700;font-size:1.1rem;">–</div></div>
-          <div><div style="color:var(--text-3);font-size:0.85rem;" data-en="Bytes Down" data-fa="بایت دریافتی">Bytes Down</div><div id="foxhole-stat-down" style="font-weight:700;font-size:1.1rem;">–</div></div>
-          <div><div style="color:var(--text-3);font-size:0.85rem;" data-en="Last Used" data-fa="آخرین استفاده">Last Used</div><div id="foxhole-stat-last" style="font-weight:700;font-size:1.1rem;direction:ltr;text-align:left;">–</div></div>
-        </div>
-      </div>
-      <div class="card">
-        <div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></span><span class="card-title" data-en="Relay Stats" data-fa="آمار رله">Relay Stats</span></span></div>
-        <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-bottom:12px;">
-          <div class="stat-card" style="padding:12px;"><div class="stat-label"><span data-en="Connected now" data-fa="متصل اکنون">Connected now</span></div><div class="stat-val" id="foxhole-st-connected" style="font-size:1.3rem;">–</div></div>
-          <div class="stat-card" style="padding:12px;"><div class="stat-label"><span data-en="Unique users today" data-fa="کاربران یکتا امروز">Unique users today</span></div><div class="stat-val" id="foxhole-st-unique-day" style="font-size:1.3rem;">–</div></div>
-          <div class="stat-card" style="padding:12px;"><div class="stat-label"><span data-en="Unique users this month" data-fa="کاربران یکتا این ماه">Unique users this month</span></div><div class="stat-val" id="foxhole-st-unique-month" style="font-size:1.3rem;">–</div></div>
-        </div>
-        <div class="logs-table-container" style="overflow-x:auto;">
-          <table class="tbl">
-            <thead><tr><th data-en="Period" data-fa="بازه">Period</th><th data-en="Up" data-fa="ارسالی">Up</th><th data-en="Down" data-fa="دریافتی">Down</th><th data-en="Total" data-fa="مجموع">Total</th><th data-en="Requests" data-fa="درخواست‌ها">Requests</th></tr></thead>
-            <tbody>
-              <tr><td data-en="Today" data-fa="امروز">Today</td><td id="foxhole-st-day-up" style="direction:ltr;">–</td><td id="foxhole-st-day-down" style="direction:ltr;">–</td><td id="foxhole-st-day-total" style="direction:ltr;">–</td><td id="foxhole-st-req-day">–</td></tr>
-              <tr><td data-en="This month" data-fa="این ماه">This month</td><td id="foxhole-st-month-up" style="direction:ltr;">–</td><td id="foxhole-st-month-down" style="direction:ltr;">–</td><td id="foxhole-st-month-total" style="direction:ltr;">–</td><td id="foxhole-st-req-month">–</td></tr>
-            </tbody>
-          </table>
-        </div>
-        <div style="font-size:0.8rem;color:var(--text-2);margin-top:8px;" data-en="Day and month use UTC calendar boundaries. Users are counted by auth key, never by IP. Ping tests do not count toward these stats." data-fa="روز و ماه بر اساس مرزهای تقویمی UTC هستند. کاربران بر اساس کلید احراز هویت شمرده می‌شوند، هرگز بر اساس IP. تست‌های پینگ در این آمار شمرده نمی‌شوند.">Day and month use UTC calendar boundaries. Users are counted by auth key, never by IP. Ping tests do not count toward these stats.</div>
-      </div>
-      <div class="card">
         <div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg></span><span class="card-title" data-en="Relays" data-fa="رله‌ها">Relays</span></span></div>
-        <div style="color:var(--text-3);font-size:0.9rem;padding-bottom:8px;" data-en="Each relay has its own key, link, allowlist and limits, and works independently of the others. A deleted relay leaves this list at once and its link stops working; its past traffic stays in the day and month totals." data-fa="هر رله کلید، پیوند، فهرست مجاز و محدودیت‌های خودش را دارد و مستقل از بقیه کار می‌کند. رله حذف‌شده فوراً از این فهرست می‌رود و پیوندش از کار می‌افتد؛ ترافیک گذشته‌اش در مجموع روز و ماه باقی می‌ماند.">Each relay has its own key, link, allowlist and limits, and works independently of the others. A deleted relay leaves this list at once and its link stops working; its past traffic stays in the day and month totals.</div>
+        <div style="color:var(--text-3);font-size:0.9rem;padding-bottom:8px;" data-en="Each relay has its own key, link, allowlist and limits, and works independently of the others. Paste a relay's Client Relay Link into your client — it is a URL + secret, no port, on this panel's own HTTPS address. A deleted relay leaves this list at once and its link stops working; its past traffic stays in the day and month totals." data-fa="هر رله کلید، پیوند، فهرست مجاز و محدودیت‌های خودش را دارد و مستقل از بقیه کار می‌کند. پیوند رله کلاینت هر رله را در کلاینت خود جای‌گذاری کنید — این پیوند یک نشانی + کلید است، بدون پورت، و روی همان نشانی HTTPS خود پنل سوار می‌شود. رله حذف‌شده فوراً از این فهرست می‌رود و پیوندش از کار می‌افتد؛ ترافیک گذشته‌اش در مجموع روز و ماه باقی می‌ماند.">Each relay has its own key, link, allowlist and limits, and works independently of the others. Paste a relay's Client Relay Link into your client — it is a URL + secret, no port, on this panel's own HTTPS address. A deleted relay leaves this list at once and its link stops working; its past traffic stays in the day and month totals.</div>
         <div id="foxhole-relays-list"></div>
         <div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border);">
           <div style="font-weight:700;margin-bottom:8px;" data-en="Create relay" data-fa="ساخت رله">Create relay</div>
@@ -20846,34 +20501,22 @@ example.com
         </div>
       </div>
       <div class="card">
-        <div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></span><span class="card-title" data-en="Auth Key" data-fa="کلید احراز هویت">Auth Key</span></span></div>
-        <div style="color:var(--text-3);font-size:0.9rem;padding-bottom:8px;" data-en="The relay needs two values in the client: the Relay URL and the Auth key. The key is stored encrypted and is shown only once, when generated or rotated. Rotating invalidates the old key immediately." data-fa="رله در کلاینت به دو مقدار نیاز دارد: نشانی رله و کلید احراز هویت. کلید به‌صورت رمزنگاری‌شده ذخیره می‌شود و فقط هنگام ساخت یا چرخش، یک بار نمایش داده می‌شود. چرخش، کلید قبلی را فوراً باطل می‌کند.">The relay needs two values in the client: the Relay URL and the Auth key. The key is stored encrypted and is shown only once, when generated or rotated. Rotating invalidates the old key immediately.</div>
-        <div style="display:flex;gap:6px;flex-wrap:wrap;">
-          <button class="btn btn-primary btn-sm" id="foxhole-generate-btn" onclick="foxholeRelayGenerate()"><span data-en="Generate Key" data-fa="ایجاد کلید">Generate Key</span></button>
-          <button class="btn btn-outline btn-sm" id="foxhole-rotate-btn" onclick="foxholeRelayRotate()"><span data-en="Rotate Key" data-fa="چرخش کلید">Rotate Key</span></button>
+        <div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></span><span class="card-title" data-en="Relay Stats" data-fa="آمار رله">Relay Stats</span></span></div>
+        <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-bottom:12px;">
+          <div class="stat-card" style="padding:12px;"><div class="stat-label"><span data-en="Connected now" data-fa="متصل اکنون">Connected now</span></div><div class="stat-val" id="foxhole-st-connected" style="font-size:1.3rem;">–</div></div>
+          <div class="stat-card" style="padding:12px;"><div class="stat-label"><span data-en="Unique users today" data-fa="کاربران یکتا امروز">Unique users today</span></div><div class="stat-val" id="foxhole-st-unique-day" style="font-size:1.3rem;">–</div></div>
+          <div class="stat-card" style="padding:12px;"><div class="stat-label"><span data-en="Unique users this month" data-fa="کاربران یکتا این ماه">Unique users this month</span></div><div class="stat-val" id="foxhole-st-unique-month" style="font-size:1.3rem;">–</div></div>
         </div>
-        <div id="foxhole-key-box" style="display:none;margin-top:12px;padding:12px;border:1px solid var(--warning);border-radius:10px;background:var(--surface-3);">
-          <div style="color:var(--danger);font-weight:700;margin-bottom:6px;" data-en="Copy these relay settings now — the key will never be shown again." data-fa="همین حالا این تنظیمات رله را کپی کنید — کلید دیگر هرگز نمایش داده نمی‌شود.">Copy these relay settings now — the key will never be shown again.</div>
-          <div style="color:var(--text-3);font-size:0.85rem;margin-bottom:8px;" data-en="Enter these two values in your client (foxhole: Settings → VPN relay)." data-fa="این دو مقدار را در کلاینت خود وارد کنید (foxhole: تنظیمات ← رله VPN).">Enter these two values in your client (foxhole: Settings → VPN relay).</div>
-          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:8px;"><span style="min-width:90px;font-weight:600;" data-en="Relay URL" data-fa="نشانی رله">Relay URL</span><code id="foxhole-key-url-text" style="direction:ltr;unicode-bidi:plaintext;flex:1;overflow-wrap:anywhere;"></code><button class="btn btn-outline btn-sm" onclick="foxholeCopyKeyUrl()"><span data-en="Copy" data-fa="کپی">Copy</span></button></div>
-          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;"><span style="min-width:90px;font-weight:600;" data-en="Auth key" data-fa="کلید احراز هویت">Auth key</span><code id="foxhole-key-text" style="direction:ltr;unicode-bidi:plaintext;flex:1;overflow-wrap:anywhere;"></code><button class="btn btn-outline btn-sm" id="foxhole-key-copy-btn" onclick="foxholeCopyKey()"><span data-en="Copy Key" data-fa="کپی کلید">Copy Key</span></button></div>
-          <div style="color:var(--text-3);font-size:0.85rem;margin-top:8px;" data-en="The full client relay link at the top of this page is also shown only now — copy it from there." data-fa="پیوند کامل رله کلاینت در بالای این صفحه نیز فقط همین حالا نمایش داده می‌شود — آن را از همان‌جا کپی کنید.">The full client relay link at the top of this page is also shown only now — copy it from there.</div>
+        <div class="logs-table-container" style="overflow-x:auto;">
+          <table class="tbl">
+            <thead><tr><th data-en="Period" data-fa="بازه">Period</th><th data-en="Up" data-fa="ارسالی">Up</th><th data-en="Down" data-fa="دریافتی">Down</th><th data-en="Total" data-fa="مجموع">Total</th><th data-en="Requests" data-fa="درخواست‌ها">Requests</th></tr></thead>
+            <tbody>
+              <tr><td data-en="Today" data-fa="امروز">Today</td><td id="foxhole-st-day-up" style="direction:ltr;">–</td><td id="foxhole-st-day-down" style="direction:ltr;">–</td><td id="foxhole-st-day-total" style="direction:ltr;">–</td><td id="foxhole-st-req-day">–</td></tr>
+              <tr><td data-en="This month" data-fa="این ماه">This month</td><td id="foxhole-st-month-up" style="direction:ltr;">–</td><td id="foxhole-st-month-down" style="direction:ltr;">–</td><td id="foxhole-st-month-total" style="direction:ltr;">–</td><td id="foxhole-st-req-month">–</td></tr>
+            </tbody>
+          </table>
         </div>
-      </div>
-      <div class="card">
-        <div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></span><span class="card-title" data-en="Ping Test" data-fa="تست پینگ">Ping Test</span></span></div>
-        <div style="color:var(--text-3);font-size:0.9rem;padding-bottom:8px;" data-en="Sends two probes through the relay itself: a download from Mozilla's VPN server (GET vpn.mozilla.org) and an upload to Mozilla's account server (POST api.accounts.firefox.com). Each is timed and reported separately." data-fa="دو درخواست آزمایشی را از طریق خود رله می‌فرستد: یک دانلود از سرور VPN موزیلا (GET به vpn.mozilla.org) و یک آپلود به سرور حساب موزیلا (POST به api.accounts.firefox.com). هرکدام جداگانه زمان‌سنجی و گزارش می‌شوند.">Sends two probes through the relay itself: a download from Mozilla's VPN server (GET vpn.mozilla.org) and an upload to Mozilla's account server (POST api.accounts.firefox.com). Each is timed and reported separately.</div>
-        <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
-          <select class="fi" id="foxhole-ping-relay" style="max-width:240px;"><option value="default">default</option></select>
-          <button class="btn btn-primary btn-sm" id="foxhole-ping-btn" onclick="foxholeRelayPing(this)"><span data-en="Ping Relay" data-fa="پینگ رله">Ping Relay</span></button>
-          <span id="foxhole-ping-result" style="font-weight:600;">–</span>
-        </div>
-        <div id="foxhole-ping-last" style="color:var(--text-3);font-size:0.85rem;padding-top:8px;">–</div>
-      </div>
-      <div class="card">
-        <div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg></span><span class="card-title" data-en="Apps Script (Code.gs)" data-fa="اپس اسکریپت (Code.gs)">Apps Script (Code.gs)</span></span></div>
-        <div style="color:var(--text-3);font-size:0.9rem;padding-bottom:8px;" data-en="Download the improved Apps Script relay (Code.gs) if you still want a Google Apps Script deployment alongside the panel relay." data-fa="نسخه بهبودیافته رله Apps Script (Code.gs) را دانلود کنید، اگر همچنان می‌خواهید در کنار رله پنل، یک استقرار Google Apps Script هم داشته باشید.">Download the improved Apps Script relay (Code.gs) if you still want a Google Apps Script deployment alongside the panel relay.</div>
-        <a class="btn btn-outline btn-sm" href="/api/foxhole/code.gs" download="Code.gs"><span data-en="Download Code.gs" data-fa="دانلود Code.gs">Download Code.gs</span></a>
+        <div style="font-size:0.8rem;color:var(--text-2);margin-top:8px;" data-en="Day and month use UTC calendar boundaries. Users are counted by auth key, never by IP. Ping tests do not count toward these stats." data-fa="روز و ماه بر اساس مرزهای تقویمی UTC هستند. کاربران بر اساس کلید احراز هویت شمرده می‌شوند، هرگز بر اساس IP. تست‌های پینگ در این آمار شمرده نمی‌شوند.">Day and month use UTC calendar boundaries. Users are counted by auth key, never by IP. Ping tests do not count toward these stats.</div>
       </div>
     </section>
     <section class="page" id="page-telegram">
@@ -24236,105 +23879,12 @@ function foxholePingDir(d, name){
   if(d.error) line += ' · ' + d.error;
   return line;
 }
-function foxholePingLine(rec){
-  if(!rec) return lang==='fa'?'هنوز پینگی ثبت نشده است.':'No ping recorded yet.';
-  var parts = [];
-  var r = rec.receive, s = rec.send;
-  parts.push(foxholePingDir(r, lang==='fa'?'دریافت':'Receive') + (r && r.target ? ' · ' + r.target : ''));
-  parts.push(foxholePingDir(s, lang==='fa'?'ارسال':'Send') + (s && s.target ? ' · ' + s.target : ''));
-  var line = (lang==='fa'?'آخرین پینگ: ':'Last ping: ') + parts.join(' | ');
-  if(rec.at) line += ' · ' + rec.at;
-  if(rec.relay) line += ' · ' + rec.relay;
-  return line;
-}
-var foxholeClientLink = '';
-function foxholeClientLinkFor(key){
-  try{ return window.location.origin + '/relay?secret=' + encodeURIComponent(key); }catch(e){ return '/relay?secret=' + encodeURIComponent(key); }
-}
-function foxholeClientLinkMasked(){
-  try{ return window.location.origin + '/relay?secret=••••••••'; }catch(e){ return '/relay?secret=••••••••'; }
-}
-function foxholeShowClientLinkMasked(){
-  foxholeClientLink = '';
-  var el = $m('foxhole-client-link');
-  if(el) el.textContent = foxholeClientLinkMasked();
-  var btn = $m('foxhole-client-link-copy-btn');
-  if(btn) btn.disabled = true;
-  var note = $m('foxhole-client-link-note');
-  if(note) note.textContent = lang==='fa'?'پیوند پوشیده است — کلید فقط یک بار نمایش داده می‌شود. برای دریافت پیوند جدید، کلید را بچرخانید.':'Link masked — the key is shown only once. Rotate the key to get a new link.';
-  var sp = $m('foxhole-status-page-link');
-  if(sp){ try{ sp.href = window.location.origin + '/relay'; }catch(e){ sp.href = '/relay'; } }
-}
-function foxholeShowClientLinkFull(key){
-  foxholeClientLink = foxholeClientLinkFor(key);
-  var el = $m('foxhole-client-link');
-  if(el) el.textContent = foxholeClientLink;
-  var btn = $m('foxhole-client-link-copy-btn');
-  if(btn) btn.disabled = false;
-  var note = $m('foxhole-client-link-note');
-  if(note) note.textContent = lang==='fa'?'کلید فقط یک بار نمایش داده می‌شود — همین حالا این پیوند را کپی کنید.':'The key is shown only once — copy this link now.';
-  var sp = $m('foxhole-status-page-link');
-  if(sp) sp.href = foxholeClientLink;
-}
 async function loadFoxholeRelay(){
-  var box = $m('foxhole-key-box');
-  if(box) box.style.display = 'none';
-  var kt = $m('foxhole-key-text');
-  if(kt) kt.textContent = '';
-  var ku = $m('foxhole-key-url-text');
-  if(ku) ku.textContent = '';
-  foxholeShowClientLinkMasked();
-  var urlEl = $m('foxhole-relay-url');
-  if(urlEl){ try{ urlEl.textContent = window.location.origin + '/api/foxhole/relay'; }catch(e){ urlEl.textContent = '/api/foxhole/relay'; } }
-  try{
-    var r = await authenticatedFetch('/api/foxhole/status');
-    if(!r.ok) throw new Error('HTTP ' + r.status);
-    var d = await r.json();
-    var pill = $m('foxhole-status-pill');
-    if(pill){
-      var on = !!d.enabled;
-      pill.className = 'tag ' + (on ? 'tag-on' : 'tag-off');
-      pill.textContent = on ? (lang==='fa'?'فعال':'Enabled') : (lang==='fa'?'غیرفعال':'Disabled');
-    }
-    var cfg = $m('foxhole-config-line');
-    if(cfg){
-      if(d.configured){ cfg.textContent = (lang==='fa'?'کلید تنظیم شده است':'Key configured') + (d.fingerprint ? ' · ' + d.fingerprint : '') + (d.env_key ? (lang==='fa'?' · کلید محیطی':' · env key') : ''); }
-      else { cfg.textContent = lang==='fa'?'کلیدی تنظیم نشده است — برای فعال‌سازی «ایجاد کلید» را بزنید.':'No key configured — press Generate Key to enable.'; }
-    }
-    var en = $m('foxhole-enable-btn'), dis = $m('foxhole-disable-btn');
-    if(en) en.disabled = !!d.enabled || !d.configured;
-    if(dis) dis.disabled = !d.enabled;
-    var rot = $m('foxhole-rotate-btn');
-    if(rot) rot.disabled = !d.configured;
-    var setTxt = function(id, v){ var el = $m(id); if(el) el.textContent = v; };
-    setTxt('foxhole-stat-requests', String(d.requests || 0));
-    setTxt('foxhole-stat-up', fmtB(d.bytes_up || 0));
-    setTxt('foxhole-stat-down', fmtB(d.bytes_down || 0));
-    setTxt('foxhole-stat-last', d.last_used ? String(d.last_used) : '—');
-  }catch(e){ toast(lang==='fa'?'بارگذاری وضعیت رله فایرفاکس ناموفق بود.':'Failed to load Firefox Relay status.', true); return false; }
-  try{
-    var rp = await authenticatedFetch('/api/foxhole/ping');
-    if(rp.ok){ var dp = await rp.json(); var last = $m('foxhole-ping-last'); if(last) last.textContent = foxholePingLine(dp.last_ping || null); }
-  }catch(e){}
   try{
     var rs = await authenticatedFetch('/api/foxhole/stats');
     if(rs.ok){ var ds = await rs.json(); foxholeRenderStats(ds); }
   }catch(e){}
-  try{ await foxholeLoadRelays(); }catch(e){}
-  try{
-    var hr = await fetch('/relay?health=1');
-    var hl = $m('foxhole-health-line');
-    if(hl){
-      if(hr.ok){
-        var hd = await hr.json();
-        if(hd && hd.ready){ hl.textContent = (lang==='fa'?'رله آماده است':'Relay ready') + (hd.version !== undefined && hd.version !== null && hd.version !== '' ? ' · v' + hd.version : '') + (hd.relay ? ' · ' + hd.relay : ''); }
-        else { hl.textContent = (lang==='fa'?'رله آماده نیست':'Relay not ready') + (hd && hd.version !== undefined && hd.version !== null && hd.version !== '' ? ' · v' + hd.version : ''); }
-      } else { hl.textContent = (lang==='fa'?'بررسی سلامت رله در دسترس نیست':'Relay health check unavailable') + ' (HTTP ' + hr.status + ')'; }
-    }
-  }catch(e){
-    var hl2 = $m('foxhole-health-line');
-    if(hl2) hl2.textContent = lang==='fa'?'بررسی سلامت رله در دسترس نیست.':'Relay health check unavailable.';
-  }
+  try{ await foxholeLoadRelays(); }catch(e){ toast(lang==='fa'?'بارگذاری رله‌ها ناموفق بود.':'Failed to load relays.', true); return false; }
   return true;
 }
 function foxholeStatNum(v){
@@ -24359,15 +23909,7 @@ function foxholeRenderStats(d){
   setTxt('foxhole-st-req-day', foxholeStatNum(rq.day));
   setTxt('foxhole-st-req-month', foxholeStatNum(rq.month));
 }
-function foxholeShowKeyOnce(key){
-  var box = $m('foxhole-key-box'), txt = $m('foxhole-key-text'), urlTxt = $m('foxhole-key-url-text');
-  if(txt) txt.textContent = key;
-  if(urlTxt){ try{ urlTxt.textContent = window.location.origin + '/api/foxhole/relay'; }catch(e){ urlTxt.textContent = '/api/foxhole/relay'; } }
-  if(box) box.style.display = '';
-  foxholeShowClientLinkFull(key);
-}
-async function foxholeRelayGenerate(){
-  var btn = $m('foxhole-generate-btn');
+async function foxholeRelayGenerate(btn){
   if(btn) btn.disabled = true;
   try{
     var r = await authenticatedFetch('/api/foxhole/generate', {method:'POST'});
@@ -24375,47 +23917,26 @@ async function foxholeRelayGenerate(){
     var d = await r.json();
     if(!d.key) throw new Error('no key');
     await loadFoxholeRelay();
-    foxholeShowKeyOnce(d.key);
+    var relay = null;
+    for(var i = 0; i < foxholeRelays.length; i++){ if(foxholeRelays[i] && foxholeRelays[i].slug === 'default') relay = foxholeRelays[i]; }
+    if(!relay) relay = {slug: 'default', relay_url: '/relay'};
+    foxholeRelayShowNewKey(relay, d.key);
+    await foxholeLoadRelays();
     toast(lang==='fa'?'کلید ساخته شد — همین حالا آن را کپی کنید.':'Key generated — copy it now.');
   }catch(e){ toast(lang==='fa'?'ساخت کلید ناموفق بود.':'Failed to generate key.', true); }
-  finally{ var b2 = $m('foxhole-generate-btn'); if(b2) b2.disabled = false; }
+  finally{ if(btn) btn.disabled = false; }
 }
-async function foxholeRelayRotate(){
-  var btn = $m('foxhole-rotate-btn');
+async function foxholeRelayPing(btn, relaySlug, relayId){
   if(btn) btn.disabled = true;
-  try{
-    var r = await authenticatedFetch('/api/foxhole/rotate', {method:'POST'});
-    if(!r.ok) throw new Error('HTTP ' + r.status);
-    var d = await r.json();
-    if(!d.key) throw new Error('no key');
-    await loadFoxholeRelay();
-    foxholeShowKeyOnce(d.key);
-    toast(lang==='fa'?'کلید چرخید — کلید قبلی فوراً باطل شد. همین حالا کلید جدید را کپی کنید.':'Key rotated — the old key is invalid immediately. Copy the new key now.');
-  }catch(e){ toast(lang==='fa'?'چرخش کلید ناموفق بود.':'Failed to rotate key.', true); }
-  finally{ var b2 = $m('foxhole-rotate-btn'); if(b2) b2.disabled = false; }
-}
-async function foxholeRelayToggle(enable){
-  try{
-    var r = await authenticatedFetch(enable ? '/api/foxhole/enable' : '/api/foxhole/disable', {method:'POST'});
-    if(!r.ok) throw new Error('HTTP ' + r.status);
-    await loadFoxholeRelay();
-    toast(enable ? (lang==='fa'?'رله فعال شد.':'Relay enabled.') : (lang==='fa'?'رله غیرفعال شد.':'Relay disabled.'));
-  }catch(e){ toast(lang==='fa'?'تغییر وضعیت رله ناموفق بود.':'Failed to change relay state.', true); }
-}
-async function foxholeRelayPing(btn, relaySlug){
-  if(btn) btn.disabled = true;
-  var res = $m('foxhole-ping-result');
+  var res = relayId ? $m('foxhole-ping-result-' + relayId) : null;
   if(res) res.textContent = lang==='fa'?'در حال پینگ…':'Pinging…';
   var pingRelay = relaySlug || '';
-  if(!pingRelay){ var pingSel = $m('foxhole-ping-relay'); if(pingSel) pingRelay = pingSel.value || ''; }
   try{
     var r = await authenticatedFetch('/api/foxhole/ping', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(pingRelay ? {relay: pingRelay} : {})});
     var d = await r.json();
     if(!r.ok) throw new Error(d.detail || ('HTTP ' + r.status));
     var line = foxholePingDir(d.receive, lang==='fa'?'دریافت':'Receive') + ' | ' + foxholePingDir(d.send, lang==='fa'?'ارسال':'Send');
-    if(res) res.textContent = (lang==='fa'?'نتیجه پینگ: ':'Ping result: ') + line;
-    var last = $m('foxhole-ping-last');
-    if(last) last.textContent = foxholePingLine(d);
+    if(res) res.textContent = line;
   }catch(e){ if(res) res.textContent = lang==='fa'?'پینگ ناموفق بود.':'Ping failed.'; toast(lang==='fa'?'پینگ رله ناموفق بود.':'Relay ping failed.', true); }
   finally{ if(btn) btn.disabled = false; }
 }
@@ -24431,22 +23952,6 @@ function foxholeCopyText(text, okMsg){
   var done = function(){ toast(okMsg || (lang==='fa'?'کپی شد.':'Copied.')); };
   if(navigator.clipboard && navigator.clipboard.writeText){ navigator.clipboard.writeText(text).then(done, function(){ foxholeCopyFallback(text, done); }); }
   else { foxholeCopyFallback(text, done); }
-}
-function foxholeCopyRelayUrl(){
-  var el = $m('foxhole-relay-url');
-  if(el && el.textContent) foxholeCopyText(el.textContent);
-}
-function foxholeCopyClientLink(){
-  if(!foxholeClientLink){ toast(lang==='fa'?'پیوند کامل فقط بلافاصله پس از ساخت یا چرخش کلید در دسترس است.':'The full link is only available right after generating or rotating the key.', true); return; }
-  foxholeCopyText(foxholeClientLink);
-}
-function foxholeCopyKeyUrl(){
-  var el = $m('foxhole-key-url-text');
-  if(el && el.textContent) foxholeCopyText(el.textContent);
-}
-function foxholeCopyKey(){
-  var el = $m('foxhole-key-text');
-  if(el && el.textContent) foxholeCopyText(el.textContent, lang==='fa'?'کلید کپی شد — آن را در جایی امن نگه دارید.':'Key copied — store it somewhere safe.');
 }
 var foxholeRelays = [];
 var foxholeRelayLinks = {};
@@ -24479,24 +23984,7 @@ async function foxholeLoadRelays(){
   var d = await r.json();
   foxholeRelays = (d && d.relays) || [];
   foxholeRenderRelays();
-  foxholeRenderPingSelect();
   return true;
-}
-function foxholeRenderPingSelect(){
-  var sel = $m('foxhole-ping-relay');
-  if(!sel) return;
-  var current = sel.value || 'default';
-  var html = '';
-  for(var i = 0; i < foxholeRelays.length; i++){
-    var relay = foxholeRelays[i];
-    html += '<option value="' + esc(relay.slug || '') + '"' + (relay.slug === current ? ' selected' : '') + '>' + esc((relay.label || relay.slug || '') + ' (' + (relay.slug || '') + ')') + '</option>';
-  }
-  if(!html) html = '<option value="default">default</option>';
-  sel.innerHTML = html;
-  var found = false;
-  for(var j = 0; j < foxholeRelays.length; j++){ if(foxholeRelays[j].slug === current) found = true; }
-  if(!found) sel.value = 'default';
-  if(!sel.value && foxholeRelays.length) sel.value = foxholeRelays[0].slug || 'default';
 }
 function foxholeRelayRowHtml(relay){
   var usage = relay.usage || {};
@@ -24511,6 +23999,8 @@ function foxholeRelayRowHtml(relay){
   var copyDisabled = fullLink ? '' : ' disabled';
   var isDefault = (relay.slug === 'default');
   var delBtn = isDefault ? '<button class="btn btn-outline btn-sm" disabled title="' + (lang==='fa'?'رله پیش‌فرض قابل حذف نیست.':'The default relay cannot be deleted.') + '"><span>' + (lang==='fa'?'حذف':'Delete') + '</span></button>' : '<button class="btn btn-outline btn-sm" onclick="foxholeRelayDelete(' + relay.id + ')"><span>' + (lang==='fa'?'حذف':'Delete') + '</span></button>';
+  var toggleBtn = '<button class="btn btn-outline btn-sm" onclick="foxholeRelayToggleOne(' + relay.id + ')"><span>' + (relay.enabled ? (lang==='fa'?'غیرفعال‌سازی':'Disable') : (lang==='fa'?'فعال‌سازی':'Enable')) + '</span></button>';
+  var genBtn = (!relay.configured && isDefault) ? '<button class="btn btn-primary btn-sm" onclick="foxholeRelayGenerate(this)"><span>' + (lang==='fa'?'ایجاد کلید':'Generate Key') + '</span></button>' : '';
   var limits = [];
   limits.push((lang==='fa'?'محدودیت نرخ: ':'Rate limit: ') + (relay.rate_limit ? String(relay.rate_limit) + '/min' : (lang==='fa'?'سراسری (۶۰ در دقیقه)':'global (60/min)')));
   limits.push((lang==='fa'?'سقف ترافیک: ':'Traffic cap: ') + (relay.traffic_limit_bytes ? fmtB(relay.traffic_limit_bytes) : (lang==='fa'?'نامحدود':'unlimited')));
@@ -24518,15 +24008,20 @@ function foxholeRelayRowHtml(relay){
   var allowText = (relay.allowlist && relay.allowlist.length) ? esc(relay.allowlist.join(', ')) : (lang==='fa'?'پیش‌فرض (شش دامنه)':'default (six domains)');
   var html = '<div style="padding:10px 0;border-bottom:1px solid var(--border);">';
   html += '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">' + pill + '<b>' + esc(relay.label || relay.slug || '') + '</b><code style="direction:ltr;">' + esc(relay.slug || '') + '</code><span style="color:var(--text-3);font-size:0.85rem;">' + esc(relay.fingerprint || '') + '</span></div>';
+  html += '<div style="color:var(--text-3);font-size:0.85rem;margin-top:6px;"><span data-en="Client Relay Link" data-fa="پیوند رله کلاینت">Client Relay Link</span> — <span>' + (lang==='fa'?'این پیوند را در کلاینت جای‌گذاری کنید.':'Paste this link into your client.') + '</span></div>';
   html += '<div style="display:flex;gap:6px;align-items:center;margin-top:6px;"><code style="direction:ltr;unicode-bidi:plaintext;flex:1;overflow-wrap:anywhere;">' + esc(linkText) + '</code><button class="btn btn-outline btn-sm" onclick="foxholeRelayCopyLink(\'' + esc(relay.slug || '') + '\')"' + copyDisabled + '><span>' + (lang==='fa'?'کپی پیوند':'Copy Link') + '</span></button></div>';
-  html += '<div style="color:var(--text-3);font-size:0.85rem;margin-top:6px;">' + (lang==='fa'?'امروز: ':'Today: ') + '↑ ' + fmtB(day.up || 0) + ' ↓ ' + fmtB(day.down || 0) + ' · ' + fmtB(day.total || 0) + ' · ' + String(requests.day || 0) + ' ' + (lang==='fa'?'درخواست':'requests') + ' | ' + (lang==='fa'?'این ماه: ':'This month: ') + '↑ ' + fmtB(month.up || 0) + ' ↓ ' + fmtB(month.down || 0) + ' · ' + fmtB(month.total || 0) + ' | ' + (lang==='fa'?'متصل اکنون: ':'Connected now: ') + String(usage.connected || 0) + ' · ' + (lang==='fa'?'یکتا امروز/ماه: ':'Unique day/month: ') + String(unique.day || 0) + '/' + String(unique.month || 0) + '</div>';
+  html += '<div style="color:var(--text-3);font-size:0.85rem;margin-top:6px;">' + (lang==='fa'?'امروز: ':'Today: ') + '↑ ' + fmtB(day.up || 0) + ' ↓ ' + fmtB(day.down || 0) + ' · ' + fmtB(day.total || 0) + ' · ' + String(requests.day || 0) + ' ' + (lang==='fa'?'درخواست':'requests') + ' | ' + (lang==='fa'?'این ماه: ':'This month: ') + '↑ ' + fmtB(month.up || 0) + ' ↓ ' + fmtB(month.down || 0) + ' · ' + fmtB(month.total || 0) + ' · ' + String(requests.month || 0) + ' ' + (lang==='fa'?'درخواست':'requests') + ' | ' + (lang==='fa'?'متصل اکنون: ':'Connected now: ') + String(usage.connected || 0) + ' · ' + (lang==='fa'?'یکتا امروز/ماه: ':'Unique day/month: ') + String(unique.day || 0) + '/' + String(unique.month || 0) + '</div>';
   html += '<div style="color:var(--text-3);font-size:0.85rem;">' + limits.join(' · ') + ' · ' + (lang==='fa'?'مجاز: ':'Allowlist: ') + allowText + ' · ' + (lang==='fa'?'درخواست‌ها (کل): ':'Requests (all time): ') + String(relay.requests || 0) + '</div>';
   html += '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;">';
+  html += genBtn;
+  html += '<button class="btn btn-outline btn-sm" onclick="foxholeRelayPingOne(' + relay.id + ', this)"><span>' + (lang==='fa'?'پینگ':'Ping') + '</span></button>';
+  html += toggleBtn;
   html += '<button class="btn btn-outline btn-sm" onclick="foxholeRelayEdit(' + relay.id + ')"><span>' + (lang==='fa'?'ویرایش':'Edit') + '</span></button>';
   html += '<button class="btn btn-outline btn-sm" onclick="foxholeRelayRotateOne(' + relay.id + ')"><span>' + (lang==='fa'?'چرخش کلید':'Rotate Key') + '</span></button>';
-  html += '<button class="btn btn-outline btn-sm" onclick="foxholeRelayPingOne(' + relay.id + ')"><span>' + (lang==='fa'?'پینگ':'Ping') + '</span></button>';
   html += delBtn;
-  html += '</div></div>';
+  html += '</div>';
+  html += '<div id="foxhole-ping-result-' + relay.id + '" style="font-size:0.85rem;margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;"></div>';
+  html += '</div>';
   return html;
 }
 function foxholeRenderRelays(){
@@ -24677,12 +24172,22 @@ async function foxholeRelayDelete(id){
     toast(lang==='fa'?'رله حذف شد. پیوند آن دیگر کار نمی‌کند؛ رله‌های دیگر تغییری نکردند.':'Relay deleted. Its link no longer works; other relays are unchanged.');
   }catch(e){ toast((lang==='fa'?'حذف رله ناموفق بود: ':'Failed to delete relay: ') + (e && e.message ? e.message : ''), true); }
 }
-function foxholeRelayPingOne(id){
+function foxholeRelayPingOne(id, btn){
   var relay = foxholeRelayById(id);
   if(!relay) return;
-  var sel = $m('foxhole-ping-relay');
-  if(sel) sel.value = relay.slug || 'default';
-  foxholeRelayPing(null, relay.slug || 'default');
+  foxholeRelayPing(btn || null, relay.slug || 'default', id);
+}
+async function foxholeRelayToggleOne(id){
+  var relay = foxholeRelayById(id);
+  if(!relay) return;
+  var enable = !relay.enabled;
+  try{
+    var r = await authenticatedFetch('/api/foxhole/relays/' + id, {method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify({enabled: enable})});
+    var d = await r.json().catch(function(){ return {}; });
+    if(!r.ok) throw new Error((d && d.detail) || ('HTTP ' + r.status));
+    await foxholeLoadRelays();
+    toast(enable ? (lang==='fa'?'رله فعال شد.':'Relay enabled.') : (lang==='fa'?'رله غیرفعال شد.':'Relay disabled.'));
+  }catch(e){ toast(lang==='fa'?'تغییر وضعیت رله ناموفق بود.':'Failed to change relay state.', true); }
 }
 var SXPAGES=['dashboard','inbounds','active-users','addresses','ipscanner','logs','foxhole-relay','telegram','settings','about'];
 function pageFromLocation(){
