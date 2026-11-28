@@ -33,6 +33,16 @@ fi
 
 echo "SulgX entrypoint: HOME=$HOME DATA_DIR=$DATA_DIR"
 
+# DATA_DIR on /tmp or /var/tmp is ephemeral: a redeploy or restart wipes the
+# database, the generated secrets and the stored admin hash with it.
+SULGX_DATA_EPHEMERAL=no
+case "$DATA_DIR" in
+  /tmp|/tmp/*|/var/tmp|/var/tmp/*)
+    SULGX_DATA_EPHEMERAL=yes
+    printf '%s\n' "SulgX entrypoint: WARNING - DATA_DIR=$DATA_DIR is on ephemeral storage (/tmp or /var/tmp): panel data (database, secrets, credentials) will be WIPED on redeploy or restart. Mount a persistent volume at /data." >&2
+    ;;
+esac
+
 export SULGX_DATA_DIR="$DATA_DIR"
 ENV_FILE="$DATA_DIR/.sulgx-env"
 CRED_FILE="$DATA_DIR/initial-credentials.txt"
@@ -139,6 +149,10 @@ if [ "$SULGX_GENERATED_ADMIN" = "yes" ]; then
   chmod 600 "$CRED_FILE" 2>/dev/null || true
   chown sulgx:sulgx "$CRED_FILE" 2>/dev/null || true
   printf '%s\n' "SulgX first boot: using default admin password 'admin' (change it after first login, also saved to $CRED_FILE)"
+  printf '%s\n' "SulgX entrypoint: WARNING - the default admin password 'admin' is well-known: anyone who can reach this panel can log in with it. Set a strong ADMIN_PASSWORD environment variable (at least 8 characters) and change the password after first login." >&2
+  if [ "$SULGX_DATA_EPHEMERAL" = "yes" ]; then
+    printf '%s\n' "SulgX entrypoint: WARNING - storage is ephemeral (DATA_DIR=$DATA_DIR): after a restart or redeploy wipes the database, the panel comes back up with the known default admin password 'admin' again. Set ADMIN_PASSWORD on the host." >&2
+  fi
 fi
 
 if [ -z "${1:-}" ]; then
