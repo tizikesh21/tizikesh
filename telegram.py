@@ -71,6 +71,23 @@ _COUNT_TRAFFIC = None
 _MTPROXY_QUOTA_OK = None
 _SESSION_ALLOWED = None
 ACTIVE_PROXY = {}
+_CLOSED_PROXY_SESSIONS = []
+
+
+def _record_proxy_session_closed(entry):
+    if not isinstance(entry, dict) or not entry.get("id"):
+        return
+    row = {k: v for k, v in entry.items() if k != "writer"}
+    row["ended_at"] = datetime.now(timezone.utc).isoformat()
+    _CLOSED_PROXY_SESSIONS.append(row)
+    if len(_CLOSED_PROXY_SESSIONS) > 512:
+        del _CLOSED_PROXY_SESSIONS[:len(_CLOSED_PROXY_SESSIONS) - 512]
+
+
+def take_closed_proxy_sessions():
+    rows = _CLOSED_PROXY_SESSIONS[:]
+    del _CLOSED_PROXY_SESSIONS[:]
+    return rows
 _SERVERS = []
 _BOUND_PORTS = set()
 _BIND_ERRORS = {}
@@ -433,6 +450,7 @@ def disconnect_proxy_session(sid):
             writer.close()
         except OSError:
             pass
+    _record_proxy_session_closed(entry)
     ACTIVE_PROXY.pop(sid, None)
     return True
 
@@ -786,6 +804,7 @@ async def _handle_mtproto_relay(reader, writer, prefix):
             except OSError:
                 pass
         if sid is not None:
+            _record_proxy_session_closed(entry)
             ACTIVE_PROXY.pop(sid, None)
         try:
             writer.close()
@@ -1630,6 +1649,7 @@ async def _handle_socks5_udp_associate(reader, writer, username, link, transport
             except (ConnectionError, asyncio.TimeoutError, OSError):
                 pass
         if sid is not None:
+            _record_proxy_session_closed(entry)
             ACTIVE_PROXY.pop(sid, None)
         if udp_sock is not None:
             try:
@@ -1754,7 +1774,7 @@ async def _handle_socks5(reader, writer, transport="raw"):
         _LOG.info("socks5 connect user " + username + " to " + str(host) + ":" + str(port) + " transport " + str(transport) + " from " + peer_text)
         peer = writer.get_extra_info("peername")
         sid = "socks5-" + os.urandom(6).hex()
-        entry = {"id": sid, "username": username, "protocol": "socks5", "client_ip": peer[0] if peer else "", "started_at": datetime.now(timezone.utc).isoformat(), "bytes_up": 0, "bytes_down": 0, "bytes_flushed": 0, "writer": writer}
+        entry = {"id": sid, "username": username, "protocol": "socks5", "client_ip": peer[0] if peer else "", "started_at": datetime.now(timezone.utc).isoformat(), "bytes_up": 0, "bytes_down": 0, "bytes_flushed": 0, "destination": str(host) + ":" + str(port), "dest_host": str(host), "dest_port": int(port), "writer": writer}
         ACTIVE_PROXY[sid] = entry
 
         async def _count(n, direction):
@@ -1838,6 +1858,7 @@ async def _handle_socks5(reader, writer, transport="raw"):
             except (ConnectionError, asyncio.TimeoutError, OSError):
                 pass
         if sid is not None:
+            _record_proxy_session_closed(entry)
             ACTIVE_PROXY.pop(sid, None)
         if target_writer is not None:
             try:
@@ -2000,6 +2021,10 @@ async def _http_serve_connect(reader, writer, target, headers):
         await writer.drain()
         _LOG.info("http proxy connect user " + str(username) + " to " + str(host) + ":" + str(port) + " from " + _mux_peer_text(writer))
         sid, entry = _http_register_session(writer, username)
+        if entry is not None:
+            entry["destination"] = str(host) + ":" + str(port)
+            entry["dest_host"] = str(host)
+            entry["dest_port"] = int(port)
 
         async def _count(n, direction):
             nonlocal total_bytes, up_flushed, down_flushed
@@ -2076,6 +2101,7 @@ async def _http_serve_connect(reader, writer, target, headers):
             except (ConnectionError, asyncio.TimeoutError, OSError):
                 pass
         if sid is not None:
+            _record_proxy_session_closed(entry)
             ACTIVE_PROXY.pop(sid, None)
         try:
             target_writer.close()
@@ -2134,6 +2160,10 @@ async def _http_serve_absolute(reader, writer, method, target, version, headers)
     entry = None
     try:
         sid, entry = _http_register_session(writer, username)
+        if entry is not None:
+            entry["destination"] = str(host) + ":" + str(port)
+            entry["dest_host"] = str(host)
+            entry["dest_port"] = int(port)
         _LOG.info("http proxy absolute user " + str(username) + " to " + str(host) + ":" + str(port) + " " + str(method) + " from " + _mux_peer_text(writer))
 
         async def _count(n, direction):
@@ -2277,6 +2307,7 @@ async def _http_serve_absolute(reader, writer, method, target, version, headers)
                 pass
         if sid is not None:
             _LOG.info("http proxy absolute end user " + str(username) + " bytes=" + str(total_bytes) + " from " + _mux_peer_text(writer))
+            _record_proxy_session_closed(entry)
             ACTIVE_PROXY.pop(sid, None)
         try:
             target_writer.close()
@@ -3434,6 +3465,41 @@ async def telemt_mtproto_user_stats(uid):
         return {}
 
 
+async def telemt_web_user_stats(uid):
+    entry = _TELEMT_WEB.get("legacy-root")
+    if entry is None:
+        return {}
+    proc = entry.get("proc")
+    if proc is None or proc.returncode is not None:
+        return {}
+    username = telemt_web_username(uid)
+    path = "/v1/users/" + _url_path_quote(username, safe="")
+    status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "GET", path)
+    if status != 200 or not payload.get("ok"):
+        return {}
+    data = payload.get("data") or {}
+    try:
+        return {"total_octets": int(data.get("total_octets") or 0), "current_connections": int(data.get("current_connections") or 0), "active_unique_ips": int(data.get("active_unique_ips") or 0)}
+    except (TypeError, ValueError):
+        return {}
+
+
+def telemt_web_generation():
+    entry = _TELEMT_WEB.get("legacy-root")
+    if entry is None:
+        return 0
+    proc = entry.get("proc")
+    try:
+        pid = int(getattr(proc, "pid", 0) or 0)
+    except (TypeError, ValueError):
+        pid = 0
+    try:
+        restarts = int(entry.get("restarts") or 0)
+    except (TypeError, ValueError):
+        restarts = 0
+    return restarts * 10000000 + pid
+
+
 async def telemt_start_web(uid, token, secret_hex, host, max_sessions=8, max_streams=512, public_ip=None, root_enabled=False, profiles=None):
     key = str(uid)
     if not telemt_available():
@@ -3742,14 +3808,14 @@ async def telemt_web_status(uid):
     key = str(uid)
     entry = _TELEMT_WEB.get(key)
     if entry is None:
-        return {"enabled": False, "port": 0, "error": "no telemt WEB child for uid " + key, "sessions": 0, "healthy": False}
+        return {"enabled": False, "port": 0, "error": "no telemt WEB child for uid " + key, "sessions": 0, "healthy": False, "runtime_bytes_up": 0, "runtime_bytes_down": 0}
     port = entry["port"]
     proc = entry.get("proc")
     if proc is None or proc.returncode is not None:
-        return {"enabled": False, "port": port, "error": entry.get("error") or "telemt WEB child is not running", "sessions": 0, "healthy": False}
+        return {"enabled": False, "port": port, "error": entry.get("error") or "telemt WEB child is not running", "sessions": 0, "healthy": False, "runtime_bytes_up": 0, "runtime_bytes_down": 0}
     status, payload = await _telemt_api_async(entry["api_port"], entry["token"], "GET", "/v1/runtime/web/status", timeout=5.0)
     if status != 200 or not payload.get("ok"):
-        return {"enabled": False, "port": port, "error": "telemt WEB API did not answer", "sessions": 0, "healthy": False}
+        return {"enabled": False, "port": port, "error": "telemt WEB API did not answer", "sessions": 0, "healthy": False, "runtime_bytes_up": 0, "runtime_bytes_down": 0}
     data = payload.get("data") or {}
     ingress = data.get("ingress") or {}
     healthy = data.get("lifecycle") == "running" and ingress.get("accepting_connections") is True
@@ -3760,10 +3826,19 @@ async def telemt_web_status(uid):
         rows = (payload.get("data") or {}).get("sessions") or []
         session_rows = rows if isinstance(rows, list) else []
         sessions = len(session_rows)
+    runtime = data.get("runtime") or {}
+    try:
+        runtime_up = int(runtime.get("bytes_up") or 0)
+    except (TypeError, ValueError):
+        runtime_up = 0
+    try:
+        runtime_down = int(runtime.get("bytes_down") or 0)
+    except (TypeError, ValueError):
+        runtime_down = 0
     error = ""
     if not healthy:
         error = str(data.get("reason") or data.get("lifecycle") or "WEB runtime is not running")
-    return {"enabled": True, "port": port, "error": error, "sessions": sessions, "session_rows": session_rows, "healthy": healthy}
+    return {"enabled": True, "port": port, "error": error, "sessions": sessions, "session_rows": session_rows, "healthy": healthy, "runtime_bytes_up": runtime_up, "runtime_bytes_down": runtime_down}
 
 
 async def telemt_stop_all():
