@@ -12,6 +12,7 @@ import time
 import re
 import random
 import base64
+import gzip
 import ipaddress
 import socket
 import uuid as uuid_lib
@@ -151,6 +152,11 @@ _TELEMT_WEB_STATUS_CACHE = {}
 _TELEMT_PROVISIONED = {"web": set(), "mtproto": set()}
 _TELEMT_MTPROTO_STATS = {}
 _TELEMT_MTPROTO_GENERATION = 0
+_TELEMT_WEB_STATS = {}
+_TELEMT_WEB_GENERATION = 0
+_TELEMT_WEB_FALLBACK = {"active": False, "streak": 0, "runtime_up": 0, "runtime_down": 0, "runtime_up_bps": 0, "runtime_down_bps": 0, "since": ""}
+_TELEMT_WEB_RUNTIME_LAST = {}
+_WEB_TOKEN_CHARGED = {}
 _TELEMT_ROOT_PROFILE_KEY = ""
 _TELEMT_ROOT_CHILD_UID = "legacy-root"
 _WEB_TOKEN_ALIASES = {}
@@ -579,6 +585,18 @@ def _live_proxy_unflushed_bytes(uid):
         if link is None or str(link.get("uid") or "") != str(uid):
             continue
         total += max(0, int(s.get("bytes_up", 0) or 0) + int(s.get("bytes_down", 0) or 0) - int(s.get("bytes_flushed", 0) or 0))
+    if str(uid) not in _TELEMT_WEB_STATS:
+        try:
+            username_fn = _tg_fn("telemt_web_username")
+            username = str(username_fn(uid)) if username_fn is not None else ""
+            status = _telemt_web_status_cached(_TELEMT_ROOT_CHILD_UID)
+            rows = _telemt_web_sessions_value(status)
+            if username and isinstance(rows, list):
+                for row in rows:
+                    if isinstance(row, dict) and str(row.get("user") or "") == username:
+                        total += max(0, int(row.get("bytes_up", 0) or 0) + int(row.get("bytes_down", 0) or 0) - int(row.get("bytes_flushed", 0) or 0))
+        except Exception:
+            pass
     return total
 
 
@@ -736,6 +754,8 @@ async def _telemt_sync_root_vhost():
             result = await _tg_call("telemt_start_web", _TELEMT_ROOT_CHILD_UID, _TELEMT_ROOT_CHILD_TOKEN, first_secret, host, max_sessions=first_sessions, max_streams=512, public_ip=public_ip, root_enabled=True, profiles=profiles)
         except TypeError:
             result = {"enabled": False, "error": "telemt WEB start does not support shared profiles"}
+        except Exception as _exc:
+            result = {"enabled": False, "error": "telemt WEB start failed: " + str(_exc)}
         if isinstance(result, dict) and result.get("enabled"):
             if await _telemt_root_child_is_rooted():
                 _TELEMT_PROVISIONED["web"].add(_TELEMT_ROOT_CHILD_UID)
@@ -1561,8 +1581,27 @@ def _proxy_session_count(uid):
     return total
 
 
-def subnet24_of(ip):
+def _normalize_client_ip(ip):
     raw = str(ip or "").strip()
+    if raw.lower().startswith("::ffff:"):
+        return raw[7:]
+    return raw
+
+
+def _dest_label(row):
+    dest = str(row.get("destination") or "").strip()
+    if dest:
+        return dest
+    transport = str(row.get("transport") or row.get("protocol") or "")
+    if transport in ("mtproto", "webproxy"):
+        return "Telegram DC"
+    if transport in ("socks5", "http-proxy"):
+        return "General destination"
+    return ""
+
+
+def subnet24_of(ip):
+    raw = _normalize_client_ip(ip)
     if not raw:
         return "unknown"
     try:
@@ -1888,6 +1927,819 @@ async def migrate_proxy_passwords():
             continue
         await db_execute("UPDATE proxy_lines SET password = ? WHERE id = ?", "UPDATE proxy_lines SET password = $1 WHERE id = $2", (encrypted, row["id"]))
 
+
+
+FOXHOLE_SKIP_HEADERS = {
+    "host", "connection", "keep-alive", "content-length",
+    "transfer-encoding", "proxy-connection", "proxy-authorization",
+    "priority", "te", "upgrade", "trailer", "accept-encoding",
+    "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto",
+    "x-forwarded-port", "x-real-ip", "forwarded", "via",
+    "x-mhr-hop",
+}
+FOXHOLE_GET_ALLOWED_HOSTS = {
+    "mozilla.org", "mozilla.com", "firefox.com",
+    "github.com", "githubusercontent.com", "jsdelivr.net",
+}
+FOXHOLE_GET_RELAY_NAME = "sulgx-foxhole"
+FOXHOLE_GET_TIMEOUT_SECONDS = 600.0
+FOXHOLE_GET_CONNECT_TIMEOUT_SECONDS = 20.0
+FOXHOLE_SAFE_REPLAY_METHODS = {"GET", "HEAD", "OPTIONS"}
+FOXHOLE_ALLOWED_METHODS = {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
+FOXHOLE_GAS_URL_RE = re.compile(r"^https?://script\.google\.com/macros/", re.IGNORECASE)
+FOXHOLE_MAX_REQUEST_BYTES = 1048576
+FOXHOLE_MAX_RESPONSE_BYTES = 5242880
+FOXHOLE_MAX_JSON_BODY_BYTES = 2097152
+FOXHOLE_TIMEOUT_SECONDS = 15.0
+FOXHOLE_CONNECT_TIMEOUT_SECONDS = 5.0
+FOXHOLE_MAX_REDIRECTS = 5
+FOXHOLE_BATCH_MAX_ITEMS = 20
+FOXHOLE_RATE_LIMIT_WINDOW_SECONDS = 60.0
+FOXHOLE_RATE_LIMIT_MAX = 60
+FOXHOLE_MAX_HOPS = 10
+FOXHOLE_USAGE_RETENTION_DAYS = 90
+FOXHOLE_CONNECTED_WINDOW_SECONDS = 300
+FOXHOLE_RELAY_DASHBOARD_UID = "foxhole-relay"
+FOXHOLE_SCHEMA_READY = False
+FOXHOLE_RATE_BUCKETS = {}
+FOXHOLE_RATE_LOCK = asyncio.Lock()
+
+
+class _FoxholeSecretRedactFilter(logging.Filter):
+    def filter(self, record):
+        try:
+            if isinstance(record.args, tuple):
+                redacted_args = []
+                changed = False
+                for arg in record.args:
+                    text = str(arg)
+                    if "secret=" in text:
+                        redacted_args.append(re.sub(r"secret=[^&\s\"']*", "secret=[redacted]", text))
+                        changed = True
+                    else:
+                        redacted_args.append(arg)
+                if changed:
+                    record.args = tuple(redacted_args)
+            elif isinstance(record.msg, str) and "secret=" in record.msg:
+                record.msg = re.sub(r"secret=[^&\s\"']*", "secret=[redacted]", record.msg)
+        except Exception:
+            pass
+        return True
+
+
+def _foxhole_install_secret_redaction():
+    for name in ("", "uvicorn.access", "uvicorn.error", "uvicorn", "SulgX"):
+        target = logging.getLogger(name)
+        if not any(isinstance(item, _FoxholeSecretRedactFilter) for item in target.filters):
+            target.addFilter(_FoxholeSecretRedactFilter())
+
+
+_foxhole_install_secret_redaction()
+
+
+def _foxhole_fingerprint(plain_key):
+    return hashlib.sha256(str(plain_key).encode()).hexdigest()[:16]
+
+
+def _foxhole_env_key():
+    return os.environ.get("FOXHOLE_RELAY_KEY", "").strip()
+
+
+async def _foxhole_load_row():
+    await _foxhole_ensure_schema()
+    try:
+        row = await _foxhole_load_row_by_slug("default")
+        if row:
+            return row
+        return await db_fetchone("SELECT * FROM foxhole_relay WHERE id = 1 AND deleted = 0", "SELECT * FROM foxhole_relay WHERE id = 1 AND deleted = FALSE")
+    except Exception as e:
+        logger.error(f"Firefox Relay row read failed: {e}")
+        return None
+
+
+async def _foxhole_load_row_by_fingerprint(fingerprint):
+    await _foxhole_ensure_schema()
+    try:
+        return await db_fetchone("SELECT * FROM foxhole_relay WHERE fingerprint = ? AND deleted = 0", "SELECT * FROM foxhole_relay WHERE fingerprint = $1 AND deleted = 0", (fingerprint,))
+    except Exception as e:
+        logger.error(f"Firefox Relay fingerprint lookup failed: {e}")
+        return None
+
+
+async def _foxhole_load_row_for_secret(presented):
+    if presented:
+        row = await _foxhole_load_row_by_fingerprint(_foxhole_fingerprint(presented))
+        if row:
+            plain_key = _foxhole_resolve_key(row)
+            if plain_key and hmac_mod.compare_digest(presented, plain_key):
+                return row, plain_key
+    row = await _foxhole_load_row()
+    return row, _foxhole_resolve_key(row)
+
+
+async def _foxhole_ensure_schema():
+    global FOXHOLE_SCHEMA_READY
+    if FOXHOLE_SCHEMA_READY:
+        return
+    try:
+        if DB_BACKEND == "postgresql":
+            ensure = globals().get("ensure_column_pg")
+            columns = [
+                ("slug", "TEXT DEFAULT ''"),
+                ("label", "TEXT DEFAULT ''"),
+                ("allowlist", "TEXT DEFAULT ''"),
+                ("rate_limit", "BIGINT DEFAULT 0"),
+                ("traffic_limit_bytes", "BIGINT DEFAULT 0"),
+                ("expires_at", "TEXT DEFAULT ''"),
+                ("deleted", "BOOLEAN DEFAULT FALSE"),
+            ]
+        else:
+            ensure = globals().get("ensure_column_sqlite")
+            columns = [
+                ("slug", "TEXT DEFAULT ''"),
+                ("label", "TEXT DEFAULT ''"),
+                ("allowlist", "TEXT DEFAULT ''"),
+                ("rate_limit", "INTEGER DEFAULT 0"),
+                ("traffic_limit_bytes", "INTEGER DEFAULT 0"),
+                ("expires_at", "TEXT DEFAULT ''"),
+                ("deleted", "INTEGER DEFAULT 0"),
+            ]
+        if ensure is None:
+            return
+        for column, col_def in columns:
+            await ensure("foxhole_relay", column, col_def)
+        await db_execute(
+            "UPDATE foxhole_relay SET slug = 'default' WHERE id = 1 AND (slug IS NULL OR slug = '')",
+            "UPDATE foxhole_relay SET slug = 'default' WHERE id = 1 AND (slug IS NULL OR slug = '')",
+        )
+        empty_rows = await db_fetchall(
+            "SELECT id FROM foxhole_relay WHERE slug IS NULL OR slug = ''",
+            "SELECT id FROM foxhole_relay WHERE slug IS NULL OR slug = ''",
+        )
+        for empty_row in empty_rows or []:
+            await db_execute(
+                "UPDATE foxhole_relay SET slug = ? WHERE id = ?",
+                "UPDATE foxhole_relay SET slug = $1 WHERE id = $2",
+                ("relay-" + str(empty_row.get("id")), empty_row.get("id")),
+            )
+        try:
+            await db_execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_foxhole_relay_slug ON foxhole_relay(slug)",
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_foxhole_relay_slug ON foxhole_relay(slug)",
+            )
+        except Exception as e:
+            logger.error(f"Firefox Relay slug index creation failed: {e}")
+        FOXHOLE_SCHEMA_READY = True
+    except Exception as e:
+        logger.error(f"Firefox Relay schema migration failed: {e}")
+
+
+def _foxhole_valid_slug(value):
+    text = str(value or "").strip().lower()
+    if not text or len(text) > 64:
+        return ""
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", text):
+        return ""
+    return text
+
+
+async def _foxhole_load_row_by_slug(slug, include_deleted=False):
+    await _foxhole_ensure_schema()
+    try:
+        query = "SELECT * FROM foxhole_relay WHERE slug = ?"
+        pg_query = "SELECT * FROM foxhole_relay WHERE slug = $1"
+        if not include_deleted:
+            query += " AND deleted = 0"
+            pg_query += " AND deleted = FALSE"
+        return await db_fetchone(query, pg_query, (slug,))
+    except Exception as e:
+        logger.error(f"Firefox Relay slug lookup failed: {e}")
+        return None
+
+
+async def _foxhole_load_row_by_id(relay_id, include_deleted=False):
+    await _foxhole_ensure_schema()
+    try:
+        query = "SELECT * FROM foxhole_relay WHERE id = ?"
+        pg_query = "SELECT * FROM foxhole_relay WHERE id = $1"
+        if not include_deleted:
+            query += " AND deleted = 0"
+            pg_query += " AND deleted = FALSE"
+        return await db_fetchone(query, pg_query, (relay_id,))
+    except Exception as e:
+        logger.error(f"Firefox Relay id lookup failed: {e}")
+        return None
+
+
+async def _foxhole_load_all_rows():
+    await _foxhole_ensure_schema()
+    try:
+        return await db_fetchall("SELECT * FROM foxhole_relay WHERE deleted = 0 ORDER BY id ASC", "SELECT * FROM foxhole_relay WHERE deleted = FALSE ORDER BY id ASC")
+    except Exception as e:
+        logger.error(f"Firefox Relay list read failed: {e}")
+        return []
+
+
+async def _foxhole_unique_slug(base):
+    candidate = _foxhole_valid_slug(base) or "relay"
+    if candidate == "default":
+        candidate = "relay"
+    suffix = 0
+    while suffix <= 1000:
+        name = candidate if suffix == 0 else candidate + "-" + str(suffix)
+        existing = await _foxhole_load_row_by_slug(name, include_deleted=True)
+        if not existing:
+            return name
+        suffix += 1
+    return candidate + "-" + secrets.token_hex(4)
+
+
+def _foxhole_row_allowlist(row):
+    if not row:
+        return None
+    raw = str(row.get("allowlist") or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(parsed, list):
+        return None
+    hosts = set()
+    for entry in parsed:
+        host = str(entry or "").strip().lower()
+        if host:
+            hosts.add(host)
+    return hosts or None
+
+
+def _foxhole_host_allowed(url_text, allowed):
+    if os.environ.get("FOXHOLE_ALLOW_PRIVATE", "").strip() == "1":
+        return True
+    try:
+        host = (urlparse(url_text).hostname or "").lower()
+    except Exception:
+        return False
+    for domain in allowed:
+        if host == domain or host.endswith("." + domain):
+            return True
+    return False
+
+
+def _foxhole_row_rate_limit(row):
+    try:
+        limit = int((row or {}).get("rate_limit") or 0)
+    except (TypeError, ValueError):
+        return 0
+    return limit if limit > 0 else 0
+
+
+def _foxhole_parse_expires(row):
+    raw = str((row or {}).get("expires_at") or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
+
+
+def _foxhole_relay_blocked(row):
+    expires = _foxhole_parse_expires(row)
+    if expires is not None and datetime.now(UTC) >= expires:
+        return "relay expired"
+    try:
+        limit = int((row or {}).get("traffic_limit_bytes") or 0)
+    except (TypeError, ValueError):
+        limit = 0
+    if limit > 0:
+        try:
+            used = int((row or {}).get("bytes_up") or 0) + int((row or {}).get("bytes_down") or 0)
+        except (TypeError, ValueError):
+            used = 0
+        if used >= limit:
+            return "traffic limit reached"
+    return ""
+
+
+def _foxhole_parse_allowlist_input(value):
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ValueError("allowlist must be a list of hosts")
+    hosts = []
+    for entry in value:
+        host = str(entry or "").strip().lower()
+        if not host or " " in host or "/" in host:
+            raise ValueError("allowlist entries must be host names")
+        hosts.append(host)
+    return hosts
+
+
+def _foxhole_parse_nonneg_int(value, field):
+    if value is None:
+        return 0
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid " + field)
+    if number < 0:
+        raise HTTPException(status_code=400, detail="Invalid " + field)
+    return number
+
+
+def _foxhole_relay_public(row):
+    if not row:
+        return {}
+    plain_key = _foxhole_resolve_key(row)
+    slug = str(row.get("slug") or "")
+    path = "/relay/" + slug if slug and slug != "default" else "/relay"
+    allowlist = _foxhole_row_allowlist(row)
+    return {
+        "id": row.get("id"),
+        "slug": slug,
+        "label": row.get("label") or "",
+        "enabled": _foxhole_row_enabled(row),
+        "configured": bool(plain_key),
+        "fingerprint": _foxhole_effective_fingerprint(row, plain_key),
+        "requests": int(row.get("requests") or 0),
+        "bytes_up": int(row.get("bytes_up") or 0),
+        "bytes_down": int(row.get("bytes_down") or 0),
+        "last_used": row.get("last_used") or "",
+        "created_at": row.get("created_at") or "",
+        "rotated_at": row.get("rotated_at") or "",
+        "rate_limit": _foxhole_row_rate_limit(row),
+        "traffic_limit_bytes": int(row.get("traffic_limit_bytes") or 0),
+        "expires_at": row.get("expires_at") or "",
+        "allowlist": sorted(allowlist) if allowlist is not None else None,
+        "ready": _foxhole_row_enabled(row) and bool(plain_key),
+        "relay_url": path,
+        "post_url": "/api/foxhole/relay",
+    }
+
+
+def _foxhole_row_enabled(row):
+    if not row:
+        return bool(_foxhole_env_key())
+    value = row.get("enabled")
+    if isinstance(value, bool):
+        return value
+    return str(value) in ("1", "true", "True")
+
+
+def _foxhole_resolve_key(row):
+    if row and (row.get("key_enc") or ""):
+        plain = decrypt_proxy_password(str(row.get("key_enc")))
+        if plain:
+            return plain
+    return _foxhole_env_key()
+
+
+def _foxhole_effective_fingerprint(row, plain_key):
+    if row and (row.get("fingerprint") or ""):
+        return str(row.get("fingerprint"))
+    if plain_key:
+        return _foxhole_fingerprint(plain_key)
+    return ""
+
+
+async def _foxhole_store_key(plain_key, enabled, reset_counters):
+    fingerprint = _foxhole_fingerprint(plain_key)
+    encrypted = encrypt_proxy_password(plain_key)
+    now = datetime.now(UTC).isoformat()
+    existing = await _foxhole_load_row()
+    if existing:
+        row_id = existing.get("id")
+        if reset_counters:
+            await db_execute(
+                "UPDATE foxhole_relay SET key_enc = ?, fingerprint = ?, enabled = ?, requests = 0, bytes_up = 0, bytes_down = 0, last_used = '', rotated_at = ? WHERE id = ?",
+                "UPDATE foxhole_relay SET key_enc = $1, fingerprint = $2, enabled = $3, requests = 0, bytes_up = 0, bytes_down = 0, last_used = '', rotated_at = $4 WHERE id = $5",
+                (encrypted, fingerprint, 1 if enabled else 0, now, row_id),
+            )
+        else:
+            await db_execute(
+                "UPDATE foxhole_relay SET key_enc = ?, fingerprint = ?, enabled = ?, rotated_at = ? WHERE id = ?",
+                "UPDATE foxhole_relay SET key_enc = $1, fingerprint = $2, enabled = $3, rotated_at = $4 WHERE id = $5",
+                (encrypted, fingerprint, 1 if enabled else 0, now, row_id),
+            )
+    else:
+        await db_execute(
+            "INSERT INTO foxhole_relay (slug, label, key_enc, fingerprint, enabled, requests, bytes_up, bytes_down, last_used, created_at, rotated_at) VALUES ('default', 'Default', ?, ?, ?, 0, 0, 0, '', ?, ?)",
+            "INSERT INTO foxhole_relay (slug, label, key_enc, fingerprint, enabled, requests, bytes_up, bytes_down, last_used, created_at, rotated_at) VALUES ('default', 'Default', $1, $2, $3, 0, 0, 0, '', $4, $5)",
+            (encrypted, fingerprint, 1 if enabled else 0, now, now),
+        )
+    return fingerprint
+
+
+async def _foxhole_set_enabled(enabled):
+    row = await _foxhole_load_row()
+    if not row:
+        await db_execute(
+            "INSERT INTO foxhole_relay (slug, label, key_enc, fingerprint, enabled, requests, bytes_up, bytes_down, last_used, created_at, rotated_at) VALUES ('default', 'Default', '', '', ?, 0, 0, 0, '', '', '')",
+            "INSERT INTO foxhole_relay (slug, label, key_enc, fingerprint, enabled, requests, bytes_up, bytes_down, last_used, created_at, rotated_at) VALUES ('default', 'Default', '', '', $1, 0, 0, 0, '', '', '')",
+            (1 if enabled else 0,),
+        )
+        return
+    await db_execute(
+        "UPDATE foxhole_relay SET enabled = ? WHERE id = ?",
+        "UPDATE foxhole_relay SET enabled = $1 WHERE id = $2",
+        (1 if enabled else 0, row.get("id")),
+    )
+
+
+async def _foxhole_account(fingerprint, req_count, up_bytes, down_bytes, count=True, items=None):
+    if not count:
+        return
+    if req_count <= 0 and up_bytes <= 0 and down_bytes <= 0:
+        return
+    now = datetime.now(UTC).isoformat()
+    try:
+        row = await _foxhole_load_row_by_fingerprint(fingerprint)
+        if row:
+            await db_execute(
+                "UPDATE foxhole_relay SET requests = requests + ?, bytes_up = bytes_up + ?, bytes_down = bytes_down + ?, last_used = ? WHERE fingerprint = ? AND deleted = 0",
+                "UPDATE foxhole_relay SET requests = requests + $1, bytes_up = bytes_up + $2, bytes_down = bytes_down + $3, last_used = $4 WHERE fingerprint = $5 AND deleted = FALSE",
+                (req_count, up_bytes, down_bytes, now, fingerprint),
+            )
+        else:
+            try:
+                await db_execute(
+                    "INSERT INTO foxhole_relay (slug, key_enc, fingerprint, enabled, requests, bytes_up, bytes_down, last_used, created_at, rotated_at, deleted) VALUES (?, '', ?, 0, ?, ?, ?, ?, '', '', 0)",
+                    "INSERT INTO foxhole_relay (slug, key_enc, fingerprint, enabled, requests, bytes_up, bytes_down, last_used, created_at, rotated_at, deleted) VALUES ($1, '', $2, FALSE, $3, $4, $5, $6, '', '', FALSE)",
+                    ("env-" + fingerprint[:8], fingerprint, req_count, up_bytes, down_bytes, now),
+                )
+            except Exception:
+                await db_execute(
+                    "UPDATE foxhole_relay SET requests = requests + ?, bytes_up = bytes_up + ?, bytes_down = bytes_down + ?, last_used = ? WHERE fingerprint = ? AND deleted = 0",
+                    "UPDATE foxhole_relay SET requests = requests + $1, bytes_up = bytes_up + $2, bytes_down = bytes_down + $3, last_used = $4 WHERE fingerprint = $5 AND deleted = FALSE",
+                    (req_count, up_bytes, down_bytes, now, fingerprint),
+                )
+    except Exception as e:
+        logger.error(f"Firefox Relay accounting failed: {e}")
+        return
+    log_items = items if items is not None else [(up_bytes, down_bytes)]
+    await _foxhole_log_usage(fingerprint, log_items, now)
+    await _foxhole_prune_usage()
+    await _foxhole_account_dashboard(up_bytes, down_bytes)
+
+
+async def _foxhole_account_dashboard(up_bytes, down_bytes):
+    try:
+        if up_bytes > 0:
+            await account_traffic(FOXHOLE_RELAY_DASHBOARD_UID, int(up_bytes), "up")
+        if down_bytes > 0:
+            await account_traffic(FOXHOLE_RELAY_DASHBOARD_UID, int(down_bytes), "down")
+    except Exception as e:
+        logger.error(f"Firefox Relay dashboard accounting failed: {e}")
+
+
+async def _foxhole_log_usage(fingerprint, items, now_iso):
+    if not items:
+        return
+    ops = [
+        (
+            "INSERT INTO foxhole_relay_usage (fingerprint, ts, bytes_up, bytes_down) VALUES (?, ?, ?, ?)",
+            "INSERT INTO foxhole_relay_usage (fingerprint, ts, bytes_up, bytes_down) VALUES ($1, $2, $3, $4)",
+            (fingerprint, now_iso, int(up_bytes), int(down_bytes)),
+        )
+        for up_bytes, down_bytes in items
+    ]
+    try:
+        await db_execute_many(ops)
+    except Exception as e:
+        logger.error(f"Firefox Relay usage log failed: {e}")
+
+
+async def _foxhole_prune_usage():
+    cutoff = (datetime.now(UTC) - timedelta(days=FOXHOLE_USAGE_RETENTION_DAYS)).isoformat()
+    try:
+        await db_execute(
+            "DELETE FROM foxhole_relay_usage WHERE ts < ?",
+            "DELETE FROM foxhole_relay_usage WHERE ts < $1",
+            (cutoff,),
+        )
+    except Exception as e:
+        logger.error(f"Firefox Relay usage prune failed: {e}")
+
+
+async def _foxhole_usage_stats(fingerprints=None):
+    await _foxhole_ensure_schema()
+    now = datetime.now(UTC)
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    next_day = day_start + timedelta(days=1)
+    month_start = day_start.replace(day=1)
+    if month_start.month == 12:
+        next_month = month_start.replace(year=month_start.year + 1, month=1)
+    else:
+        next_month = month_start.replace(month=month_start.month + 1)
+    connected_since = (now - timedelta(seconds=FOXHOLE_CONNECTED_WINDOW_SECONDS)).isoformat()
+    empty = {
+        "traffic": {"day": {"up": 0, "down": 0, "total": 0}, "month": {"up": 0, "down": 0, "total": 0}},
+        "connected": 0,
+        "unique": {"day": 0, "month": 0},
+        "requests": {"day": 0, "month": 0},
+    }
+    selector = list(fingerprints) if fingerprints is not None else None
+    if selector is not None and not selector:
+        return empty
+    excluded = []
+    if selector is None:
+        try:
+            deleted_rows = await db_fetchall(
+                "SELECT fingerprint FROM foxhole_relay WHERE deleted = 1 AND fingerprint <> ''",
+                "SELECT fingerprint FROM foxhole_relay WHERE deleted = TRUE AND fingerprint <> ''",
+            )
+            excluded = [str(r.get("fingerprint") or "") for r in deleted_rows or [] if (r.get("fingerprint") or "")]
+        except Exception as e:
+            logger.error(f"Firefox Relay deleted fingerprint read failed: {e}")
+            excluded = []
+
+    async def run_query(sqlite_q, pg_q, params, fps, exclude):
+        if fps is not None and not fps:
+            return {}
+        if fps:
+            sqlite_q = sqlite_q + " AND fingerprint IN (" + ",".join("?" for _ in fps) + ")"
+            pg_q = pg_q + " AND fingerprint IN (" + ",".join("$" + str(len(params) + 1 + i) for i in range(len(fps))) + ")"
+            params = tuple(params) + tuple(fps)
+        elif exclude:
+            sqlite_q = sqlite_q + " AND fingerprint NOT IN (" + ",".join("?" for _ in exclude) + ")"
+            pg_q = pg_q + " AND fingerprint NOT IN (" + ",".join("$" + str(len(params) + 1 + i) for i in range(len(exclude))) + ")"
+            params = tuple(params) + tuple(exclude)
+        try:
+            return await db_fetchone(sqlite_q, pg_q, params) or {}
+        except Exception as e:
+            logger.error(f"Firefox Relay usage stats failed: {e}")
+            return {}
+
+    day_row = await run_query(
+        "SELECT COALESCE(SUM(bytes_up), 0) AS up, COALESCE(SUM(bytes_down), 0) AS down, COUNT(*) AS n FROM foxhole_relay_usage WHERE ts >= ? AND ts < ?",
+        "SELECT COALESCE(SUM(bytes_up), 0) AS up, COALESCE(SUM(bytes_down), 0) AS down, COUNT(*) AS n FROM foxhole_relay_usage WHERE ts >= $1 AND ts < $2",
+        (day_start.isoformat(), next_day.isoformat()),
+        selector,
+        [],
+    )
+    month_row = await run_query(
+        "SELECT COALESCE(SUM(bytes_up), 0) AS up, COALESCE(SUM(bytes_down), 0) AS down, COUNT(*) AS n FROM foxhole_relay_usage WHERE ts >= ? AND ts < ?",
+        "SELECT COALESCE(SUM(bytes_up), 0) AS up, COALESCE(SUM(bytes_down), 0) AS down, COUNT(*) AS n FROM foxhole_relay_usage WHERE ts >= $1 AND ts < $2",
+        (month_start.isoformat(), next_month.isoformat()),
+        selector,
+        [],
+    )
+    day_unique_row = await run_query(
+        "SELECT COUNT(DISTINCT fingerprint) AS u FROM foxhole_relay_usage WHERE ts >= ? AND ts < ?",
+        "SELECT COUNT(DISTINCT fingerprint) AS u FROM foxhole_relay_usage WHERE ts >= $1 AND ts < $2",
+        (day_start.isoformat(), next_day.isoformat()),
+        selector,
+        excluded,
+    )
+    month_unique_row = await run_query(
+        "SELECT COUNT(DISTINCT fingerprint) AS u FROM foxhole_relay_usage WHERE ts >= ? AND ts < ?",
+        "SELECT COUNT(DISTINCT fingerprint) AS u FROM foxhole_relay_usage WHERE ts >= $1 AND ts < $2",
+        (month_start.isoformat(), next_month.isoformat()),
+        selector,
+        excluded,
+    )
+    connected_row = await run_query(
+        "SELECT COUNT(DISTINCT fingerprint) AS n FROM foxhole_relay_usage WHERE ts >= ?",
+        "SELECT COUNT(DISTINCT fingerprint) AS n FROM foxhole_relay_usage WHERE ts >= $1",
+        (connected_since,),
+        selector,
+        excluded,
+    )
+    day_up = int(day_row.get("up") or 0)
+    day_down = int(day_row.get("down") or 0)
+    month_up = int(month_row.get("up") or 0)
+    month_down = int(month_row.get("down") or 0)
+    return {
+        "traffic": {
+            "day": {"up": day_up, "down": day_down, "total": day_up + day_down},
+            "month": {"up": month_up, "down": month_down, "total": month_up + month_down},
+        },
+        "connected": int(connected_row.get("n") or 0),
+        "unique": {"day": int(day_unique_row.get("u") or 0), "month": int(month_unique_row.get("u") or 0)},
+        "requests": {"day": int(day_row.get("n") or 0), "month": int(month_row.get("n") or 0)},
+    }
+
+
+async def _foxhole_rate_allow(fingerprint, limit=0):
+    try:
+        wanted = int(limit or 0)
+    except (TypeError, ValueError):
+        wanted = 0
+    effective = wanted if wanted > 0 else FOXHOLE_RATE_LIMIT_MAX
+    now = time.time()
+    async with FOXHOLE_RATE_LOCK:
+        bucket = FOXHOLE_RATE_BUCKETS.get(fingerprint)
+        if bucket is None:
+            bucket = deque()
+            FOXHOLE_RATE_BUCKETS[fingerprint] = bucket
+        while bucket and bucket[0] <= now - FOXHOLE_RATE_LIMIT_WINDOW_SECONDS:
+            bucket.popleft()
+        if len(bucket) >= effective:
+            return False
+        bucket.append(now)
+        return True
+
+
+def _foxhole_loop_error(url_text, request):
+    if FOXHOLE_GAS_URL_RE.match(url_text or ""):
+        return "loop detected: relay target cannot be a Google Apps Script URL"
+    try:
+        parsed = urlparse(url_text or "")
+    except Exception:
+        return None
+    own_host = ""
+    try:
+        own_host = (request.url.hostname or "").lower()
+    except Exception:
+        own_host = ""
+    target_host = (parsed.hostname or "").lower()
+    if target_host and own_host and target_host == own_host:
+        return "loop detected: relay target cannot be the panel itself"
+    panel_domain = ""
+    try:
+        panel_domain = (get_domain(request) or "").lower()
+    except Exception:
+        panel_domain = ""
+    if target_host and panel_domain and target_host == panel_domain:
+        return "loop detected: relay target cannot be the panel itself"
+    return None
+
+
+async def _foxhole_target_is_public(url_text):
+    if os.environ.get("FOXHOLE_ALLOW_PRIVATE", "").strip() == "1":
+        return True
+    try:
+        host = (urlparse(url_text).hostname or "").strip()
+    except Exception:
+        return False
+    if not host:
+        return False
+    try:
+        ips = await resolve_domain_to_ips(host)
+    except Exception:
+        return False
+    if not ips:
+        return False
+    for ip in ips:
+        if not is_public_ip(str(ip)):
+            return False
+    return True
+
+
+def _foxhole_build_headers(item_headers):
+    headers = {}
+    hop = 1
+    if isinstance(item_headers, dict):
+        for raw_name, raw_value in item_headers.items():
+            name = str(raw_name)
+            lowered = name.lower()
+            if lowered == "x-mhr-hop":
+                try:
+                    hop = int(str(raw_value).strip()) + 1
+                except (TypeError, ValueError):
+                    hop = 1
+                continue
+            if lowered in FOXHOLE_SKIP_HEADERS:
+                continue
+            if lowered.startswith("cf-"):
+                continue
+            headers[name] = raw_value
+    headers["x-mhr-hop"] = str(hop)
+    headers["accept-encoding"] = "gzip, deflate"
+    return headers, hop
+
+
+def _foxhole_maybe_gzip(raw):
+    if not raw:
+        return base64.b64encode(raw).decode(), False
+    try:
+        compressed = gzip.compress(raw, compresslevel=6)
+    except Exception:
+        return base64.b64encode(raw).decode(), False
+    if len(compressed) < len(raw):
+        return base64.b64encode(compressed).decode(), True
+    return base64.b64encode(raw).decode(), False
+
+
+def _foxhole_clean_response_headers(raw_headers):
+    dropped = {"content-length", "transfer-encoding", "content-encoding", "connection", "keep-alive", "proxy-connection", "upgrade", "te", "trailer"}
+    cleaned = {}
+    for name, value in raw_headers.multi_items():
+        lowered = name.lower()
+        if lowered in dropped:
+            continue
+        if lowered.startswith("cf-") or lowered.startswith("x-forwarded-"):
+            continue
+        if lowered in cleaned:
+            cleaned[lowered] = cleaned[lowered] + ", " + value
+        else:
+            cleaned[lowered] = value
+    return cleaned
+
+
+class _FoxholeFetchError(Exception):
+    def __init__(self, message, up_bytes=0, retryable=False):
+        super().__init__(message)
+        self.message = message
+        self.up_bytes = up_bytes
+        self.retryable = retryable
+
+
+def _foxhole_get_allowed_host(url_text):
+    return _foxhole_host_allowed(url_text, FOXHOLE_GET_ALLOWED_HOSTS)
+
+
+async def _foxhole_fetch_open(item, client, request, allowlist=False):
+    if not isinstance(item, dict):
+        raise _FoxholeFetchError("bad item")
+    url_text = item.get("u")
+    if not url_text or not isinstance(url_text, str) or not re.match(r"^https?://", url_text, re.IGNORECASE):
+        raise _FoxholeFetchError("bad url")
+    loop_error = _foxhole_loop_error(url_text, request)
+    if loop_error:
+        raise _FoxholeFetchError(loop_error)
+    if allowlist:
+        allowed_hosts = FOXHOLE_GET_ALLOWED_HOSTS if allowlist is True else set(allowlist)
+        if not _foxhole_host_allowed(url_text, allowed_hosts):
+            raise _FoxholeFetchError("host not allowed: " + (urlparse(url_text).hostname or "").lower())
+    method = str(item.get("m") or "GET").upper()
+    if method not in FOXHOLE_ALLOWED_METHODS:
+        raise _FoxholeFetchError("bad method")
+    payload = b""
+    if item.get("b"):
+        raw_b = item.get("b")
+        if not isinstance(raw_b, str):
+            raise _FoxholeFetchError("bad body")
+        try:
+            payload = base64.b64decode(raw_b, validate=True)
+        except Exception:
+            raise _FoxholeFetchError("bad body")
+        if len(payload) > FOXHOLE_MAX_REQUEST_BYTES:
+            raise _FoxholeFetchError("request too large")
+    headers, hop = _foxhole_build_headers(item.get("h") if isinstance(item.get("h"), dict) else {})
+    if hop > FOXHOLE_MAX_HOPS:
+        raise _FoxholeFetchError("loop detected: too many relay hops")
+    if not await _foxhole_target_is_public(url_text):
+        raise _FoxholeFetchError("fetch failed")
+    content_type = item.get("ct")
+    if payload and content_type:
+        headers["content-type"] = str(content_type)
+    follow = item.get("r") is not False
+    try:
+        stream = client.stream(method, url_text, headers=headers, content=payload if payload else None, follow_redirects=follow)
+        resp = await stream.__aenter__()
+    except httpx.TooManyRedirects:
+        raise _FoxholeFetchError("too many redirects", len(payload))
+    except Exception as e:
+        logger.error(f"Firefox Relay fetch failed for {method} {urlparse(url_text).hostname or ''}: {type(e).__name__}")
+        raise _FoxholeFetchError("fetch failed", len(payload), True)
+    return stream, resp, len(payload)
+
+
+@asynccontextmanager
+async def _foxhole_fetch_stream(item, client, request, allowlist=False):
+    stream, resp, up_bytes = await _foxhole_fetch_open(item, client, request, allowlist=allowlist)
+    try:
+        yield resp, up_bytes
+    finally:
+        await stream.__aexit__(None, None, None)
+
+
+async def _foxhole_fetch_one(item, client, request):
+    try:
+        async with _foxhole_fetch_stream(item, client, request) as (resp, up_bytes):
+            body = b""
+            try:
+                async for chunk in resp.aiter_bytes():
+                    body += chunk
+                    if len(body) > FOXHOLE_MAX_RESPONSE_BYTES:
+                        return {"e": "response too large"}, up_bytes, len(body), False
+            except Exception as e:
+                logger.error(f"Firefox Relay fetch failed while reading the response: {type(e).__name__}")
+                return {"e": "fetch failed"}, up_bytes, 0, True
+            encoded, gzipped = _foxhole_maybe_gzip(body)
+            result = {"s": resp.status_code, "h": _foxhole_clean_response_headers(resp.headers), "b": encoded}
+            if gzipped:
+                result["gz"] = 1
+            return result, up_bytes, len(body), False
+    except _FoxholeFetchError as failure:
+        return {"e": failure.message}, failure.up_bytes, 0, failure.retryable
+
+
+async def _foxhole_fetch_with_retry(item, client, request, batch):
+    result, up_bytes, down_bytes, retryable = await _foxhole_fetch_one(item, client, request)
+    if not batch or not retryable:
+        return result, up_bytes, down_bytes
+    method = str(item.get("m") or "GET").upper()
+    if method not in FOXHOLE_SAFE_REPLAY_METHODS:
+        return {"e": "batch fetch failed; unsafe method not replayed"}, up_bytes, down_bytes
+    retry, retry_up, retry_down, _retryable = await _foxhole_fetch_one(item, client, request)
+    return retry, up_bytes + retry_up, down_bytes + retry_down
 
 
 def parse_outbound_proxy_line(text):
@@ -4000,6 +4852,13 @@ async def _probe_raw_listener(port, protocol):
             pass
 
 
+def _safe_int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 async def refresh_proxy_listener_status(force=False):
     global _PROXY_LISTENER_PROBE_AT
     now = time.monotonic()
@@ -4015,7 +4874,9 @@ async def refresh_proxy_listener_status(force=False):
         for key, protocol, env_port in (("socks", "socks5", SOCKS_PORT), ("mtproxy", "mtproto", TG_PROXY_PORT), ("http", "http-proxy", HTTP_PROXY_PORT)):
             _ports = set()
             if env_port:
-                _ports.add(int(env_port))
+                _env_port = _safe_int(env_port, 0)
+                if _env_port:
+                    _ports.add(_env_port)
             for _l in _status_rows:
                 if (_l.get("protocol") or "") == protocol and _l.get("active"):
                     try:
@@ -4060,19 +4921,19 @@ async def refresh_proxy_listener_status(force=False):
                 entry["failed_ports"] = {}
             elif PROXY_START_ERRORS.get(key):
                 entry["enabled"] = False
-                entry["port"] = int(ports[0])
+                entry["port"] = _safe_int(ports[0], 0)
                 entry["error"] = PROXY_START_ERRORS[key]
                 entry["ports"] = live_ports
                 entry["failed_ports"] = failed_ports
             else:
                 entry["enabled"] = bool(live_ports)
-                entry["port"] = int(live_ports[0]) if live_ports else int(ports[0])
+                entry["port"] = _safe_int(live_ports[0], 0) if live_ports else _safe_int(ports[0], 0)
                 entry["error"] = "" if live_ports else "; ".join(str(p) + ": " + str(e) for p, e in failed_ports.items())
                 entry["ports"] = live_ports
                 entry["failed_ports"] = failed_ports
             entry["verified_at"] = verified_at
             TG_PROXY_STATUS[key] = entry
-        _web_bridge_ports = sorted({int(_l.get("port") or 443) for _l in _status_rows if (_l.get("protocol") or "") == "webproxy" and _l.get("active") and int(_l.get("port") or 443) != int(WEBPROXY_PUBLIC_PORT)})
+        _web_bridge_ports = sorted({_safe_int(_l.get("port") or 443, 443) for _l in _status_rows if (_l.get("protocol") or "") == "webproxy" and _l.get("active") and _safe_int(_l.get("port") or 443, 443) != int(WEBPROXY_PUBLIC_PORT)})
         for _bp in _web_bridge_ports:
             _alive, _berr = await _probe_raw_listener(_bp, "http-proxy")
             if _alive:
@@ -4101,9 +4962,9 @@ async def refresh_proxy_listener_status(force=False):
                 TELEMT_HEALTH["web_children_total"] = 0
             TELEMT_HEALTH["error"] = str(health.get("error") or "")
         web_entry["port"] = WEBPROXY_PUBLIC_PORT
-        web_entry["ports"] = [WEBPROXY_PUBLIC_PORT] + sorted({int(_l.get("port") or 443) for _l in _status_rows if (_l.get("protocol") or "") == "webproxy" and _l.get("active") and int(_l.get("port") or 443) != int(WEBPROXY_PUBLIC_PORT) and _web_bridge_running(int(_l.get("port") or 443))})
+        web_entry["ports"] = [WEBPROXY_PUBLIC_PORT] + sorted({_safe_int(_l.get("port") or 443, 443) for _l in _status_rows if (_l.get("protocol") or "") == "webproxy" and _l.get("active") and _safe_int(_l.get("port") or 443, 443) != int(WEBPROXY_PUBLIC_PORT) and _web_bridge_running(_safe_int(_l.get("port") or 443, 443))})
         web_entry["failed_ports"] = {str(p): e for p, e in _WEB_BRIDGE_ERRORS.items()}
-        web_entry["bridge_ports"] = sorted({int(_l.get("port") or 443) for _l in _status_rows if (_l.get("protocol") or "") == "webproxy" and _l.get("active") and int(_l.get("port") or 443) != int(WEBPROXY_PUBLIC_PORT) and _web_bridge_running(int(_l.get("port") or 443))})
+        web_entry["bridge_ports"] = sorted({_safe_int(_l.get("port") or 443, 443) for _l in _status_rows if (_l.get("protocol") or "") == "webproxy" and _l.get("active") and _safe_int(_l.get("port") or 443, 443) != int(WEBPROXY_PUBLIC_PORT) and _web_bridge_running(_safe_int(_l.get("port") or 443, 443))})
         web_entry["bridge_errors"] = dict(_WEB_BRIDGE_ERRORS)
         try:
             await _ensure_web_base_secret()
@@ -4473,6 +5334,115 @@ async def _telemt_mtproto_sync_once():
         pass
 
 
+async def _telemt_web_sync_loop():
+    while True:
+        await asyncio.sleep(15.0)
+        try:
+            await _telemt_web_sync_once()
+        except Exception:
+            pass
+
+
+async def _telemt_web_sync_once():
+    global _TELEMT_WEB_GENERATION
+    if tgproxy is None:
+        return
+    gen_fn = _tg_fn("telemt_web_generation")
+    gen = 0
+    if gen_fn is not None:
+        try:
+            gen = int(gen_fn() or 0)
+        except Exception:
+            gen = 0
+    restarted = gen != _TELEMT_WEB_GENERATION and _TELEMT_WEB_GENERATION != 0
+    _TELEMT_WEB_GENERATION = gen
+    async with LINKS_LOCK:
+        rows = [link for link in LINKS.values() if (link.get("protocol") or "") == "webproxy" and link.get("active")]
+    runtime_up = 0
+    runtime_down = 0
+    runtime_ok = False
+    try:
+        status = await _tg_call("telemt_web_status", _TELEMT_ROOT_CHILD_UID)
+        if isinstance(status, dict) and status.get("enabled"):
+            runtime_up = int(status.get("runtime_bytes_up") or 0)
+            runtime_down = int(status.get("runtime_bytes_down") or 0)
+            runtime_ok = True
+    except Exception:
+        runtime_ok = False
+    now = time.monotonic()
+    prev_runtime = _TELEMT_WEB_RUNTIME_LAST.get("sample")
+    runtime_delta = 0
+    runtime_up_bps = 0
+    runtime_down_bps = 0
+    if prev_runtime is not None and runtime_ok:
+        dt = max(now - prev_runtime[0], 0.001)
+        runtime_delta = max(0, runtime_up - prev_runtime[1]) + max(0, runtime_down - prev_runtime[2])
+        runtime_up_bps = max(0, int((runtime_up - prev_runtime[1]) / dt))
+        runtime_down_bps = max(0, int((runtime_down - prev_runtime[2]) / dt))
+    if runtime_ok:
+        _TELEMT_WEB_RUNTIME_LAST["sample"] = (now, runtime_up, runtime_down)
+    total_moved = 0
+    fresh = False
+    for link in rows:
+        uid = str(link.get("uid", ""))
+        if restarted:
+            _TELEMT_WEB_STATS.pop(uid, None)
+        try:
+            stats = await _tg_call("telemt_web_user_stats", uid)
+        except Exception:
+            stats = None
+        if not isinstance(stats, dict) or not stats:
+            continue
+        try:
+            total = int(stats.get("total_octets") or 0)
+            current_connections = int(stats.get("current_connections") or 0)
+            active_unique_ips = int(stats.get("active_unique_ips") or 0)
+        except (TypeError, ValueError):
+            continue
+        counted = int(_WEB_TOKEN_CHARGED.get(uid) or 0)
+        base = _TELEMT_WEB_STATS.get(uid)
+        if base is None:
+            _TELEMT_WEB_STATS[uid] = {"telemt": total, "counted": counted, "current_connections": current_connections, "active_unique_ips": active_unique_ips, "total_bps": 0, "last_sync": now}
+            fresh = True
+            continue
+        if total < base["telemt"]:
+            base["telemt"] = total
+            base["counted"] = counted
+            base["current_connections"] = current_connections
+            base["active_unique_ips"] = active_unique_ips
+            base["total_bps"] = 0
+            base["last_sync"] = now
+            continue
+        delta_telemt = total - base["telemt"]
+        total_moved += max(0, delta_telemt)
+        residual = delta_telemt - (counted - base["counted"])
+        dt_sync = max(now - float(base.get("last_sync") or now), 0.001)
+        base["telemt"] = total
+        base["counted"] = counted
+        base["current_connections"] = current_connections
+        base["active_unique_ips"] = active_unique_ips
+        base["total_bps"] = max(0, int(delta_telemt / dt_sync)) if delta_telemt > 0 else 0
+        base["last_sync"] = now
+        if residual > 0:
+            try:
+                await consume_quota_partial(uid, residual)
+            except Exception:
+                pass
+    window_fallback = bool(runtime_ok and runtime_delta > 0 and total_moved == 0 and rows and not fresh)
+    if window_fallback:
+        _TELEMT_WEB_FALLBACK["streak"] = int(_TELEMT_WEB_FALLBACK.get("streak") or 0) + 1
+    else:
+        _TELEMT_WEB_FALLBACK["streak"] = 0
+    active_now = _TELEMT_WEB_FALLBACK["streak"] >= 2
+    if active_now and not _TELEMT_WEB_FALLBACK.get("active"):
+        _TELEMT_WEB_FALLBACK["since"] = datetime.now(UTC).isoformat()
+    _TELEMT_WEB_FALLBACK["active"] = active_now
+    _TELEMT_WEB_FALLBACK["runtime_up"] = runtime_up
+    _TELEMT_WEB_FALLBACK["runtime_down"] = runtime_down
+    _TELEMT_WEB_FALLBACK["runtime_up_bps"] = runtime_up_bps
+    _TELEMT_WEB_FALLBACK["runtime_down_bps"] = runtime_down_bps
+
+
 def proxy_link_for_uid(uid, protocol, host, port, variant="dd", domain="www.google.com", token=""):
     stored = LINKS.get(uid) or {"uid": uid}
     try:
@@ -4709,6 +5679,33 @@ if CONFIG["database_url"] and HAS_POSTGRES:
                 CREATE TABLE IF NOT EXISTS doh_upstreams (
                     id SERIAL PRIMARY KEY, url TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS foxhole_relay (
+                    id INTEGER PRIMARY KEY,
+                    key_enc TEXT NOT NULL DEFAULT '',
+                    fingerprint TEXT NOT NULL DEFAULT '',
+                    enabled BOOLEAN DEFAULT FALSE,
+                    requests BIGINT NOT NULL DEFAULT 0,
+                    bytes_up BIGINT NOT NULL DEFAULT 0,
+                    bytes_down BIGINT NOT NULL DEFAULT 0,
+                    last_used TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT '',
+                    rotated_at TEXT NOT NULL DEFAULT '',
+                    slug TEXT NOT NULL DEFAULT '',
+                    label TEXT NOT NULL DEFAULT '',
+                    allowlist TEXT NOT NULL DEFAULT '',
+                    rate_limit BIGINT NOT NULL DEFAULT 0,
+                    traffic_limit_bytes BIGINT NOT NULL DEFAULT 0,
+                    expires_at TEXT NOT NULL DEFAULT '',
+                    deleted BOOLEAN NOT NULL DEFAULT FALSE
+                );
+                CREATE TABLE IF NOT EXISTS foxhole_relay_usage (
+                    id SERIAL PRIMARY KEY,
+                    fingerprint TEXT NOT NULL DEFAULT '',
+                    ts TEXT NOT NULL DEFAULT '',
+                    bytes_up BIGINT NOT NULL DEFAULT 0,
+                    bytes_down BIGINT NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_foxhole_relay_usage_ts ON foxhole_relay_usage (ts);
                 CREATE TABLE IF NOT EXISTS proxy_lines (
                     id SERIAL PRIMARY KEY,
                     name TEXT NOT NULL,
@@ -4793,6 +5790,13 @@ if CONFIG["database_url"] and HAS_POSTGRES:
             await ensure_column_pg("links", "bypass_russia", "BOOLEAN DEFAULT FALSE")
             await ensure_column_pg("session_events", "bytes_up", "BIGINT DEFAULT 0")
             await ensure_column_pg("session_events", "bytes_down", "BIGINT DEFAULT 0")
+            await ensure_column_pg("foxhole_relay", "slug", "TEXT DEFAULT ''")
+            await ensure_column_pg("foxhole_relay", "label", "TEXT DEFAULT ''")
+            await ensure_column_pg("foxhole_relay", "allowlist", "TEXT DEFAULT ''")
+            await ensure_column_pg("foxhole_relay", "rate_limit", "BIGINT DEFAULT 0")
+            await ensure_column_pg("foxhole_relay", "traffic_limit_bytes", "BIGINT DEFAULT 0")
+            await ensure_column_pg("foxhole_relay", "expires_at", "TEXT DEFAULT ''")
+            await ensure_column_pg("foxhole_relay", "deleted", "BOOLEAN DEFAULT FALSE")
             
 
     async def db_execute(sqlite_q: str, pg_q: str, params: tuple = ()):
@@ -4921,6 +5925,33 @@ else:
             CREATE TABLE IF NOT EXISTS doh_upstreams (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, url TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS foxhole_relay (
+                id INTEGER PRIMARY KEY,
+                key_enc TEXT NOT NULL DEFAULT '',
+                fingerprint TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 0,
+                requests INTEGER NOT NULL DEFAULT 0,
+                bytes_up INTEGER NOT NULL DEFAULT 0,
+                bytes_down INTEGER NOT NULL DEFAULT 0,
+                last_used TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT '',
+                rotated_at TEXT NOT NULL DEFAULT '',
+                slug TEXT NOT NULL DEFAULT '',
+                label TEXT NOT NULL DEFAULT '',
+                allowlist TEXT NOT NULL DEFAULT '',
+                rate_limit INTEGER NOT NULL DEFAULT 0,
+                traffic_limit_bytes INTEGER NOT NULL DEFAULT 0,
+                expires_at TEXT NOT NULL DEFAULT '',
+                deleted INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS foxhole_relay_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fingerprint TEXT NOT NULL DEFAULT '',
+                ts TEXT NOT NULL DEFAULT '',
+                bytes_up INTEGER NOT NULL DEFAULT 0,
+                bytes_down INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_foxhole_relay_usage_ts ON foxhole_relay_usage (ts);
             CREATE TABLE IF NOT EXISTS proxy_lines (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
@@ -5015,6 +6046,13 @@ else:
         await ensure_column_sqlite("links", "last_test_verdict", "TEXT DEFAULT ''")
         await ensure_column_sqlite("session_events", "bytes_up", "INTEGER DEFAULT 0")
         await ensure_column_sqlite("session_events", "bytes_down", "INTEGER DEFAULT 0")
+        await ensure_column_sqlite("foxhole_relay", "slug", "TEXT DEFAULT ''")
+        await ensure_column_sqlite("foxhole_relay", "label", "TEXT DEFAULT ''")
+        await ensure_column_sqlite("foxhole_relay", "allowlist", "TEXT DEFAULT ''")
+        await ensure_column_sqlite("foxhole_relay", "rate_limit", "INTEGER DEFAULT 0")
+        await ensure_column_sqlite("foxhole_relay", "traffic_limit_bytes", "INTEGER DEFAULT 0")
+        await ensure_column_sqlite("foxhole_relay", "expires_at", "TEXT DEFAULT ''")
+        await ensure_column_sqlite("foxhole_relay", "deleted", "INTEGER DEFAULT 0")
 
         await db_conn.commit()
 
@@ -6041,6 +7079,7 @@ async def lifespan(app: FastAPI):
         TG_PROXY_STATUS["webproxy"] = {"enabled": bool(_web_base_ok and _telemt_ok), "port": WEBPROXY_PUBLIC_PORT, "error": "" if (_web_base_ok and _telemt_ok) else (WEBPROXY_STATE["configure_error"] or "telemt binary is not available on this host")}
         asyncio.create_task(_proxy_listener_refresh_loop())
         asyncio.create_task(_telemt_mtproto_sync_loop())
+        asyncio.create_task(_telemt_web_sync_loop())
     await migrate_proxy_passwords()
     version_row = await db_fetchone(
         "SELECT value FROM settings WHERE key = 'jwt_token_version'",
@@ -7258,6 +8297,9 @@ bdi{unicode-bidi:isolate}
 .btn-sm{min-height:var(--sx-control-h-sm);padding:10px 14px;font-size:var(--sx-text-sm)}
 .btn-icon{display:inline-flex;align-items:center;justify-content:center;width:38px;height:38px;border-radius:var(--sx-radius-md);border:1px solid var(--sx-border);background:var(--sx-surface);color:var(--sx-text-2);cursor:pointer;transition:background-color var(--sx-transition),color var(--sx-transition),border-color var(--sx-transition);flex:none}
 .btn-icon:hover{background:var(--sx-surface-2);color:var(--sx-text);border-color:var(--sx-accent-border)}
+body.sx-doc-land #theme-toggle-btn{color:var(--sx-text)}
+body.sx-doc-land #theme-icon{display:inline-flex;line-height:0}
+body.sx-doc-land #theme-icon svg{width:20px;height:20px;display:block}
 .btn-danger-icon:hover{color:var(--sx-danger);border-color:var(--sx-danger-border)}
 .btn:focus-visible,.btn-icon:focus-visible,.act-btn:focus-visible,.nav-link:focus-visible,.pill-btn:focus-visible,.chip:focus-visible,.seg-btn:focus-visible,.lang-btn:focus-visible,.mo-close:focus-visible{outline:2px solid var(--sx-focus);outline-offset:2px}
 .lang-switch{display:flex;gap:2px;background:var(--sx-surface-2);border:1px solid var(--sx-border);border-radius:var(--sx-radius-md);padding:3px}
@@ -7409,7 +8451,7 @@ LANDING_HTML = r"""<!DOCTYPE html>
         <button class="lang-btn lang-en active" onclick="setLang('en')">EN</button>
         <button class="lang-btn lang-fa" onclick="setLang('fa')">FA</button>
       </div>
-      <button class="btn-icon" id="theme-toggle-btn" onclick="toggleTheme()" title="Toggle theme" data-en-title="Toggle theme" data-fa-title="تغییر تم" aria-label="Toggle theme" data-en-aria="Toggle theme" data-fa-aria="تغییر تم"><span id="theme-icon"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg></span></span></button>
+      <button class="btn-icon" id="theme-toggle-btn" onclick="toggleTheme()" title="Toggle theme" data-en-title="Toggle theme" data-fa-title="تغییر تم" aria-label="Toggle theme" data-en-aria="Toggle theme" data-fa-aria="تغییر تم"><span id="theme-icon"><span class="ic" style="--ic:20px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg></span></span></button>
     </div>
   </div>
 </div>
@@ -7442,14 +8484,14 @@ function setLang(l){
   document.querySelectorAll('[data-en-aria]').forEach(el=>{const v=el.getAttribute('data-'+l+'-aria');if(v)el.setAttribute('aria-label',v);});
   localStorage.setItem('ll', l);
 }
-const THEME_ICONS={dark:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>',light:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>',blue:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>'};
+const THEME_ICONS={dark:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>',light:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>',blue:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" fill="currentColor" stroke="none"/><path d="M19 1.8l.7 1.9 1.9.7-1.9.7-.7 1.9-.7-1.9-1.9-.7 1.9-.7z" fill="currentColor" stroke="none"/></svg>'};
 function setTheme(t){
   theme = t;
   document.body.classList.toggle('light-mode', t==='light');
   document.body.classList.toggle('blue-dark', t==='blue-dark');
   localStorage.setItem('theme', t);
   const themeIcon = document.getElementById('theme-icon');
-  if (themeIcon) themeIcon.innerHTML = t==='light' ? THEME_ICONS.light : THEME_ICONS.dark;
+  if (themeIcon) themeIcon.innerHTML = '<span class="ic" style="--ic:20px" aria-hidden="true">' + (t==='light' ? THEME_ICONS.light : t==='blue-dark' ? THEME_ICONS.blue : THEME_ICONS.dark) + '</span>';
 }
 function toggleTheme(){
   const themes = ['dark','light','blue-dark'];
@@ -7678,7 +8720,9 @@ async def _forward_http_to_telemt(request, uid, upstream_path, upstream_query=b"
                 pass
             if total["down"]:
                 try:
-                    await consume_quota_partial(quota_uid or uid, total["down"])
+                    charged = await consume_quota_partial(quota_uid or uid, total["down"])
+                    if charged and quota_uid and quota_uid != _TELEMT_ROOT_CHILD_UID:
+                        _WEB_TOKEN_CHARGED[str(quota_uid)] = int(_WEB_TOKEN_CHARGED.get(str(quota_uid)) or 0) + int(charged)
                 except Exception:
                     pass
 
@@ -7698,7 +8742,8 @@ async def _forward_ws_to_telemt(websocket, uid, upstream_path, quota_uid=None):
     raw.settimeout(10.0)
     try:
         raw.connect(("127.0.0.1", int(port)))
-    except OSError:
+    except OSError as exc:
+        logger.warning("WEB WS forwarder TCP connect to telemt failed on port " + str(port) + ": " + str(exc))
         try:
             raw.close()
         except OSError:
@@ -7714,7 +8759,8 @@ async def _forward_ws_to_telemt(websocket, uid, upstream_path, quota_uid=None):
     ws_header_key = "additional_headers" if ws_major >= 13 else "extra_headers"
     try:
         upstream_ws = await websockets.connect(url, sock=raw, subprotocols=subprotocols, open_timeout=10.0, ping_interval=None, max_size=None, compression=None, **{ws_header_key: {"X-Forwarded-For": client_ip}})
-    except Exception:
+    except Exception as exc:
+        logger.warning("WEB WS forwarder upstream WS connect failed for " + str(upstream_path) + ": " + str(exc))
         try:
             raw.close()
         except OSError:
@@ -7776,12 +8822,16 @@ async def _forward_ws_to_telemt(websocket, uid, upstream_path, quota_uid=None):
         pass
     try:
         if up_total:
-            await consume_quota_partial(quota_uid or uid, up_total)
+            charged = await consume_quota_partial(quota_uid or uid, up_total)
+            if charged and quota_uid and quota_uid != _TELEMT_ROOT_CHILD_UID:
+                _WEB_TOKEN_CHARGED[str(quota_uid)] = int(_WEB_TOKEN_CHARGED.get(str(quota_uid)) or 0) + int(charged)
     except Exception:
         pass
     try:
         if down_total:
-            await consume_quota_partial(quota_uid or uid, down_total)
+            charged = await consume_quota_partial(quota_uid or uid, down_total)
+            if charged and quota_uid and quota_uid != _TELEMT_ROOT_CHILD_UID:
+                _WEB_TOKEN_CHARGED[str(quota_uid)] = int(_WEB_TOKEN_CHARGED.get(str(quota_uid)) or 0) + int(charged)
     except Exception:
         pass
 
@@ -9754,6 +10804,486 @@ async def generate_webproxy_secret(_=Depends(require_auth)):
     return {"secret": _webproxy_new_secret_hex()}
 
 
+@app.api_route("/api/foxhole/relay", methods=["GET", "POST"])
+async def foxhole_relay(request: Request):
+    if request.method == "GET":
+        row = await _foxhole_load_row()
+        plain_key = _foxhole_resolve_key(row)
+        return JSONResponse(content={"ok": True, "service": "foxhole-relay", "version": STABLE_VERSION, "enabled": _foxhole_row_enabled(row), "configured": bool(plain_key), "relay_url": "/api/foxhole/relay"})
+    raw_body = await request.body()
+    if len(raw_body) > FOXHOLE_MAX_JSON_BODY_BYTES:
+        return JSONResponse(content={"e": "request too large"})
+    try:
+        req = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+    except Exception:
+        return JSONResponse(content={"e": "bad request"})
+    if not isinstance(req, dict):
+        return JSONResponse(content={"e": "bad request"})
+    presented = req.get("k")
+    row, plain_key = await _foxhole_load_row_for_secret(presented if isinstance(presented, str) else "")
+    if not plain_key or not isinstance(presented, str) or not hmac_mod.compare_digest(presented, plain_key):
+        return JSONResponse(content={"e": "unauthorized"})
+    if not _foxhole_row_enabled(row):
+        return JSONResponse(content={"e": "relay disabled"})
+    blocked = _foxhole_relay_blocked(row)
+    if blocked:
+        return JSONResponse(content={"e": blocked})
+    fingerprint = _foxhole_effective_fingerprint(row, plain_key)
+    items = req.get("q")
+    is_batch = isinstance(items, list)
+    if is_batch and len(items) > FOXHOLE_BATCH_MAX_ITEMS:
+        return JSONResponse(content={"e": "batch too large"})
+    timeout = httpx.Timeout(FOXHOLE_TIMEOUT_SECONDS, connect=FOXHOLE_CONNECT_TIMEOUT_SECONDS)
+    total_up = 0
+    total_down = 0
+    total_count = 0
+    async with httpx.AsyncClient(timeout=timeout, max_redirects=FOXHOLE_MAX_REDIRECTS, trust_env=False) as client:
+        if is_batch:
+            results = []
+            item_bytes = []
+            for item in items:
+                fresh_row = await _foxhole_load_row_by_fingerprint(fingerprint)
+                if fresh_row is not None:
+                    fresh_blocked = _foxhole_relay_blocked(fresh_row)
+                    if fresh_blocked:
+                        results.append({"e": fresh_blocked})
+                        continue
+                if not await _foxhole_rate_allow(fingerprint, _foxhole_row_rate_limit(row)):
+                    results.append({"e": "rate limited"})
+                    continue
+                total_count += 1
+                result, up_bytes, down_bytes = await _foxhole_fetch_with_retry(item, client, request, True)
+                total_up += up_bytes
+                total_down += down_bytes
+                item_bytes.append((up_bytes, down_bytes))
+                results.append(result)
+            await _foxhole_account(fingerprint, total_count, total_up, total_down, items=item_bytes)
+            return JSONResponse(content={"q": results})
+        if not await _foxhole_rate_allow(fingerprint, _foxhole_row_rate_limit(row)):
+            return JSONResponse(content={"e": "rate limited"})
+        result, up_bytes, down_bytes = await _foxhole_fetch_with_retry(req, client, request, False)
+        await _foxhole_account(fingerprint, 1, up_bytes, down_bytes, items=[(up_bytes, down_bytes)])
+        return JSONResponse(content=result)
+
+
+FOXHOLE_GET_PAGE_STATES = {
+    "works": (200, "#10b981", "Working", "Your relay is ready", "Put this page's address in Arman VPN:", ["Settings", "Connection", "If Mozilla is blocked", "Cloudflare Worker"]),
+    "wrong": (403, "#ef4444", "Wrong secret", "This address has no secret, or the wrong one", "It must end in ?secret= followed by the key set in the panel.", []),
+    "unset": (503, "#f59e0b", "Not set up", "Set a secret first", "Generate a relay key in the panel first, then open this address with ?secret= at the end.", []),
+    "disabled": (503, "#f59e0b", "Relay disabled", "The relay is switched off", "Enable the relay in the panel first, then open this address again.", []),
+}
+
+
+def _foxhole_relay_fail(status, why):
+    return Response(content=why, status_code=status, headers={"X-Relay-Error": why}, media_type="text/plain")
+
+
+def _foxhole_relay_page(state):
+    status, color, badge, title, text, steps = FOXHOLE_GET_PAGE_STATES[state]
+    path_html = ''
+    if steps:
+        path_html = '<div class="path">' + ''.join('<span>' + step + '</span><i>›</i>' for step in steps[:-1]) + '<span>' + steps[-1] + '</span></div>'
+    page_html = (
+        '<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+        '<title>SulgX relay</title><style>'
+        ':root{--bg:#eef0fb;--card:#fff;--text:#1d2040;--muted:#5d6385;--accent:#5b5bd6;--c:' + color + '}'
+        '@media (prefers-color-scheme:dark){:root{--bg:#0b0e1f;--card:#151a35;--text:#eef0ff;--muted:#9aa3c7;--accent:#8b8ff8}}'
+        '*{box-sizing:border-box}'
+        'body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;color:var(--text);'
+        'font:16px/1.65 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;'
+        'background:radial-gradient(900px 500px at 15% -10%,color-mix(in srgb,var(--accent) 28%,transparent),transparent),'
+        'radial-gradient(700px 500px at 110% 110%,color-mix(in srgb,var(--c) 22%,transparent),transparent),var(--bg)}'
+        '.card{width:min(560px,100%);background:var(--card);border-radius:22px;padding:34px 32px;'
+        'box-shadow:0 24px 70px rgba(20,27,61,.18);border-top:5px solid var(--c)}'
+        '.brand{display:flex;align-items:center;gap:10px;font-weight:700;color:var(--muted);font-size:14px;letter-spacing:.02em}'
+        '.dot{width:10px;height:10px;border-radius:50%;background:var(--accent)}'
+        '.badge{display:inline-block;margin-top:22px;padding:6px 14px;border-radius:999px;font-weight:700;font-size:14px;'
+        'color:var(--c);background:color-mix(in srgb,var(--c) 15%,transparent)}'
+        'h1{font-size:23px;line-height:1.3;margin:14px 0 8px}'
+        'p{margin:0;color:var(--muted)}'
+        '.path{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:16px}'
+        '.path span{padding:5px 12px;border-radius:10px;font-weight:600;font-size:14px;'
+        'background:color-mix(in srgb,var(--accent) 13%,transparent);color:var(--accent)}'
+        '.path i{color:var(--muted);font-style:normal}'
+        '</style>'
+        '<div class="card"><div class="brand"><span class="dot"></span>SulgX relay</div>'
+        '<span class="badge">' + badge + '</span><h1>' + title + '</h1><p>' + text + '</p>' + path_html + '</div></html>'
+    )
+    return HTMLResponse(content=page_html, status_code=status)
+def _foxhole_get_fail_status(message):
+    if message.startswith("host not allowed:"):
+        return 403
+    if message == "bad url" or message == "bad body":
+        return 400
+    if message == "bad method":
+        return 405
+    if message == "request too large":
+        return 413
+    if message.startswith("loop detected:"):
+        return 400
+    return 502
+
+
+@app.api_route("/relay", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"])
+async def foxhole_get_relay(request: Request):
+    return await _foxhole_serve_get_relay(request, None)
+
+
+@app.api_route("/relay/{slug}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"])
+async def foxhole_get_relay_slug(request: Request, slug: str):
+    return await _foxhole_serve_get_relay(request, slug)
+
+
+async def _foxhole_serve_get_relay(request: Request, path_slug):
+    params = request.query_params
+    target = params.get("url")
+    probe = params.get("health") == "1"
+    browser = target is None and not probe
+    if probe:
+        if request.method != "GET":
+            return _foxhole_relay_fail(405, "health requires GET")
+        if path_slug:
+            row = await _foxhole_load_row_by_slug(path_slug)
+        else:
+            row = await _foxhole_load_row()
+        plain_key = _foxhole_resolve_key(row) if row else ""
+        return JSONResponse(content={"relay": FOXHOLE_GET_RELAY_NAME, "version": STABLE_VERSION, "ready": bool(row) and _foxhole_row_enabled(row) and bool(plain_key)}, headers={"Cache-Control": "no-store"})
+    presented = params.get("secret") or ""
+    pinned_row = None
+    if path_slug:
+        pinned_row = await _foxhole_load_row_by_slug(path_slug)
+    if pinned_row is not None:
+        row = pinned_row
+        plain_key = _foxhole_resolve_key(row)
+    else:
+        row, plain_key = await _foxhole_load_row_for_secret(presented)
+    if not plain_key:
+        if browser:
+            return _foxhole_relay_page("unset")
+        return _foxhole_relay_fail(503, "no secret is set in the relay")
+    if not hmac_mod.compare_digest(presented, plain_key):
+        if browser:
+            return _foxhole_relay_page("wrong")
+        return _foxhole_relay_fail(403, "wrong secret")
+    if browser:
+        if not _foxhole_row_enabled(row):
+            return _foxhole_relay_page("disabled")
+        blocked = _foxhole_relay_blocked(row)
+        if blocked:
+            return _foxhole_relay_fail(403, blocked)
+        return _foxhole_relay_page("works")
+    if not _foxhole_row_enabled(row):
+        return _foxhole_relay_fail(503, "relay disabled")
+    blocked = _foxhole_relay_blocked(row)
+    if blocked:
+        return _foxhole_relay_fail(403, blocked)
+    try:
+        parts = urlparse(target)
+    except Exception:
+        return _foxhole_relay_fail(400, "url must be an https URL")
+    scheme = (parts.scheme or "").lower()
+    allow_private = os.environ.get("FOXHOLE_ALLOW_PRIVATE", "").strip() == "1"
+    if (scheme != "https" and not (allow_private and scheme == "http")) or not parts.hostname:
+        return _foxhole_relay_fail(400, "url must be an https URL")
+    fingerprint = _foxhole_effective_fingerprint(row, plain_key)
+    if not await _foxhole_rate_allow(fingerprint, _foxhole_row_rate_limit(row)):
+        return _foxhole_relay_fail(429, "rate limited")
+    raw_body = await request.body()
+    if len(raw_body) > FOXHOLE_MAX_REQUEST_BYTES:
+        return _foxhole_relay_fail(413, "request too large")
+    item = {"u": target, "m": request.method, "h": dict(request.headers), "r": False}
+    if raw_body:
+        item["b"] = base64.b64encode(raw_body).decode()
+        content_type = request.headers.get("content-type")
+        if content_type:
+            item["ct"] = content_type
+    timeout = httpx.Timeout(FOXHOLE_GET_TIMEOUT_SECONDS, connect=FOXHOLE_GET_CONNECT_TIMEOUT_SECONDS)
+    client = httpx.AsyncClient(timeout=timeout, max_redirects=FOXHOLE_MAX_REDIRECTS, trust_env=False)
+    allowlist = _foxhole_row_allowlist(row)
+    try:
+        stream, resp, up_bytes = await _foxhole_fetch_open(item, client, request, allowlist=allowlist if allowlist is not None else True)
+    except _FoxholeFetchError as failure:
+        await client.aclose()
+        return _foxhole_relay_fail(_foxhole_get_fail_status(failure.message), failure.message)
+    resp_headers = _foxhole_clean_response_headers(resp.headers)
+    try:
+        row_limit = int(row.get("traffic_limit_bytes") or 0)
+        row_used = int(row.get("bytes_up") or 0) + int(row.get("bytes_down") or 0)
+    except (TypeError, ValueError):
+        row_limit = 0
+        row_used = 0
+    row_expires = _foxhole_parse_expires(row)
+
+    async def body_iter():
+        down_bytes = 0
+        try:
+            async for chunk in resp.aiter_bytes():
+                if row_limit > 0 and row_used + down_bytes + len(chunk) > row_limit:
+                    raise RuntimeError("traffic limit reached")
+                if row_expires is not None and datetime.now(UTC) >= row_expires:
+                    raise RuntimeError("relay expired")
+                down_bytes += len(chunk)
+                if down_bytes > FOXHOLE_MAX_RESPONSE_BYTES:
+                    raise RuntimeError("response too large")
+                yield chunk
+        finally:
+            await stream.__aexit__(None, None, None)
+            await client.aclose()
+            await _foxhole_account(fingerprint, 1, up_bytes, min(down_bytes, FOXHOLE_MAX_RESPONSE_BYTES), items=[(up_bytes, min(down_bytes, FOXHOLE_MAX_RESPONSE_BYTES))])
+    return StreamingResponse(body_iter(), status_code=resp.status_code, headers=resp_headers)
+
+
+@app.get("/api/foxhole/status")
+async def foxhole_status(_=Depends(require_auth)):
+    row = await _foxhole_load_row()
+    plain_key = _foxhole_resolve_key(row)
+    env_only = bool(plain_key) and not (row and (row.get("key_enc") or ""))
+    return {
+        "ok": True,
+        "service": "foxhole-relay",
+        "version": STABLE_VERSION,
+        "configured": bool(plain_key),
+        "env_key": env_only,
+        "enabled": _foxhole_row_enabled(row),
+        "fingerprint": _foxhole_effective_fingerprint(row, plain_key),
+        "requests": int((row or {}).get("requests") or 0),
+        "bytes_up": int((row or {}).get("bytes_up") or 0),
+        "bytes_down": int((row or {}).get("bytes_down") or 0),
+        "last_used": (row or {}).get("last_used") or "",
+        "created_at": (row or {}).get("created_at") or "",
+        "rotated_at": (row or {}).get("rotated_at") or "",
+        "limits": {
+            "max_request_bytes": FOXHOLE_MAX_REQUEST_BYTES,
+            "max_response_bytes": FOXHOLE_MAX_RESPONSE_BYTES,
+            "max_json_body_bytes": FOXHOLE_MAX_JSON_BODY_BYTES,
+            "timeout_seconds": FOXHOLE_TIMEOUT_SECONDS,
+            "max_redirects": FOXHOLE_MAX_REDIRECTS,
+            "batch_max_items": FOXHOLE_BATCH_MAX_ITEMS,
+            "rate_limit_per_minute": FOXHOLE_RATE_LIMIT_MAX,
+        },
+        "relay_url": "/api/foxhole/relay",
+    }
+
+
+@app.get("/api/foxhole/stats")
+async def foxhole_stats(request: Request, _=Depends(require_auth)):
+    selector = (request.query_params.get("relay") or "").strip()
+    if not selector:
+        return await _foxhole_usage_stats()
+    row = await _foxhole_load_row_by_slug(selector)
+    if row:
+        fingerprint = _foxhole_effective_fingerprint(row, _foxhole_resolve_key(row))
+        result = await _foxhole_usage_stats([fingerprint])
+        result["relay"] = {"slug": str(row.get("slug") or ""), "fingerprint": fingerprint}
+        return result
+    if re.fullmatch(r"[0-9a-f]{16}", selector):
+        result = await _foxhole_usage_stats([selector])
+        result["relay"] = {"slug": "", "fingerprint": selector}
+        return result
+    raise HTTPException(status_code=404, detail="Unknown relay")
+
+
+@app.post("/api/foxhole/generate")
+async def foxhole_generate(_=Depends(require_auth)):
+    plain_key = secrets.token_urlsafe(32)
+    fingerprint = await _foxhole_store_key(plain_key, True, True)
+    log_event("Firefox Relay", "Relay key generated")
+    return {"ok": True, "key": plain_key, "fingerprint": fingerprint, "enabled": True, "relay_url": "/api/foxhole/relay"}
+
+
+@app.post("/api/foxhole/rotate")
+async def foxhole_rotate(_=Depends(require_auth)):
+    row = await _foxhole_load_row()
+    if not _foxhole_resolve_key(row):
+        raise HTTPException(status_code=400, detail="No relay key configured, use generate")
+    plain_key = secrets.token_urlsafe(32)
+    fingerprint = await _foxhole_store_key(plain_key, _foxhole_row_enabled(row), True)
+    log_event("Firefox Relay", "Relay key rotated, previous key invalidated")
+    return {"ok": True, "key": plain_key, "fingerprint": fingerprint, "enabled": _foxhole_row_enabled(row), "relay_url": "/api/foxhole/relay"}
+
+
+@app.post("/api/foxhole/enable")
+async def foxhole_enable(_=Depends(require_auth)):
+    row = await _foxhole_load_row()
+    if not _foxhole_resolve_key(row):
+        raise HTTPException(status_code=400, detail="No relay key configured, use generate")
+    await _foxhole_set_enabled(True)
+    log_event("Firefox Relay", "Relay enabled")
+    return {"ok": True, "enabled": True}
+
+
+@app.post("/api/foxhole/disable")
+async def foxhole_disable(_=Depends(require_auth)):
+    await _foxhole_set_enabled(False)
+    log_event("Firefox Relay", "Relay disabled")
+    return {"ok": True, "enabled": False}
+
+
+@app.post("/api/foxhole/relays", status_code=201)
+async def foxhole_create_relay(request: Request, _=Depends(require_auth)):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    label = str(body.get("label") or "").strip()[:120]
+    slug = ""
+    if body.get("slug"):
+        slug = _foxhole_valid_slug(body.get("slug"))
+        if not slug:
+            raise HTTPException(status_code=400, detail="Invalid slug")
+        existing = await _foxhole_load_row_by_slug(slug, include_deleted=True)
+        if existing:
+            raise HTTPException(status_code=400, detail="slug already exists")
+    try:
+        allowlist = _foxhole_parse_allowlist_input(body.get("allowlist"))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    rate_limit = _foxhole_parse_nonneg_int(body.get("rate_limit"), "rate_limit")
+    traffic_limit = _foxhole_parse_nonneg_int(body.get("traffic_limit_bytes"), "traffic_limit_bytes")
+    expires_raw = str(body.get("expires_at") or "").strip()
+    if expires_raw and _foxhole_parse_expires({"expires_at": expires_raw}) is None:
+        raise HTTPException(status_code=400, detail="Invalid expires_at")
+    enabled = body.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise HTTPException(status_code=400, detail="Invalid enabled")
+    if not slug:
+        slug = await _foxhole_unique_slug(label or "relay")
+    plain_key = secrets.token_urlsafe(32)
+    fingerprint = _foxhole_fingerprint(plain_key)
+    encrypted = encrypt_proxy_password(plain_key)
+    now = datetime.now(UTC).isoformat()
+    allowlist_text = json.dumps(allowlist) if allowlist else ""
+    try:
+        await db_execute(
+            "INSERT INTO foxhole_relay (slug, label, key_enc, fingerprint, enabled, requests, bytes_up, bytes_down, last_used, created_at, rotated_at, allowlist, rate_limit, traffic_limit_bytes, expires_at, deleted) VALUES (?, ?, ?, ?, ?, 0, 0, 0, '', ?, ?, ?, ?, ?, ?, 0)",
+            "INSERT INTO foxhole_relay (slug, label, key_enc, fingerprint, enabled, requests, bytes_up, bytes_down, last_used, created_at, rotated_at, allowlist, rate_limit, traffic_limit_bytes, expires_at, deleted) VALUES ($1, $2, $3, $4, $5, 0, 0, 0, '', $6, $7, $8, $9, $10, $11, FALSE)",
+            (slug, label, encrypted, fingerprint, 1 if enabled else 0, now, now, allowlist_text, rate_limit, traffic_limit, expires_raw),
+        )
+    except Exception as e:
+        text = str(e).lower()
+        if "unique" in text or "duplicate" in text:
+            raise HTTPException(status_code=400, detail="slug already exists")
+        raise
+    row = await _foxhole_load_row_by_slug(slug)
+    log_event("Firefox Relay", "Relay created: " + slug)
+    return JSONResponse(status_code=201, content={"ok": True, "key": plain_key, "relay": _foxhole_relay_public(row)})
+
+
+@app.get("/api/foxhole/relays")
+async def foxhole_list_relays(_=Depends(require_auth)):
+    rows = await _foxhole_load_all_rows()
+    relays = []
+    for row in rows:
+        public = _foxhole_relay_public(row)
+        fingerprint = str(public.get("fingerprint") or "")
+        if fingerprint:
+            public["usage"] = await _foxhole_usage_stats([fingerprint])
+        else:
+            public["usage"] = await _foxhole_usage_stats([])
+        relays.append(public)
+    return {"ok": True, "relays": relays, "totals": await _foxhole_usage_stats()}
+
+
+@app.patch("/api/foxhole/relays/{relay_id}")
+async def foxhole_update_relay(relay_id: int, request: Request, _=Depends(require_auth)):
+    row = await _foxhole_load_row_by_id(relay_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Relay not found")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    columns = []
+    values = []
+    now = datetime.now(UTC).isoformat()
+    if "label" in body:
+        columns.append("label")
+        values.append(str(body.get("label") or "").strip()[:120])
+    if body.get("slug"):
+        slug = _foxhole_valid_slug(body.get("slug"))
+        if not slug:
+            raise HTTPException(status_code=400, detail="Invalid slug")
+        clash = await _foxhole_load_row_by_slug(slug, include_deleted=True)
+        if clash and int(clash.get("id") or 0) != int(relay_id):
+            raise HTTPException(status_code=400, detail="slug already exists")
+        columns.append("slug")
+        values.append(slug)
+    if "allowlist" in body:
+        try:
+            allowlist = _foxhole_parse_allowlist_input(body.get("allowlist"))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        columns.append("allowlist")
+        values.append(json.dumps(allowlist) if allowlist else "")
+    if "rate_limit" in body:
+        columns.append("rate_limit")
+        values.append(_foxhole_parse_nonneg_int(body.get("rate_limit"), "rate_limit"))
+    if "traffic_limit_bytes" in body:
+        columns.append("traffic_limit_bytes")
+        values.append(_foxhole_parse_nonneg_int(body.get("traffic_limit_bytes"), "traffic_limit_bytes"))
+    if "expires_at" in body:
+        expires_raw = str(body.get("expires_at") or "").strip()
+        if expires_raw and _foxhole_parse_expires({"expires_at": expires_raw}) is None:
+            raise HTTPException(status_code=400, detail="Invalid expires_at")
+        columns.append("expires_at")
+        values.append(expires_raw)
+    if "enabled" in body:
+        if not isinstance(body.get("enabled"), bool):
+            raise HTTPException(status_code=400, detail="Invalid enabled")
+        columns.append("enabled")
+        values.append(1 if body.get("enabled") else 0)
+    plain_key = None
+    literal = ""
+    old_fingerprint = str(row.get("fingerprint") or "")
+    if body.get("rotate") is True:
+        plain_key = secrets.token_urlsafe(32)
+        columns.append("key_enc")
+        values.append(encrypt_proxy_password(plain_key))
+        columns.append("fingerprint")
+        values.append(_foxhole_fingerprint(plain_key))
+        columns.append("rotated_at")
+        values.append(now)
+        literal = ", requests = 0, bytes_up = 0, bytes_down = 0, last_used = ''"
+    if columns or literal:
+        sqlite_sets = ", ".join(c + " = ?" for c in columns) + literal
+        pg_sets = ", ".join(c + " = $" + str(i + 1) for i, c in enumerate(columns)) + literal
+        await db_execute(
+            "UPDATE foxhole_relay SET " + sqlite_sets + " WHERE id = ?",
+            "UPDATE foxhole_relay SET " + pg_sets + " WHERE id = $" + str(len(columns) + 1),
+            tuple(values) + (relay_id,),
+        )
+    if plain_key is not None and old_fingerprint:
+        FOXHOLE_RATE_BUCKETS.pop(old_fingerprint, None)
+    updated = await _foxhole_load_row_by_id(relay_id)
+    if plain_key is not None:
+        log_event("Firefox Relay", "Relay key rotated: " + str((updated or {}).get("slug") or relay_id))
+    result = {"ok": True, "relay": _foxhole_relay_public(updated)}
+    if plain_key is not None:
+        result["key"] = plain_key
+    return result
+
+
+@app.delete("/api/foxhole/relays/{relay_id}")
+async def foxhole_delete_relay(relay_id: int, _=Depends(require_auth)):
+    row = await _foxhole_load_row_by_id(relay_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Relay not found")
+    fingerprint = str(row.get("fingerprint") or "")
+    await db_execute(
+        "UPDATE foxhole_relay SET deleted = 1, key_enc = '', enabled = 0 WHERE id = ?",
+        "UPDATE foxhole_relay SET deleted = TRUE, key_enc = '', enabled = FALSE WHERE id = $1",
+        (relay_id,),
+    )
+    if fingerprint:
+        FOXHOLE_RATE_BUCKETS.pop(fingerprint, None)
+    log_event("Firefox Relay", "Relay deleted: " + str(row.get("slug") or relay_id))
+    return {"ok": True, "deleted": relay_id, "slug": row.get("slug") or ""}
+
+
 @app.post("/api/links/{uid}/outbound")
 async def set_link_outbound(uid: str, request: Request, _=Depends(require_auth)):
     body = await request.json()
@@ -9789,6 +11319,431 @@ async def set_link_outbound(uid: str, request: Request, _=Depends(require_auth))
     else:
         await db_execute("UPDATE links SET outbound_mode = ?, proxy_line_id = ? WHERE uid = ?", "UPDATE links SET outbound_mode = $1, proxy_line_id = $2 WHERE uid = $3", (mode, proxy_line_id, uid))
     return {"ok": True, "outbound_mode": mode, "proxy_line_id": proxy_line_id, "outbound_proxy": outbound_proxy}
+
+
+FOXHOLE_PING_RECEIVE_URL = "https://vpn.mozilla.org/"
+FOXHOLE_PING_SEND_URL = "https://api.accounts.firefox.com/v1/oauth/token"
+FOXHOLE_PING_SEND_BODY = b'{"client_id": "5882386c6d801776", "grant_type": "fxa-credentials", "scope": "profile https://identity.mozilla.com/apps/vpn", "ttl": 86400}'
+FOXHOLE_PING_SETTINGS_KEY = "foxhole_last_ping"
+FOXHOLE_CODE_GS = r"""var RELAY_AUTH_PROPERTY = "RELAY_AUTH_KEY";
+var RELAY_QUOTA_PROPERTY_PREFIX = "RELAY_USE_";
+var RELAY_DAILY_FETCH_CAP = 18000;
+var MAX_POST_BYTES = 16777216;
+var MAX_PAYLOAD_BYTES = 10485760;
+var MAX_RESPONSE_BYTES = 20971520;
+var MAX_BATCH_ITEMS = 50;
+var MAX_URL_CHARS = 8192;
+var MAX_HEADER_COUNT = 64;
+var MAX_HEADER_VALUE_CHARS = 16384;
+var MIN_GZIP_BYTES = 1024;
+
+var SKIP_HEADERS = {
+  host: 1, connection: 1, "content-length": 1,
+  "transfer-encoding": 1, "proxy-connection": 1, "proxy-authorization": 1,
+  "priority": 1, te: 1,
+  "x-forwarded-for": 1, "x-forwarded-host": 1, "x-forwarded-proto": 1,
+  "x-forwarded-port": 1, "x-real-ip": 1, "forwarded": 1, "via": 1,
+  "x-mhr-hop": 1,
+  "accept-encoding": 1
+};
+
+var _GAS_URL_RE = /^https?:\x2f\x2fscript\.google\.com\x2fmacros\x2f/i;
+var _HTTP_URL_RE = /^https?:\x2f\x2f/i;
+var _NO_GZIP_TYPE_RE = /^(image|video|audio)\x2f/i;
+
+var SAFE_REPLAY_METHODS = { GET: 1, HEAD: 1, OPTIONS: 1 };
+var ALLOWED_METHODS = { GET: 1, HEAD: 1, POST: 1, PUT: 1, PATCH: 1, DELETE: 1, OPTIONS: 1 };
+
+function doPost(e) {
+  try {
+    if (!e || !e.postData || typeof e.postData.contents !== "string") {
+      return _json({ e: "bad request" });
+    }
+    if (e.postData.contents.length > MAX_POST_BYTES) {
+      return _json({ e: "request too large" });
+    }
+    var req;
+    try {
+      req = JSON.parse(e.postData.contents);
+    } catch (parseErr) {
+      return _json({ e: "bad json" });
+    }
+    if (!req || typeof req !== "object") {
+      return _json({ e: "bad request" });
+    }
+    var key = _authKey();
+    if (!key || !_keysEqual(String(req.k || ""), key)) {
+      return _json({ e: "unauthorized" });
+    }
+    if (Array.isArray(req.q)) return _doBatch(req.q);
+    return _doSingle(req);
+  } catch (err) {
+    return _json({ e: _errText(err) });
+  }
+}
+
+function _authKey() {
+  try {
+    var key = PropertiesService.getScriptProperties().getProperty(RELAY_AUTH_PROPERTY);
+    if (typeof key === "string" && key.length > 0) return key;
+  } catch (err) {}
+  return null;
+}
+
+function _keysEqual(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  var n = Math.max(a.length, b.length);
+  var diff = a.length === b.length ? 0 : 1;
+  for (var i = 0; i < n; i++) {
+    var ca = i < a.length ? a.charCodeAt(i) : 0;
+    var cb = i < b.length ? b.charCodeAt(i) : 0;
+    diff = diff | (ca ^ cb);
+  }
+  return diff === 0;
+}
+
+function _errText(err) {
+  if (err && typeof err.message === "string" && err.message.length > 0) return err.message;
+  return String(err);
+}
+
+function _todayKey() {
+  var d = new Date();
+  var m = d.getUTCMonth() + 1;
+  var day = d.getUTCDate();
+  return d.getUTCFullYear() + "-" + (m < 10 ? "0" + m : "" + m) + "-" + (day < 10 ? "0" + day : "" + day);
+}
+
+function _checkQuota(n) {
+  try {
+    var props = PropertiesService.getScriptProperties();
+    var name = RELAY_QUOTA_PROPERTY_PREFIX + _todayKey();
+    var used = parseInt(props.getProperty(name) || "0", 10);
+    if (isNaN(used)) used = 0;
+    if (used + n > RELAY_DAILY_FETCH_CAP) return false;
+    props.setProperty(name, String(used + n));
+    return true;
+  } catch (err) {
+    return true;
+  }
+}
+
+function _checkUrl(u) {
+  if (!u || typeof u !== "string" || u.length > MAX_URL_CHARS || !_HTTP_URL_RE.test(u)) {
+    return "bad url";
+  }
+  if (_GAS_URL_RE.test(u)) {
+    return "loop detected: relay target cannot be a Google Apps Script URL";
+  }
+  return null;
+}
+
+function _checkMethod(m) {
+  var method = String(m || "GET").toUpperCase();
+  if (!ALLOWED_METHODS[method]) return "bad method";
+  return null;
+}
+
+function _headerValue(headers, name) {
+  if (!headers || typeof headers !== "object") return "";
+  var want = name.toLowerCase();
+  for (var k in headers) {
+    if (Object.prototype.hasOwnProperty.call(headers, k) && k.toLowerCase() === want) {
+      return String(headers[k]);
+    }
+  }
+  return "";
+}
+
+function _maybeGzip(bytes, contentType) {
+  if (bytes.length < MIN_GZIP_BYTES) return { b: bytes, gz: false };
+  var ct = String(contentType || "").toLowerCase();
+  if (_NO_GZIP_TYPE_RE.test(ct) || ct.indexOf("zip") !== -1 || ct.indexOf("gzip") !== -1 ||
+      ct.indexOf("octet-stream") !== -1 || ct.indexOf("pdf") !== -1) {
+    return { b: bytes, gz: false };
+  }
+  try {
+    var compressed = Utilities.gzip(Utilities.newBlob(bytes)).getBytes();
+    if (compressed.length < bytes.length) {
+      return { b: compressed, gz: true };
+    }
+  } catch (e) {}
+  return { b: bytes, gz: false };
+}
+
+function _resultOf(resp) {
+  var content = resp.getContent();
+  if (content.length > MAX_RESPONSE_BYTES) {
+    return { e: "response too large" };
+  }
+  var headers = _respHeaders(resp);
+  var gz = _maybeGzip(content, _headerValue(headers, "content-type"));
+  var result = {
+    s: resp.getResponseCode(),
+    h: headers,
+    b: Utilities.base64Encode(gz.b)
+  };
+  if (gz.gz) result.gz = 1;
+  return result;
+}
+
+function _doSingle(req) {
+  var urlErr = _checkUrl(req.u);
+  if (urlErr) return _json({ e: urlErr });
+  var methodErr = _checkMethod(req.m);
+  if (methodErr) return _json({ e: methodErr });
+  var opts = _buildOpts(req);
+  if (!_checkQuota(1)) return _json({ e: "quota exceeded" });
+  var resp = UrlFetchApp.fetch(req.u, opts);
+  return _json(_resultOf(resp));
+}
+
+function _doBatch(items) {
+  if (items.length > MAX_BATCH_ITEMS) {
+    return _json({ e: "batch too large" });
+  }
+  var fetchArgs = [];
+  var fetchIndex = [];
+  var fetchMethods = [];
+  var errorMap = {};
+
+  for (var i = 0; i < items.length; i++) {
+    var item = items[i];
+    if (!item || typeof item !== "object") {
+      errorMap[i] = "bad item";
+      continue;
+    }
+    var urlErr = _checkUrl(item.u);
+    if (urlErr) {
+      errorMap[i] = urlErr;
+      continue;
+    }
+    var methodErr = _checkMethod(item.m);
+    if (methodErr) {
+      errorMap[i] = methodErr;
+      continue;
+    }
+    try {
+      var opts = _buildOpts(item);
+      opts.url = item.u;
+      fetchArgs.push(opts);
+      fetchIndex.push(i);
+      fetchMethods.push(String(item.m || "GET").toUpperCase());
+    } catch (err) {
+      errorMap[i] = _errText(err);
+    }
+  }
+
+  var responses = [];
+  if (fetchArgs.length > 0) {
+    if (!_checkQuota(fetchArgs.length)) {
+      return _json({ e: "quota exceeded" });
+    }
+    try {
+      responses = UrlFetchApp.fetchAll(fetchArgs);
+    } catch (err) {
+      responses = [];
+      for (var j = 0; j < fetchArgs.length; j++) {
+        try {
+          if (!SAFE_REPLAY_METHODS[fetchMethods[j]]) {
+            errorMap[fetchIndex[j]] = "batch fetchAll failed; unsafe method not replayed";
+            responses[j] = null;
+            continue;
+          }
+          if (!_checkQuota(1)) {
+            errorMap[fetchIndex[j]] = "quota exceeded";
+            responses[j] = null;
+            continue;
+          }
+          var fallbackReq = fetchArgs[j];
+          var fallbackUrl = fallbackReq.url;
+          var fallbackOpts = {};
+          for (var key in fallbackReq) {
+            if (Object.prototype.hasOwnProperty.call(fallbackReq, key) && key !== "url") {
+              fallbackOpts[key] = fallbackReq[key];
+            }
+          }
+          responses[j] = UrlFetchApp.fetch(fallbackUrl, fallbackOpts);
+        } catch (singleErr) {
+          errorMap[fetchIndex[j]] = _errText(singleErr);
+          responses[j] = null;
+        }
+      }
+    }
+  }
+
+  var respOf = {};
+  for (var j = 0; j < fetchIndex.length; j++) respOf[fetchIndex[j]] = responses[j];
+  var results = [];
+  for (var i = 0; i < items.length; i++) {
+    if (Object.prototype.hasOwnProperty.call(errorMap, i)) {
+      results.push({ e: errorMap[i] });
+    } else {
+      var resp = respOf[i];
+      if (!resp) {
+        results.push({ e: "fetch failed" });
+      } else {
+        results.push(_resultOf(resp));
+      }
+    }
+  }
+  return _json({ q: results });
+}
+
+function _buildOpts(req) {
+  var method = String(req.m || "GET").toUpperCase();
+  var opts = {
+    method: method.toLowerCase(),
+    muteHttpExceptions: true,
+    followRedirects: req.r !== false,
+    validateHttpsCertificates: true,
+    escaping: false
+  };
+  var headers = { "x-mhr-hop": "1" };
+  var count = 1;
+  if (req.h && typeof req.h === "object") {
+    for (var k in req.h) {
+      if (!Object.prototype.hasOwnProperty.call(req.h, k)) continue;
+      if (SKIP_HEADERS[k.toLowerCase()]) continue;
+      var v = req.h[k];
+      if (v === null || v === undefined) continue;
+      var text = String(v);
+      if (text.length > MAX_HEADER_VALUE_CHARS) throw new Error("bad headers");
+      count++;
+      if (count > MAX_HEADER_COUNT) throw new Error("bad headers");
+      headers[k] = text;
+    }
+  }
+  opts.headers = headers;
+  if (req.b) {
+    var payload = Utilities.base64Decode(req.b);
+    if (payload.length > MAX_PAYLOAD_BYTES) throw new Error("payload too large");
+    opts.payload = payload;
+    if (req.ct) opts.contentType = req.ct;
+  }
+  return opts;
+}
+
+function _respHeaders(resp) {
+  try {
+    if (typeof resp.getAllHeaders === "function") {
+      return resp.getAllHeaders();
+    }
+  } catch (err) {}
+  return resp.getHeaders();
+}
+
+function doGet(e) {
+  return HtmlService.createHtmlOutput(
+    "<!DOCTYPE html><html><head><title>My App</title></head>" +
+      '<body style="font-family:sans-serif;max-width:600px;margin:40px auto">' +
+      "<h1>Welcome</h1><p>This application is running normally.</p>" +
+      "</body></html>"
+  );
+}
+
+function _json(obj) {
+  var text = JSON.stringify(obj).replace(/[<>&]/g, function (c) {
+    return "\\u00" + c.charCodeAt(0).toString(16);
+  });
+  return HtmlService.createHtmlOutput(text).setXFrameOptionsMode(
+    HtmlService.XFrameOptionsMode.ALLOWALL
+  );
+}
+"""
+
+
+async def _foxhole_ping_load():
+    try:
+        row = await db_fetchone("SELECT value FROM settings WHERE key = 'foxhole_last_ping'", "SELECT value FROM settings WHERE key = 'foxhole_last_ping'")
+        if row and row.get("value"):
+            parsed = json.loads(str(row.get("value")))
+            if isinstance(parsed, dict):
+                return parsed
+    except Exception:
+        return None
+    return None
+
+
+async def _foxhole_ping_save(record):
+    try:
+        await db_execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", "INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2", (FOXHOLE_PING_SETTINGS_KEY, json.dumps(record)))
+    except Exception as e:
+        logger.error(f"Firefox Relay ping save failed: {e}")
+
+
+async def _foxhole_ping_probe(item, client, request):
+    started = time.monotonic()
+    result, up_bytes, down_bytes = await _foxhole_fetch_with_retry(item, client, request, False)
+    elapsed_ms = int(round((time.monotonic() - started) * 1000))
+    if isinstance(result, dict) and "s" in result:
+        return {"ok": True, "ms": elapsed_ms, "status": int(result.get("s")), "up_bytes": up_bytes, "down_bytes": down_bytes, "error": ""}
+    return {"ok": False, "ms": elapsed_ms, "status": 0, "up_bytes": up_bytes, "down_bytes": down_bytes, "error": str(result.get("e") or "fetch failed")}
+
+
+@app.get("/api/foxhole/ping")
+async def foxhole_ping_last(_=Depends(require_auth)):
+    return {"ok": True, "last_ping": await _foxhole_ping_load()}
+
+
+@app.post("/api/foxhole/ping")
+async def foxhole_ping(request: Request, _=Depends(require_auth)):
+    try:
+        ping_body = await request.json()
+    except Exception:
+        ping_body = {}
+    if not isinstance(ping_body, dict):
+        ping_body = {}
+    ping_selector = str(ping_body.get("relay") or request.query_params.get("relay") or "").strip()
+    relay_slug = "default"
+    if ping_selector:
+        slug_loader = globals().get("_foxhole_load_row_by_slug")
+        if slug_loader is not None:
+            row = await slug_loader(ping_selector)
+            if not row:
+                raise HTTPException(status_code=404, detail="Unknown relay")
+            relay_slug = str(row.get("slug") or ping_selector)
+        elif ping_selector != "default":
+            raise HTTPException(status_code=404, detail="Unknown relay")
+        else:
+            row = await _foxhole_load_row()
+    else:
+        row = await _foxhole_load_row()
+        if row:
+            relay_slug = str(row.get("slug") or "default")
+    plain_key = _foxhole_resolve_key(row)
+    if not plain_key:
+        raise HTTPException(status_code=400, detail="No relay key configured, use generate")
+    if not _foxhole_row_enabled(row):
+        raise HTTPException(status_code=400, detail="Relay disabled")
+    blocked_checker = globals().get("_foxhole_relay_blocked")
+    if blocked_checker is not None:
+        blocked_reason = blocked_checker(row)
+        if blocked_reason:
+            raise HTTPException(status_code=400, detail=blocked_reason)
+    body = ping_body
+    receive_url = str(body.get("receive_u") or FOXHOLE_PING_RECEIVE_URL).strip()
+    send_url = str(body.get("send_u") or FOXHOLE_PING_SEND_URL).strip()
+    if not re.match(r"^https?://", receive_url, re.IGNORECASE) or not re.match(r"^https?://", send_url, re.IGNORECASE):
+        raise HTTPException(status_code=400, detail="bad url")
+    send_payload = base64.b64encode(FOXHOLE_PING_SEND_BODY).decode()
+    timeout = httpx.Timeout(FOXHOLE_TIMEOUT_SECONDS, connect=FOXHOLE_CONNECT_TIMEOUT_SECONDS)
+    async with httpx.AsyncClient(timeout=timeout, max_redirects=FOXHOLE_MAX_REDIRECTS, trust_env=False) as client:
+        receive = await _foxhole_ping_probe({"u": receive_url, "m": "GET"}, client, request)
+        send = await _foxhole_ping_probe({"u": send_url, "m": "POST", "b": send_payload, "ct": "application/json"}, client, request)
+    receive["target"] = receive_url
+    send["target"] = send_url
+    now = datetime.now(UTC).isoformat()
+    record = {"ok": bool(receive["ok"] and send["ok"]), "receive": receive, "send": send, "at": now, "relay": relay_slug}
+    await _foxhole_ping_save(record)
+    log_event("Firefox Relay", f"Relay ping {relay_slug} receive {receive_url} {receive['ms']} ms status {receive['status']}; send {send_url} {send['ms']} ms status {send['status']}")
+    return record
+
+
+@app.get("/api/foxhole/code.gs")
+async def foxhole_code_gs(_=Depends(require_auth)):
+    data = FOXHOLE_CODE_GS.encode("utf-8")
+    return Response(content=data, media_type="text/plain; charset=utf-8", headers={"Content-Disposition": "attachment; filename=\"Code.gs\"", "Cache-Control": "no-store"})
 
 
 async def _resolve_owner_name(name):
@@ -10082,13 +12037,16 @@ def active_sessions_snapshot():
             "up_bps": up_bps,
             "down_bps": down_bps,
             "started_at": info.get("connected_at", ""),
-            "client_ip": info.get("ip", ""),
+            "client_ip": _normalize_client_ip(info.get("ip", "")),
             "destination": info.get("destination", ""),
             "dest_host": info.get("dest_host", ""),
             "dest_port": info.get("dest_port", 0),
             "quota_remaining": (limit - used) if limit > 0 else None,
             "limit_bytes": limit,
             "used_bytes": used,
+            "link_used_bytes": used,
+            "unflushed_bytes": 0,
+            "total_bps": 0,
             "max_connections": int(link.get("max_connections", 0) or 0) if link else 0,
             "link_sessions": _link_session_count(uid),
         })
@@ -10117,7 +12075,9 @@ def active_sessions_snapshot():
             limit = int(link.get("limit_bytes", 0) or 0) if link else 0
             used = int(link.get("used_bytes", 0) or 0) if link else 0
             flushed = int(s.get("bytes_flushed", 0) or 0)
-            used = used + max(0, int(s.get("bytes_up", 0) or 0) + int(s.get("bytes_down", 0) or 0) - flushed)
+            link_used = used
+            unflushed = max(0, int(s.get("bytes_up", 0) or 0) + int(s.get("bytes_down", 0) or 0) - flushed)
+            used = used + unflushed
             owner = (link.get("owner_user_id") or "") if link else ""
             out.append({
                 "conn_id": sid,
@@ -10136,13 +12096,16 @@ def active_sessions_snapshot():
                 "up_bps": up_bps,
                 "down_bps": down_bps,
                 "started_at": s.get("started_at", ""),
-                "client_ip": s.get("client_ip", ""),
+                "client_ip": _normalize_client_ip(s.get("client_ip", "")),
                 "destination": s.get("destination", ""),
                 "dest_host": s.get("dest_host", ""),
                 "dest_port": s.get("dest_port", 0),
                 "quota_remaining": (limit - used) if limit > 0 else None,
                 "limit_bytes": limit,
                 "used_bytes": used,
+                "link_used_bytes": link_used,
+                "unflushed_bytes": unflushed,
+                "total_bps": 0,
                 "bytes_flushed": flushed,
                 "max_connections": int(link.get("max_connections", 0) or 0) if link else 0,
                 "link_sessions": _link_session_count(_row_uid) + _proxy_session_count(_row_uid),
@@ -10158,7 +12121,7 @@ def active_sessions_snapshot():
             web_sessions = []
         for s in web_sessions:
             sid = "proxy:web:" + _wuid + ":" + str(s.get("id", ""))
-            web_ip = str(s.get("client_ip") or s.get("remote_ip") or s.get("ip") or s.get("peer_ip") or s.get("client") or "")
+            web_ip = _normalize_client_ip(s.get("client_ip") or s.get("remote_ip") or s.get("ip") or s.get("peer_ip") or s.get("client") or "")
             live.add(sid)
             up = int(s.get("bytes_up", 0) or 0)
             down = int(s.get("bytes_down", 0) or 0)
@@ -10175,7 +12138,13 @@ def active_sessions_snapshot():
             limit = int(link.get("limit_bytes", 0) or 0) if link else 0
             used = int(link.get("used_bytes", 0) or 0) if link else 0
             flushed = int(s.get("bytes_flushed", 0) or 0)
-            used = used + max(0, int(s.get("bytes_up", 0) or 0) + int(s.get("bytes_down", 0) or 0) - flushed)
+            web_stats = _TELEMT_WEB_STATS.get(_wuid) or {}
+            web_total_bps = int(web_stats.get("total_bps") or 0)
+            web_fallback = bool(_TELEMT_WEB_FALLBACK.get("active"))
+            web_in_up = int(_TELEMT_WEB_FALLBACK.get("runtime_up") or 0) if web_fallback else 0
+            web_in_down = int(_TELEMT_WEB_FALLBACK.get("runtime_down") or 0) if web_fallback else 0
+            web_in_up_bps = int(_TELEMT_WEB_FALLBACK.get("runtime_up_bps") or 0) if web_fallback else 0
+            web_in_down_bps = int(_TELEMT_WEB_FALLBACK.get("runtime_down_bps") or 0) if web_fallback else 0
             owner = (link.get("owner_user_id") or "") if link else ""
             out.append({
                 "conn_id": sid,
@@ -10201,11 +12170,37 @@ def active_sessions_snapshot():
                 "quota_remaining": (limit - used) if limit > 0 else None,
                 "limit_bytes": limit,
                 "used_bytes": used,
+                "link_used_bytes": used,
+                "unflushed_bytes": 0,
+                "total_bps": web_total_bps,
                 "bytes_flushed": flushed,
+                "aggregate_count_only": bool(str(s.get("id", "")).startswith("aggregate-")),
+                "web_fallback": web_fallback,
+                "web_inbound_bytes_up": web_in_up,
+                "web_inbound_bytes_down": web_in_down,
+                "web_inbound_up_bps": web_in_up_bps,
+                "web_inbound_down_bps": web_in_down_bps,
                 "max_connections": int(link.get("max_connections", 0) or 0) if link else 0,
                 "link_sessions": _link_session_count(_wuid) + _proxy_session_count(_wuid),
             })
+    try:
+        closed_fn = _tg_fn("take_closed_proxy_sessions")
+        closed_rows = closed_fn() if closed_fn is not None else []
+    except Exception:
+        closed_rows = []
+    for crow in closed_rows or []:
+        if not isinstance(crow, dict) or not crow.get("id"):
+            continue
+        csid = "proxy:" + str(crow.get("id") or "")
+        clink = _link_for_proxy_session(str(crow.get("username") or ""))
+        cuid = str(clink.get("uid") or "") if clink else str(crow.get("username") or "")
+        cproto = str(crow.get("protocol") or "")
+        _observe_session_event({"conn_id": csid, "uid": cuid, "client_ip": _normalize_client_ip(crow.get("client_ip") or ""), "inbound_tag": "socks5-in" if cproto == "socks5" else ("http-proxy-in" if cproto == "http-proxy" else "mtproxy-in"), "transport": cproto, "started_at": crow.get("started_at") or ""})
+        _observe_session_end(csid, int(crow.get("bytes_up") or 0), int(crow.get("bytes_down") or 0))
+        _ACTIVE_LAST.pop(csid, None)
     for row in out:
+        if row.get("aggregate_count_only"):
+            continue
         _observe_session_event(row)
     for dead in list(_ACTIVE_LAST):
         if dead not in live:
@@ -10223,7 +12218,7 @@ def _aggregate_active_users(rows):
         inbound = str(row.get("uid") or "")
         if not inbound:
             inbound = str(row.get("owner_user_id") or "") or str(row.get("inbound_tag") or row.get("transport") or "")
-        client_ip = str(row.get("client_ip") or "").strip()
+        client_ip = _normalize_client_ip(row.get("client_ip") or "")
         subnet = subnet24_of(client_ip)
         key = "card:" + inbound + "|" + subnet
         group = grouped.get(key)
@@ -10241,6 +12236,15 @@ def _aggregate_active_users(rows):
             group["bytes_down"] = 0
             group["up_bps"] = 0
             group["down_bps"] = 0
+            group["used_bytes"] = int(row.get("link_used_bytes") or row.get("used_bytes") or 0)
+            group["bytes_flushed"] = 0
+            group["total_bps"] = 0
+            group["web_fallback"] = False
+            group["web_inbound_bytes_up"] = 0
+            group["web_inbound_bytes_down"] = 0
+            group["web_inbound_up_bps"] = 0
+            group["web_inbound_down_bps"] = 0
+            group["aggregate_count_only"] = True
             group["started_at"] = row.get("started_at") or ""
             grouped[key] = group
             order.append(key)
@@ -10264,6 +12268,16 @@ def _aggregate_active_users(rows):
         group["bytes_down"] += int(row.get("bytes_down") or 0)
         group["up_bps"] += int(row.get("up_bps") or 0)
         group["down_bps"] += int(row.get("down_bps") or 0)
+        group["used_bytes"] += int(row.get("unflushed_bytes") or 0)
+        group["bytes_flushed"] += int(row.get("bytes_flushed") or 0)
+        group["total_bps"] += int(row.get("total_bps") or 0)
+        if row.get("web_fallback"):
+            group["web_fallback"] = True
+        for _wf in ("web_inbound_bytes_up", "web_inbound_bytes_down", "web_inbound_up_bps", "web_inbound_down_bps"):
+            if int(row.get(_wf) or 0) > int(group.get(_wf) or 0):
+                group[_wf] = int(row.get(_wf) or 0)
+        if not row.get("aggregate_count_only"):
+            group["aggregate_count_only"] = False
         transport = str(row.get("transport") or "")
         if transport and transport not in group["transports"]:
             group["transports"].append(transport)
@@ -10275,11 +12289,8 @@ def _aggregate_active_users(rows):
             group["started_at"] = started
         if int(row.get("link_sessions") or 0) > int(group.get("link_sessions") or 0):
             group["link_sessions"] = int(row.get("link_sessions") or 0)
-        dest = str(row.get("destination") or "")
-        if not dest and transport in ("mtproto", "webproxy"):
-            dest = "Telegram DC"
-        if not dest and transport in ("socks5", "http-proxy"):
-            dest = "General destination"
+        dest = _dest_label(row)
+        row["dest_label"] = dest
         if dest:
             entry = None
             for existing in group["destinations"]:
@@ -10296,6 +12307,9 @@ def _aggregate_active_users(rows):
             entry["down_bps"] += int(row.get("down_bps") or 0)
             if ip and ip not in entry["client_ips"]:
                 entry["client_ips"].append(ip)
+    for group in grouped.values():
+        limit = int(group.get("limit_bytes") or 0)
+        group["quota_remaining"] = (limit - int(group.get("used_bytes") or 0)) if limit > 0 else None
     return [grouped[key] for key in order]
 
 
@@ -10927,11 +12941,24 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
             async with LINKS_LOCK:
                 LINKS[uid] = norm_refreshed
 
+    _patch_post_warnings = []
     _refreshed_link = LINKS.get(uid)
     if _refreshed_link is not None:
-        await _telemt_sync_link(_refreshed_link, previous=previous)
-        await _proxy_ensure_inbound_ports(_refreshed_link)
-        await refresh_proxy_listener_status(force=True)
+        try:
+            await _telemt_sync_link(_refreshed_link, previous=previous)
+        except Exception as _exc:
+            logger.warning("toggle post-commit telemt sync failed for " + uid + ": " + str(_exc))
+            _patch_post_warnings.append("telemt sync failed: " + str(_exc))
+        try:
+            await _proxy_ensure_inbound_ports(_refreshed_link)
+        except Exception as _exc:
+            logger.warning("toggle post-commit inbound ports failed for " + uid + ": " + str(_exc))
+            _patch_post_warnings.append("inbound ports failed: " + str(_exc))
+        try:
+            await refresh_proxy_listener_status(force=True)
+        except Exception as _exc:
+            logger.warning("toggle post-commit listener status failed for " + uid + ": " + str(_exc))
+            _patch_post_warnings.append("listener status failed: " + str(_exc))
         if (previous.get("protocol") or "") == "webproxy":
             try:
                 _old_port = int(previous.get("port") or 443)
@@ -10940,7 +12967,11 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
                 _old_port = 443
                 _new_port = 443
             if _old_port != _new_port or (_refreshed_link.get("protocol") or "") != "webproxy" or not _refreshed_link.get("active"):
-                await _release_web_bridge_port_if_unused(_old_port)
+                try:
+                    await _release_web_bridge_port_if_unused(_old_port)
+                except Exception as _exc:
+                    logger.warning("toggle post-commit web bridge release failed for " + uid + ": " + str(_exc))
+                    _patch_post_warnings.append("web bridge release failed: " + str(_exc))
     _patch_link_now = LINKS.get(uid)
     if _patch_link_now is not None and (_patch_link_now.get("protocol") or "") in ("socks5", "mtproto", "http-proxy"):
         _patch_prev_port = 0
@@ -10953,31 +12984,48 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
         except (TypeError, ValueError):
             _patch_now_port = 0
         if _patch_prev_port and _patch_now_port and _patch_prev_port != _patch_now_port:
-            await _tcp_proxy_release(uid, "port changed")
+            try:
+                await _tcp_proxy_release(uid, "port changed")
+            except Exception as _exc:
+                logger.warning("toggle post-commit tcp proxy release failed for " + uid + ": " + str(_exc))
+                _patch_post_warnings.append("tcp proxy release failed: " + str(_exc))
     log_event("Inbound", f"Updated inbound {uid}")
     _patch_old_token = str((previous or {}).get("webproxy_token") or "").strip().lower()
     _patch_new_token = str((LINKS.get(uid) or {}).get("webproxy_token") or "").strip().lower()
     if (LINKS.get(uid) or {}).get("protocol") == "webproxy" and _patch_old_token and _patch_new_token and _patch_old_token != _patch_new_token:
         _patch_secret_rotated = bool(_patch_new_secret_hex) or "webproxy_secret" in body or "webproxy_secret_enc" in body
         if not _patch_secret_rotated:
-            await _web_alias_retire(_patch_old_token, _patch_new_token, uid)
+            try:
+                await _web_alias_retire(_patch_old_token, _patch_new_token, uid)
+            except Exception as _exc:
+                logger.warning("toggle post-commit web alias retire failed for " + uid + ": " + str(_exc))
+                _patch_post_warnings.append("web alias retire failed: " + str(_exc))
     _patch_mtproto_gate = None
     _patch_mtproto_tls_warning = ""
     _patch_proto_now = str((LINKS.get(uid) or {}).get("protocol") or "")
     if _patch_proto_now in ("socks5", "mtproto", "http-proxy") and (("port" in body) or ("protocol" in body) or ("active" in body)):
-        _patch_port_ok, _patch_port_detail = await _probe_and_provision_if_needed(LINKS.get(uid) or {}, get_domain(request))
+        try:
+            _patch_port_ok, _patch_port_detail = await _probe_and_provision_if_needed(LINKS.get(uid) or {}, get_domain(request))
+        except Exception as _exc:
+            logger.warning("toggle post-commit public probe failed for " + uid + ": " + str(_exc))
+            _patch_post_warnings.append("public probe failed: " + str(_exc))
+            _patch_port_ok, _patch_port_detail = None, ""
         if _patch_port_ok is not None:
             (LINKS.get(uid) or {})["port_public_reachable"] = _patch_port_ok
             (LINKS.get(uid) or {})["port_check_detail"] = _patch_port_detail
             _patch_mtproto_gate = {"ok": bool(_patch_port_ok), "reason": _patch_port_detail, "ms": 0.0, "host": get_domain(request), "port": (LINKS.get(uid) or {}).get("port")}
     if _patch_proto_now == "mtproto" and (("mtproto_domain" in body) or ("mtproto_variant" in body)):
-        _patch_mtproto_tls_warning = await _mtproto_verify_live_tls(LINKS.get(uid) or {})
+        try:
+            _patch_mtproto_tls_warning = await _mtproto_verify_live_tls(LINKS.get(uid) or {})
+        except Exception as _exc:
+            logger.warning("toggle post-commit mtproto tls verify failed for " + uid + ": " + str(_exc))
+            _patch_post_warnings.append("mtproto tls verify failed: " + str(_exc))
     _patch_mask_warning = ""
     if _patch_proto_now == "mtproto" and (("mtproto_domain" in body) or ("mtproto_variant" in body)):
         _patch_mask_warning = _mtproto_mask_domain_warning((LINKS.get(uid) or {}).get("mtproto_domain"), request)
         if _patch_mask_warning:
             logger.warning("MTProto inbound " + uid + " uses the panel domain as its Fake-TLS mask domain")
-    _patch_warnings = []
+    _patch_warnings = list(_patch_post_warnings)
     if _patch_mask_warning:
         _patch_warnings.append(_patch_mask_warning)
     if _patch_mtproto_tls_warning:
@@ -18427,6 +20475,9 @@ body[dir="rtl"] .row-act-grid{flex-direction:row}
           </button><button class="nav-link" data-page="logs">
             <span class="nav-icon ic" style="--ic:20px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg></span>
             <span data-en="Logs" data-fa="لاگ‌ها">Logs</span>
+          </button><button class="nav-link" data-page="foxhole-relay">
+            <span class="nav-icon ic" style="--ic:20px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg></span>
+            <span data-en="Firefox Relay" data-fa="رله فایرفاکس">Firefox Relay</span>
           </button></div>
 <div class="sx-nav-group"><div class="sx-nav-label" data-en="System" data-fa="سیستم">System</div><button class="nav-link" data-page="telegram">
             <span class="nav-icon ic" style="--ic:20px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg></span>
@@ -18705,6 +20756,126 @@ example.com
         <button class="btn btn-danger btn-sm" onclick="clearLogs()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg></span><span data-en="Clear Logs" data-fa="پاک‌سازی لاگ‌ها">Clear Logs</span></button>
       </div>
     </section>
+    <section class="page" id="page-foxhole-relay">
+      <div class="page-header"><div><div class="page-title" data-en="Firefox Relay" data-fa="رله فایرفاکس">Firefox Relay</div><div class="page-sub" data-en="Use your own panel as the relay for Firefox IP Protection (foxhole) instead of a Google Apps Script deployment." data-fa="از پنل خودتان به‌جای Google Apps Script به‌عنوان رله برای Firefox IP Protection (foxhole) استفاده کنید.">Use your own panel as the relay for Firefox IP Protection (foxhole) instead of a Google Apps Script deployment.</div></div><div style="display:flex;gap:6px;flex-wrap:wrap;"><button class="btn btn-outline btn-sm" onclick="loadFoxholeRelay()"><span class="ic" style="--ic:16px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg></span><span data-en="Refresh" data-fa="بروزرسانی">Refresh</span></button></div></div>
+      <div class="card">
+        <div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg></span><span class="card-title" data-en="Client Relay Link" data-fa="پیوند رله کلاینت">Client Relay Link</span></span></div>
+        <div style="color:var(--text-3);font-size:0.9rem;padding-bottom:8px;" data-en="Paste this whole link into your client: Settings &gt; Connection &gt; &quot;If Mozilla is blocked&quot; &gt; &quot;Cloudflare Worker&quot;. It is a URL + secret, no port, and rides this panel's own HTTPS address." data-fa="این پیوند کامل را در کلاینت خود جای‌گذاری کنید: Settings &gt; Connection &gt; «If Mozilla is blocked» &gt; «Cloudflare Worker». این پیوند یک نشانی + کلید است، بدون پورت، و روی همان نشانی HTTPS خود پنل سوار می‌شود.">Paste this whole link into your client: Settings &gt; Connection &gt; &quot;If Mozilla is blocked&quot; &gt; &quot;Cloudflare Worker&quot;. It is a URL + secret, no port, and rides this panel's own HTTPS address.</div>
+        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg></span> <span data-en="Relay link" data-fa="پیوند رله">Relay link</span></label><div style="display:flex;gap:6px;align-items:center;"><code id="foxhole-client-link" style="direction:ltr;unicode-bidi:plaintext;flex:1;overflow-wrap:anywhere;">–</code><button class="btn btn-outline btn-sm" id="foxhole-client-link-copy-btn" onclick="foxholeCopyClientLink()" disabled><span data-en="Copy Link" data-fa="کپی پیوند">Copy Link</span></button></div></div>
+        <div id="foxhole-client-link-note" style="color:var(--text-3);font-size:0.85rem;padding:2px 0 8px;">Link masked — the key is shown only once. Rotate the key to get a new link.</div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;"><a class="btn btn-outline btn-sm" id="foxhole-status-page-link" href="/relay" target="_blank" rel="noopener"><span data-en="Open relay status page" data-fa="باز کردن صفحه وضعیت رله">Open relay status page</span></a><span style="color:var(--text-3);font-size:0.85rem;" data-en="Opening the full link shows Working; opening the bare relay address without the secret shows Wrong secret." data-fa="باز کردن پیوند کامل «Working» را نشان می‌دهد؛ باز کردن نشانی خالی رله بدون کلید «Wrong secret» را نشان می‌دهد.">Opening the full link shows Working; opening the bare relay address without the secret shows Wrong secret.</span></div>
+      </div>
+      <div class="card">
+        <div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg></span><span class="card-title" data-en="Relay Status" data-fa="وضعیت رله">Relay Status</span></span><span id="foxhole-status-pill" class="tag tag-off" data-en="Disabled" data-fa="غیرفعال">Disabled</span></div>
+        <div class="fg"><label class="fl"><span class="ic" style="--ic:14px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg></span> <span data-en="Relay URL" data-fa="نشانی رله">Relay URL</span></label><div style="display:flex;gap:6px;align-items:center;"><code id="foxhole-relay-url" style="direction:ltr;unicode-bidi:plaintext;flex:1;overflow-wrap:anywhere;">–</code><button class="btn btn-outline btn-sm" onclick="foxholeCopyRelayUrl()"><span data-en="Copy" data-fa="کپی">Copy</span></button></div></div>
+        <div id="foxhole-config-line" style="color:var(--text-3);font-size:0.9rem;padding:2px 0 8px;">–</div>
+        <div id="foxhole-health-line" style="color:var(--text-3);font-size:0.9rem;padding:2px 0 8px;">–</div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;">
+          <button class="btn btn-primary btn-sm" id="foxhole-enable-btn" onclick="foxholeRelayToggle(true)"><span data-en="Enable" data-fa="فعال‌سازی">Enable</span></button>
+          <button class="btn btn-outline btn-sm" id="foxhole-disable-btn" onclick="foxholeRelayToggle(false)"><span data-en="Disable" data-fa="غیرفعال‌سازی">Disable</span></button>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg></span><span class="card-title" data-en="Usage" data-fa="مصرف">Usage</span></span></div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;">
+          <div><div style="color:var(--text-3);font-size:0.85rem;" data-en="Requests" data-fa="درخواست‌ها">Requests</div><div id="foxhole-stat-requests" style="font-weight:700;font-size:1.1rem;">–</div></div>
+          <div><div style="color:var(--text-3);font-size:0.85rem;" data-en="Bytes Up" data-fa="بایت ارسالی">Bytes Up</div><div id="foxhole-stat-up" style="font-weight:700;font-size:1.1rem;">–</div></div>
+          <div><div style="color:var(--text-3);font-size:0.85rem;" data-en="Bytes Down" data-fa="بایت دریافتی">Bytes Down</div><div id="foxhole-stat-down" style="font-weight:700;font-size:1.1rem;">–</div></div>
+          <div><div style="color:var(--text-3);font-size:0.85rem;" data-en="Last Used" data-fa="آخرین استفاده">Last Used</div><div id="foxhole-stat-last" style="font-weight:700;font-size:1.1rem;direction:ltr;text-align:left;">–</div></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></span><span class="card-title" data-en="Relay Stats" data-fa="آمار رله">Relay Stats</span></span></div>
+        <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-bottom:12px;">
+          <div class="stat-card" style="padding:12px;"><div class="stat-label"><span data-en="Connected now" data-fa="متصل اکنون">Connected now</span></div><div class="stat-val" id="foxhole-st-connected" style="font-size:1.3rem;">–</div></div>
+          <div class="stat-card" style="padding:12px;"><div class="stat-label"><span data-en="Unique users today" data-fa="کاربران یکتا امروز">Unique users today</span></div><div class="stat-val" id="foxhole-st-unique-day" style="font-size:1.3rem;">–</div></div>
+          <div class="stat-card" style="padding:12px;"><div class="stat-label"><span data-en="Unique users this month" data-fa="کاربران یکتا این ماه">Unique users this month</span></div><div class="stat-val" id="foxhole-st-unique-month" style="font-size:1.3rem;">–</div></div>
+        </div>
+        <div class="logs-table-container" style="overflow-x:auto;">
+          <table class="tbl">
+            <thead><tr><th data-en="Period" data-fa="بازه">Period</th><th data-en="Up" data-fa="ارسالی">Up</th><th data-en="Down" data-fa="دریافتی">Down</th><th data-en="Total" data-fa="مجموع">Total</th><th data-en="Requests" data-fa="درخواست‌ها">Requests</th></tr></thead>
+            <tbody>
+              <tr><td data-en="Today" data-fa="امروز">Today</td><td id="foxhole-st-day-up" style="direction:ltr;">–</td><td id="foxhole-st-day-down" style="direction:ltr;">–</td><td id="foxhole-st-day-total" style="direction:ltr;">–</td><td id="foxhole-st-req-day">–</td></tr>
+              <tr><td data-en="This month" data-fa="این ماه">This month</td><td id="foxhole-st-month-up" style="direction:ltr;">–</td><td id="foxhole-st-month-down" style="direction:ltr;">–</td><td id="foxhole-st-month-total" style="direction:ltr;">–</td><td id="foxhole-st-req-month">–</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div style="font-size:0.8rem;color:var(--text-2);margin-top:8px;" data-en="Day and month use UTC calendar boundaries. Users are counted by auth key, never by IP. Ping tests do not count toward these stats." data-fa="روز و ماه بر اساس مرزهای تقویمی UTC هستند. کاربران بر اساس کلید احراز هویت شمرده می‌شوند، هرگز بر اساس IP. تست‌های پینگ در این آمار شمرده نمی‌شوند.">Day and month use UTC calendar boundaries. Users are counted by auth key, never by IP. Ping tests do not count toward these stats.</div>
+      </div>
+      <div class="card">
+        <div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg></span><span class="card-title" data-en="Relays" data-fa="رله‌ها">Relays</span></span></div>
+        <div style="color:var(--text-3);font-size:0.9rem;padding-bottom:8px;" data-en="Each relay has its own key, link, allowlist and limits, and works independently of the others. A deleted relay leaves this list at once and its link stops working; its past traffic stays in the day and month totals." data-fa="هر رله کلید، پیوند، فهرست مجاز و محدودیت‌های خودش را دارد و مستقل از بقیه کار می‌کند. رله حذف‌شده فوراً از این فهرست می‌رود و پیوندش از کار می‌افتد؛ ترافیک گذشته‌اش در مجموع روز و ماه باقی می‌ماند.">Each relay has its own key, link, allowlist and limits, and works independently of the others. A deleted relay leaves this list at once and its link stops working; its past traffic stays in the day and month totals.</div>
+        <div id="foxhole-relays-list"></div>
+        <div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border);">
+          <div style="font-weight:700;margin-bottom:8px;" data-en="Create relay" data-fa="ساخت رله">Create relay</div>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;">
+            <div class="fg"><label class="fl"><span data-en="Label" data-fa="برچسب">Label</span></label><input class="fi" id="foxhole-mr-label" oninput="foxholeMrLabelInput()"></div>
+            <div class="fg"><label class="fl"><span data-en="Slug" data-fa="نامک">Slug</span></label><input class="fi" id="foxhole-mr-slug" style="direction:ltr;" oninput="foxholeMrSlugInput()" placeholder="auto from label"></div>
+            <div class="fg"><label class="fl"><span data-en="Allowlist (comma-separated hosts, empty = default)" data-fa="فهرست مجاز (هاست‌ها با ویرگول، خالی = پیش‌فرض)">Allowlist (comma-separated hosts, empty = default)</span></label><input class="fi" id="foxhole-mr-allowlist" style="direction:ltr;" placeholder="vpn.mozilla.org, api.accounts.firefox.com"></div>
+            <div class="fg"><label class="fl"><span data-en="Rate limit / min (0 = global 60)" data-fa="محدودیت نرخ در دقیقه (۰ = سراسری ۶۰)">Rate limit / min (0 = global 60)</span></label><input class="fi" id="foxhole-mr-rate" type="number" min="0" step="1" value="0" style="direction:ltr;"></div>
+            <div class="fg"><label class="fl"><span data-en="Traffic limit, bytes (0 = unlimited)" data-fa="سقف ترافیک، بایت (۰ = نامحدود)">Traffic limit, bytes (0 = unlimited)</span></label><input class="fi" id="foxhole-mr-traffic" type="number" min="0" step="1" value="0" style="direction:ltr;"></div>
+            <div class="fg"><label class="fl"><span data-en="Expiry (empty = never)" data-fa="انقضا (خالی = هرگز)">Expiry (empty = never)</span></label><input class="fi" id="foxhole-mr-expires" type="datetime-local" style="direction:ltr;"></div>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px;">
+            <label style="display:flex;gap:6px;align-items:center;"><input type="checkbox" id="foxhole-mr-enabled" checked> <span data-en="Enabled" data-fa="فعال">Enabled</span></label>
+            <button class="btn btn-primary btn-sm" id="foxhole-mr-create-btn" onclick="foxholeRelayCreate()"><span data-en="Create Relay" data-fa="ساخت رله">Create Relay</span></button>
+          </div>
+          <div id="foxhole-mr-key-box" style="display:none;margin-top:12px;padding:12px;border:1px solid var(--warning);border-radius:10px;background:var(--surface-3);">
+            <div style="color:var(--danger);font-weight:700;margin-bottom:6px;" data-en="Copy this relay link and key now — the key will never be shown again." data-fa="همین حالا پیوند و کلید این رله را کپی کنید — کلید دیگر هرگز نمایش داده نمی‌شود.">Copy this relay link and key now — the key will never be shown again.</div>
+            <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:8px;"><span style="min-width:90px;font-weight:600;" data-en="Relay link" data-fa="پیوند رله">Relay link</span><code id="foxhole-mr-key-link-text" style="direction:ltr;unicode-bidi:plaintext;flex:1;overflow-wrap:anywhere;"></code><button class="btn btn-outline btn-sm" onclick="foxholeMrCopyNewLink()"><span data-en="Copy Link" data-fa="کپی پیوند">Copy Link</span></button></div>
+            <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;"><span style="min-width:90px;font-weight:600;" data-en="Auth key" data-fa="کلید احراز هویت">Auth key</span><code id="foxhole-mr-key-text" style="direction:ltr;unicode-bidi:plaintext;flex:1;overflow-wrap:anywhere;"></code><button class="btn btn-outline btn-sm" onclick="foxholeMrCopyNewKey()"><span data-en="Copy Key" data-fa="کپی کلید">Copy Key</span></button></div>
+          </div>
+        </div>
+        <div id="foxhole-mr-edit-box" style="display:none;margin-top:12px;padding:12px;border:1px solid var(--border);border-radius:10px;">
+          <div style="font-weight:700;margin-bottom:8px;" data-en="Edit relay" data-fa="ویرایش رله">Edit relay</div>
+          <input type="hidden" id="foxhole-mr-edit-id">
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;">
+            <div class="fg"><label class="fl"><span data-en="Label" data-fa="برچسب">Label</span></label><input class="fi" id="foxhole-mr-edit-label"></div>
+            <div class="fg"><label class="fl"><span data-en="Slug" data-fa="نامک">Slug</span></label><input class="fi" id="foxhole-mr-edit-slug" style="direction:ltr;"></div>
+            <div class="fg"><label class="fl"><span data-en="Allowlist (comma-separated hosts, empty = default)" data-fa="فهرست مجاز (هاست‌ها با ویرگول، خالی = پیش‌فرض)">Allowlist (comma-separated hosts, empty = default)</span></label><input class="fi" id="foxhole-mr-edit-allowlist" style="direction:ltr;"></div>
+            <div class="fg"><label class="fl"><span data-en="Rate limit / min (0 = global 60)" data-fa="محدودیت نرخ در دقیقه (۰ = سراسری ۶۰)">Rate limit / min (0 = global 60)</span></label><input class="fi" id="foxhole-mr-edit-rate" type="number" min="0" step="1" value="0" style="direction:ltr;"></div>
+            <div class="fg"><label class="fl"><span data-en="Traffic limit, bytes (0 = unlimited)" data-fa="سقف ترافیک، بایت (۰ = نامحدود)">Traffic limit, bytes (0 = unlimited)</span></label><input class="fi" id="foxhole-mr-edit-traffic" type="number" min="0" step="1" value="0" style="direction:ltr;"></div>
+            <div class="fg"><label class="fl"><span data-en="Expiry (empty = never)" data-fa="انقضا (خالی = هرگز)">Expiry (empty = never)</span></label><input class="fi" id="foxhole-mr-edit-expires" type="datetime-local" style="direction:ltr;"></div>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px;">
+            <label style="display:flex;gap:6px;align-items:center;"><input type="checkbox" id="foxhole-mr-edit-enabled"> <span data-en="Enabled" data-fa="فعال">Enabled</span></label>
+            <button class="btn btn-primary btn-sm" id="foxhole-mr-edit-save-btn" onclick="foxholeRelaySaveEdit()"><span data-en="Save" data-fa="ذخیره">Save</span></button>
+            <button class="btn btn-outline btn-sm" onclick="foxholeRelayRotateEdit()"><span data-en="Rotate Key" data-fa="چرخش کلید">Rotate Key</span></button>
+            <button class="btn btn-outline btn-sm" onclick="foxholeRelayCancelEdit()"><span data-en="Cancel" data-fa="لغو">Cancel</span></button>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></span><span class="card-title" data-en="Auth Key" data-fa="کلید احراز هویت">Auth Key</span></span></div>
+        <div style="color:var(--text-3);font-size:0.9rem;padding-bottom:8px;" data-en="The relay needs two values in the client: the Relay URL and the Auth key. The key is stored encrypted and is shown only once, when generated or rotated. Rotating invalidates the old key immediately." data-fa="رله در کلاینت به دو مقدار نیاز دارد: نشانی رله و کلید احراز هویت. کلید به‌صورت رمزنگاری‌شده ذخیره می‌شود و فقط هنگام ساخت یا چرخش، یک بار نمایش داده می‌شود. چرخش، کلید قبلی را فوراً باطل می‌کند.">The relay needs two values in the client: the Relay URL and the Auth key. The key is stored encrypted and is shown only once, when generated or rotated. Rotating invalidates the old key immediately.</div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;">
+          <button class="btn btn-primary btn-sm" id="foxhole-generate-btn" onclick="foxholeRelayGenerate()"><span data-en="Generate Key" data-fa="ایجاد کلید">Generate Key</span></button>
+          <button class="btn btn-outline btn-sm" id="foxhole-rotate-btn" onclick="foxholeRelayRotate()"><span data-en="Rotate Key" data-fa="چرخش کلید">Rotate Key</span></button>
+        </div>
+        <div id="foxhole-key-box" style="display:none;margin-top:12px;padding:12px;border:1px solid var(--warning);border-radius:10px;background:var(--surface-3);">
+          <div style="color:var(--danger);font-weight:700;margin-bottom:6px;" data-en="Copy these relay settings now — the key will never be shown again." data-fa="همین حالا این تنظیمات رله را کپی کنید — کلید دیگر هرگز نمایش داده نمی‌شود.">Copy these relay settings now — the key will never be shown again.</div>
+          <div style="color:var(--text-3);font-size:0.85rem;margin-bottom:8px;" data-en="Enter these two values in your client (foxhole: Settings → VPN relay)." data-fa="این دو مقدار را در کلاینت خود وارد کنید (foxhole: تنظیمات ← رله VPN).">Enter these two values in your client (foxhole: Settings → VPN relay).</div>
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:8px;"><span style="min-width:90px;font-weight:600;" data-en="Relay URL" data-fa="نشانی رله">Relay URL</span><code id="foxhole-key-url-text" style="direction:ltr;unicode-bidi:plaintext;flex:1;overflow-wrap:anywhere;"></code><button class="btn btn-outline btn-sm" onclick="foxholeCopyKeyUrl()"><span data-en="Copy" data-fa="کپی">Copy</span></button></div>
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;"><span style="min-width:90px;font-weight:600;" data-en="Auth key" data-fa="کلید احراز هویت">Auth key</span><code id="foxhole-key-text" style="direction:ltr;unicode-bidi:plaintext;flex:1;overflow-wrap:anywhere;"></code><button class="btn btn-outline btn-sm" id="foxhole-key-copy-btn" onclick="foxholeCopyKey()"><span data-en="Copy Key" data-fa="کپی کلید">Copy Key</span></button></div>
+          <div style="color:var(--text-3);font-size:0.85rem;margin-top:8px;" data-en="The full client relay link at the top of this page is also shown only now — copy it from there." data-fa="پیوند کامل رله کلاینت در بالای این صفحه نیز فقط همین حالا نمایش داده می‌شود — آن را از همان‌جا کپی کنید.">The full client relay link at the top of this page is also shown only now — copy it from there.</div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></span><span class="card-title" data-en="Ping Test" data-fa="تست پینگ">Ping Test</span></span></div>
+        <div style="color:var(--text-3);font-size:0.9rem;padding-bottom:8px;" data-en="Sends two probes through the relay itself: a download from Mozilla's VPN server (GET vpn.mozilla.org) and an upload to Mozilla's account server (POST api.accounts.firefox.com). Each is timed and reported separately." data-fa="دو درخواست آزمایشی را از طریق خود رله می‌فرستد: یک دانلود از سرور VPN موزیلا (GET به vpn.mozilla.org) و یک آپلود به سرور حساب موزیلا (POST به api.accounts.firefox.com). هرکدام جداگانه زمان‌سنجی و گزارش می‌شوند.">Sends two probes through the relay itself: a download from Mozilla's VPN server (GET vpn.mozilla.org) and an upload to Mozilla's account server (POST api.accounts.firefox.com). Each is timed and reported separately.</div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
+          <select class="fi" id="foxhole-ping-relay" style="max-width:240px;"><option value="default">default</option></select>
+          <button class="btn btn-primary btn-sm" id="foxhole-ping-btn" onclick="foxholeRelayPing(this)"><span data-en="Ping Relay" data-fa="پینگ رله">Ping Relay</span></button>
+          <span id="foxhole-ping-result" style="font-weight:600;">–</span>
+        </div>
+        <div id="foxhole-ping-last" style="color:var(--text-3);font-size:0.85rem;padding-top:8px;">–</div>
+      </div>
+      <div class="card">
+        <div class="card-hd"><span style="display:inline-flex;align-items:center;gap:8px;"><span class="ic" style="--ic:18px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg></span><span class="card-title" data-en="Apps Script (Code.gs)" data-fa="اپس اسکریپت (Code.gs)">Apps Script (Code.gs)</span></span></div>
+        <div style="color:var(--text-3);font-size:0.9rem;padding-bottom:8px;" data-en="Download the improved Apps Script relay (Code.gs) if you still want a Google Apps Script deployment alongside the panel relay." data-fa="نسخه بهبودیافته رله Apps Script (Code.gs) را دانلود کنید، اگر همچنان می‌خواهید در کنار رله پنل، یک استقرار Google Apps Script هم داشته باشید.">Download the improved Apps Script relay (Code.gs) if you still want a Google Apps Script deployment alongside the panel relay.</div>
+        <a class="btn btn-outline btn-sm" href="/api/foxhole/code.gs" download="Code.gs"><span data-en="Download Code.gs" data-fa="دانلود Code.gs">Download Code.gs</span></a>
+      </div>
+    </section>
     <section class="page" id="page-telegram">
       <div class="page-header"><div class="page-title" data-en="Telegram" data-fa="تلگرام">Telegram</div></div>
       <div class="card">
@@ -18929,6 +21100,7 @@ example.com
       <div class="nav-item" data-page="addresses" onclick="switchPage('addresses')"><span class="icon icon-cleanip"></span><span data-en="Clean IP" data-fa="آی‌پی تمیز">Clean IP</span></div>
       <div class="nav-item" data-page="ipscanner" onclick="switchPage('ipscanner')"><span class="icon icon-scanner"></span><span data-en="Scan" data-fa="اسکن">Scan</span></div>
       <div class="nav-item" data-page="logs" onclick="switchPage('logs')"><span class="icon icon-logs"></span><span data-en="Logs" data-fa="لاگ">Logs</span></div>
+      <div class="nav-item" data-page="foxhole-relay" onclick="switchPage('foxhole-relay')"><span class="ic" style="--ic:20px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg></span><span data-en="Relay" data-fa="رله">Relay</span></div>
       <div class="nav-item" data-page="telegram" onclick="switchPage('telegram')"><span class="icon icon-telegram"></span><span data-en="Bot" data-fa="ربات">Bot</span></div>
       <div class="nav-item" data-page="settings" onclick="switchPage('settings')"><span class="icon icon-settings"></span><span data-en="Settings" data-fa="تنظیمات">Settings</span></div>
       <div class="nav-item" data-page="about" onclick="switchPage('about')"><span class="ic" style="--ic:20px" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg></span><span data-en="About" data-fa="درباره">About</span></div>
@@ -19618,6 +21790,14 @@ const i18n = {
     hideDetailsBtn: 'Hide details',
     destinationCol: 'Destination',
     sessionsCol: 'Sessions',
+    identityGroup: 'Identity',
+    connectionGroup: 'Connection',
+    trafficGroup: 'Traffic',
+    speedGroup: 'Live speed',
+    totalSpeedWord: 'Total speed (up + down combined):',
+    webInboundTotals: 'Inbound total (all WEB users):',
+    aggregateCountNote: 'Aggregate count only — no per-session detail',
+    flushedWord: 'flushed',
     confirmReset: 'Reset?',
     copied: 'Copied!',
     copiedShort: 'Copied',
@@ -19826,6 +22006,14 @@ const i18n = {
     hideDetailsBtn: 'پنهان کردن جزئیات',
     destinationCol: 'مقصد',
     sessionsCol: 'نشست‌ها',
+    identityGroup: 'هویت',
+    connectionGroup: 'اتصال',
+    trafficGroup: 'ترافیک',
+    speedGroup: 'سرعت زنده',
+    totalSpeedWord: 'سرعت کل (آپلود + دانلود با هم):',
+    webInboundTotals: 'مجموع اینباند (همه کاربران WEB):',
+    aggregateCountNote: 'فقط شمارش تجمیعی — بدون جزئیات نشست',
+    flushedWord: 'ثبت‌شده',
     confirmReset: 'بازنشانی شود؟',
     copied: 'کپی شد!',
     copiedShort: 'کپی شد',
@@ -22041,7 +24229,462 @@ async function loadTgProxyCard(){
   }catch(e){ if(body) body.innerHTML = '<div>'+(lang==='fa'?'بارگذاری وضعیت پروکسی تلگرام ناموفق بود.':'Failed to load Telegram proxy status.')+'</div>'; toast(lang==='fa'?'بارگذاری وضعیت پروکسی تلگرام ناموفق بود':'Failed to load Telegram proxy status', true); return false; }
   finally{ if(btn){ btn.disabled = false; btn.textContent = btn.getAttribute('data-' + (document.body.dir === 'rtl' ? 'fa' : 'en')) || 'Refresh'; } }
 }
-var SXPAGES=['dashboard','inbounds','active-users','addresses','ipscanner','logs','telegram','settings','about'];
+function foxholePingDir(d, name){
+  if(!d) return name + ': —';
+  var line = name + ' ' + d.ms + ' ms';
+  if(d.status) line += ' · HTTP ' + d.status;
+  if(d.error) line += ' · ' + d.error;
+  return line;
+}
+function foxholePingLine(rec){
+  if(!rec) return lang==='fa'?'هنوز پینگی ثبت نشده است.':'No ping recorded yet.';
+  var parts = [];
+  var r = rec.receive, s = rec.send;
+  parts.push(foxholePingDir(r, lang==='fa'?'دریافت':'Receive') + (r && r.target ? ' · ' + r.target : ''));
+  parts.push(foxholePingDir(s, lang==='fa'?'ارسال':'Send') + (s && s.target ? ' · ' + s.target : ''));
+  var line = (lang==='fa'?'آخرین پینگ: ':'Last ping: ') + parts.join(' | ');
+  if(rec.at) line += ' · ' + rec.at;
+  if(rec.relay) line += ' · ' + rec.relay;
+  return line;
+}
+var foxholeClientLink = '';
+function foxholeClientLinkFor(key){
+  try{ return window.location.origin + '/relay?secret=' + encodeURIComponent(key); }catch(e){ return '/relay?secret=' + encodeURIComponent(key); }
+}
+function foxholeClientLinkMasked(){
+  try{ return window.location.origin + '/relay?secret=••••••••'; }catch(e){ return '/relay?secret=••••••••'; }
+}
+function foxholeShowClientLinkMasked(){
+  foxholeClientLink = '';
+  var el = $m('foxhole-client-link');
+  if(el) el.textContent = foxholeClientLinkMasked();
+  var btn = $m('foxhole-client-link-copy-btn');
+  if(btn) btn.disabled = true;
+  var note = $m('foxhole-client-link-note');
+  if(note) note.textContent = lang==='fa'?'پیوند پوشیده است — کلید فقط یک بار نمایش داده می‌شود. برای دریافت پیوند جدید، کلید را بچرخانید.':'Link masked — the key is shown only once. Rotate the key to get a new link.';
+  var sp = $m('foxhole-status-page-link');
+  if(sp){ try{ sp.href = window.location.origin + '/relay'; }catch(e){ sp.href = '/relay'; } }
+}
+function foxholeShowClientLinkFull(key){
+  foxholeClientLink = foxholeClientLinkFor(key);
+  var el = $m('foxhole-client-link');
+  if(el) el.textContent = foxholeClientLink;
+  var btn = $m('foxhole-client-link-copy-btn');
+  if(btn) btn.disabled = false;
+  var note = $m('foxhole-client-link-note');
+  if(note) note.textContent = lang==='fa'?'کلید فقط یک بار نمایش داده می‌شود — همین حالا این پیوند را کپی کنید.':'The key is shown only once — copy this link now.';
+  var sp = $m('foxhole-status-page-link');
+  if(sp) sp.href = foxholeClientLink;
+}
+async function loadFoxholeRelay(){
+  var box = $m('foxhole-key-box');
+  if(box) box.style.display = 'none';
+  var kt = $m('foxhole-key-text');
+  if(kt) kt.textContent = '';
+  var ku = $m('foxhole-key-url-text');
+  if(ku) ku.textContent = '';
+  foxholeShowClientLinkMasked();
+  var urlEl = $m('foxhole-relay-url');
+  if(urlEl){ try{ urlEl.textContent = window.location.origin + '/api/foxhole/relay'; }catch(e){ urlEl.textContent = '/api/foxhole/relay'; } }
+  try{
+    var r = await authenticatedFetch('/api/foxhole/status');
+    if(!r.ok) throw new Error('HTTP ' + r.status);
+    var d = await r.json();
+    var pill = $m('foxhole-status-pill');
+    if(pill){
+      var on = !!d.enabled;
+      pill.className = 'tag ' + (on ? 'tag-on' : 'tag-off');
+      pill.textContent = on ? (lang==='fa'?'فعال':'Enabled') : (lang==='fa'?'غیرفعال':'Disabled');
+    }
+    var cfg = $m('foxhole-config-line');
+    if(cfg){
+      if(d.configured){ cfg.textContent = (lang==='fa'?'کلید تنظیم شده است':'Key configured') + (d.fingerprint ? ' · ' + d.fingerprint : '') + (d.env_key ? (lang==='fa'?' · کلید محیطی':' · env key') : ''); }
+      else { cfg.textContent = lang==='fa'?'کلیدی تنظیم نشده است — برای فعال‌سازی «ایجاد کلید» را بزنید.':'No key configured — press Generate Key to enable.'; }
+    }
+    var en = $m('foxhole-enable-btn'), dis = $m('foxhole-disable-btn');
+    if(en) en.disabled = !!d.enabled || !d.configured;
+    if(dis) dis.disabled = !d.enabled;
+    var rot = $m('foxhole-rotate-btn');
+    if(rot) rot.disabled = !d.configured;
+    var setTxt = function(id, v){ var el = $m(id); if(el) el.textContent = v; };
+    setTxt('foxhole-stat-requests', String(d.requests || 0));
+    setTxt('foxhole-stat-up', fmtB(d.bytes_up || 0));
+    setTxt('foxhole-stat-down', fmtB(d.bytes_down || 0));
+    setTxt('foxhole-stat-last', d.last_used ? String(d.last_used) : '—');
+  }catch(e){ toast(lang==='fa'?'بارگذاری وضعیت رله فایرفاکس ناموفق بود.':'Failed to load Firefox Relay status.', true); return false; }
+  try{
+    var rp = await authenticatedFetch('/api/foxhole/ping');
+    if(rp.ok){ var dp = await rp.json(); var last = $m('foxhole-ping-last'); if(last) last.textContent = foxholePingLine(dp.last_ping || null); }
+  }catch(e){}
+  try{
+    var rs = await authenticatedFetch('/api/foxhole/stats');
+    if(rs.ok){ var ds = await rs.json(); foxholeRenderStats(ds); }
+  }catch(e){}
+  try{ await foxholeLoadRelays(); }catch(e){}
+  try{
+    var hr = await fetch('/relay?health=1');
+    var hl = $m('foxhole-health-line');
+    if(hl){
+      if(hr.ok){
+        var hd = await hr.json();
+        if(hd && hd.ready){ hl.textContent = (lang==='fa'?'رله آماده است':'Relay ready') + (hd.version !== undefined && hd.version !== null && hd.version !== '' ? ' · v' + hd.version : '') + (hd.relay ? ' · ' + hd.relay : ''); }
+        else { hl.textContent = (lang==='fa'?'رله آماده نیست':'Relay not ready') + (hd && hd.version !== undefined && hd.version !== null && hd.version !== '' ? ' · v' + hd.version : ''); }
+      } else { hl.textContent = (lang==='fa'?'بررسی سلامت رله در دسترس نیست':'Relay health check unavailable') + ' (HTTP ' + hr.status + ')'; }
+    }
+  }catch(e){
+    var hl2 = $m('foxhole-health-line');
+    if(hl2) hl2.textContent = lang==='fa'?'بررسی سلامت رله در دسترس نیست.':'Relay health check unavailable.';
+  }
+  return true;
+}
+function foxholeStatNum(v){
+  return (typeof v === 'number' && isFinite(v)) ? String(v) : '—';
+}
+function foxholeRenderStats(d){
+  if(!d || typeof d !== 'object') return;
+  var setTxt = function(id, v){ var el = $m(id); if(el) el.textContent = v; };
+  setTxt('foxhole-st-connected', foxholeStatNum(d.connected));
+  var u = d.unique || {};
+  setTxt('foxhole-st-unique-day', foxholeStatNum(u.day));
+  setTxt('foxhole-st-unique-month', foxholeStatNum(u.month));
+  var tr = d.traffic || {};
+  var day = tr.day || {}, mon = tr.month || {};
+  setTxt('foxhole-st-day-up', fmtB(day.up || 0));
+  setTxt('foxhole-st-day-down', fmtB(day.down || 0));
+  setTxt('foxhole-st-day-total', fmtB(day.total || 0));
+  setTxt('foxhole-st-month-up', fmtB(mon.up || 0));
+  setTxt('foxhole-st-month-down', fmtB(mon.down || 0));
+  setTxt('foxhole-st-month-total', fmtB(mon.total || 0));
+  var rq = d.requests || {};
+  setTxt('foxhole-st-req-day', foxholeStatNum(rq.day));
+  setTxt('foxhole-st-req-month', foxholeStatNum(rq.month));
+}
+function foxholeShowKeyOnce(key){
+  var box = $m('foxhole-key-box'), txt = $m('foxhole-key-text'), urlTxt = $m('foxhole-key-url-text');
+  if(txt) txt.textContent = key;
+  if(urlTxt){ try{ urlTxt.textContent = window.location.origin + '/api/foxhole/relay'; }catch(e){ urlTxt.textContent = '/api/foxhole/relay'; } }
+  if(box) box.style.display = '';
+  foxholeShowClientLinkFull(key);
+}
+async function foxholeRelayGenerate(){
+  var btn = $m('foxhole-generate-btn');
+  if(btn) btn.disabled = true;
+  try{
+    var r = await authenticatedFetch('/api/foxhole/generate', {method:'POST'});
+    if(!r.ok) throw new Error('HTTP ' + r.status);
+    var d = await r.json();
+    if(!d.key) throw new Error('no key');
+    await loadFoxholeRelay();
+    foxholeShowKeyOnce(d.key);
+    toast(lang==='fa'?'کلید ساخته شد — همین حالا آن را کپی کنید.':'Key generated — copy it now.');
+  }catch(e){ toast(lang==='fa'?'ساخت کلید ناموفق بود.':'Failed to generate key.', true); }
+  finally{ var b2 = $m('foxhole-generate-btn'); if(b2) b2.disabled = false; }
+}
+async function foxholeRelayRotate(){
+  var btn = $m('foxhole-rotate-btn');
+  if(btn) btn.disabled = true;
+  try{
+    var r = await authenticatedFetch('/api/foxhole/rotate', {method:'POST'});
+    if(!r.ok) throw new Error('HTTP ' + r.status);
+    var d = await r.json();
+    if(!d.key) throw new Error('no key');
+    await loadFoxholeRelay();
+    foxholeShowKeyOnce(d.key);
+    toast(lang==='fa'?'کلید چرخید — کلید قبلی فوراً باطل شد. همین حالا کلید جدید را کپی کنید.':'Key rotated — the old key is invalid immediately. Copy the new key now.');
+  }catch(e){ toast(lang==='fa'?'چرخش کلید ناموفق بود.':'Failed to rotate key.', true); }
+  finally{ var b2 = $m('foxhole-rotate-btn'); if(b2) b2.disabled = false; }
+}
+async function foxholeRelayToggle(enable){
+  try{
+    var r = await authenticatedFetch(enable ? '/api/foxhole/enable' : '/api/foxhole/disable', {method:'POST'});
+    if(!r.ok) throw new Error('HTTP ' + r.status);
+    await loadFoxholeRelay();
+    toast(enable ? (lang==='fa'?'رله فعال شد.':'Relay enabled.') : (lang==='fa'?'رله غیرفعال شد.':'Relay disabled.'));
+  }catch(e){ toast(lang==='fa'?'تغییر وضعیت رله ناموفق بود.':'Failed to change relay state.', true); }
+}
+async function foxholeRelayPing(btn, relaySlug){
+  if(btn) btn.disabled = true;
+  var res = $m('foxhole-ping-result');
+  if(res) res.textContent = lang==='fa'?'در حال پینگ…':'Pinging…';
+  var pingRelay = relaySlug || '';
+  if(!pingRelay){ var pingSel = $m('foxhole-ping-relay'); if(pingSel) pingRelay = pingSel.value || ''; }
+  try{
+    var r = await authenticatedFetch('/api/foxhole/ping', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(pingRelay ? {relay: pingRelay} : {})});
+    var d = await r.json();
+    if(!r.ok) throw new Error(d.detail || ('HTTP ' + r.status));
+    var line = foxholePingDir(d.receive, lang==='fa'?'دریافت':'Receive') + ' | ' + foxholePingDir(d.send, lang==='fa'?'ارسال':'Send');
+    if(res) res.textContent = (lang==='fa'?'نتیجه پینگ: ':'Ping result: ') + line;
+    var last = $m('foxhole-ping-last');
+    if(last) last.textContent = foxholePingLine(d);
+  }catch(e){ if(res) res.textContent = lang==='fa'?'پینگ ناموفق بود.':'Ping failed.'; toast(lang==='fa'?'پینگ رله ناموفق بود.':'Relay ping failed.', true); }
+  finally{ if(btn) btn.disabled = false; }
+}
+function foxholeCopyFallback(text, done){
+  try{
+    var ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    document.execCommand('copy'); document.body.removeChild(ta); done();
+  }catch(e){ toast(lang==='fa'?'کپی ناموفق بود — متن را دستی انتخاب کنید.':'Copy failed — select the text manually.', true); }
+}
+function foxholeCopyText(text, okMsg){
+  var done = function(){ toast(okMsg || (lang==='fa'?'کپی شد.':'Copied.')); };
+  if(navigator.clipboard && navigator.clipboard.writeText){ navigator.clipboard.writeText(text).then(done, function(){ foxholeCopyFallback(text, done); }); }
+  else { foxholeCopyFallback(text, done); }
+}
+function foxholeCopyRelayUrl(){
+  var el = $m('foxhole-relay-url');
+  if(el && el.textContent) foxholeCopyText(el.textContent);
+}
+function foxholeCopyClientLink(){
+  if(!foxholeClientLink){ toast(lang==='fa'?'پیوند کامل فقط بلافاصله پس از ساخت یا چرخش کلید در دسترس است.':'The full link is only available right after generating or rotating the key.', true); return; }
+  foxholeCopyText(foxholeClientLink);
+}
+function foxholeCopyKeyUrl(){
+  var el = $m('foxhole-key-url-text');
+  if(el && el.textContent) foxholeCopyText(el.textContent);
+}
+function foxholeCopyKey(){
+  var el = $m('foxhole-key-text');
+  if(el && el.textContent) foxholeCopyText(el.textContent, lang==='fa'?'کلید کپی شد — آن را در جایی امن نگه دارید.':'Key copied — store it somewhere safe.');
+}
+var foxholeRelays = [];
+var foxholeRelayLinks = {};
+var foxholeMrSlugTouched = false;
+function foxholeMrSlugify(text){
+  var s = String(text || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  return s || 'relay';
+}
+function foxholeMrLabelInput(){
+  if(foxholeMrSlugTouched) return;
+  var labelEl = $m('foxhole-mr-label'), slugEl = $m('foxhole-mr-slug');
+  if(labelEl && slugEl) slugEl.value = foxholeMrSlugify(labelEl.value);
+}
+function foxholeMrSlugInput(){ foxholeMrSlugTouched = true; }
+function foxholeRelayLinkFor(relay, key){
+  var path = (relay && relay.relay_url) || '/relay';
+  try{ return window.location.origin + path + '?secret=' + encodeURIComponent(key); }catch(e){ return path + '?secret=' + encodeURIComponent(key); }
+}
+function foxholeRelayLinkMasked(relay){
+  var path = (relay && relay.relay_url) || '/relay';
+  try{ return window.location.origin + path + '?secret=••••••••'; }catch(e){ return path + '?secret=••••••••'; }
+}
+function foxholeRelayById(id){
+  for(var i = 0; i < foxholeRelays.length; i++){ if(foxholeRelays[i] && foxholeRelays[i].id === id) return foxholeRelays[i]; }
+  return null;
+}
+async function foxholeLoadRelays(){
+  var r = await authenticatedFetch('/api/foxhole/relays');
+  if(!r.ok) throw new Error('HTTP ' + r.status);
+  var d = await r.json();
+  foxholeRelays = (d && d.relays) || [];
+  foxholeRenderRelays();
+  foxholeRenderPingSelect();
+  return true;
+}
+function foxholeRenderPingSelect(){
+  var sel = $m('foxhole-ping-relay');
+  if(!sel) return;
+  var current = sel.value || 'default';
+  var html = '';
+  for(var i = 0; i < foxholeRelays.length; i++){
+    var relay = foxholeRelays[i];
+    html += '<option value="' + esc(relay.slug || '') + '"' + (relay.slug === current ? ' selected' : '') + '>' + esc((relay.label || relay.slug || '') + ' (' + (relay.slug || '') + ')') + '</option>';
+  }
+  if(!html) html = '<option value="default">default</option>';
+  sel.innerHTML = html;
+  var found = false;
+  for(var j = 0; j < foxholeRelays.length; j++){ if(foxholeRelays[j].slug === current) found = true; }
+  if(!found) sel.value = 'default';
+  if(!sel.value && foxholeRelays.length) sel.value = foxholeRelays[0].slug || 'default';
+}
+function foxholeRelayRowHtml(relay){
+  var usage = relay.usage || {};
+  var traffic = usage.traffic || {};
+  var day = traffic.day || {}, month = traffic.month || {};
+  var unique = usage.unique || {};
+  var requests = usage.requests || {};
+  var ready = !!relay.ready;
+  var pill = ready ? '<span class="tag tag-on">' + (lang==='fa'?'آماده':'Ready') + '</span>' : '<span class="tag tag-off">' + (relay.enabled ? (lang==='fa'?'تنظیم نشده':'Not ready') : (lang==='fa'?'غیرفعال':'Disabled')) + '</span>';
+  var fullLink = foxholeRelayLinks[relay.slug || ''];
+  var linkText = fullLink || foxholeRelayLinkMasked(relay);
+  var copyDisabled = fullLink ? '' : ' disabled';
+  var isDefault = (relay.slug === 'default');
+  var delBtn = isDefault ? '<button class="btn btn-outline btn-sm" disabled title="' + (lang==='fa'?'رله پیش‌فرض قابل حذف نیست.':'The default relay cannot be deleted.') + '"><span>' + (lang==='fa'?'حذف':'Delete') + '</span></button>' : '<button class="btn btn-outline btn-sm" onclick="foxholeRelayDelete(' + relay.id + ')"><span>' + (lang==='fa'?'حذف':'Delete') + '</span></button>';
+  var limits = [];
+  limits.push((lang==='fa'?'محدودیت نرخ: ':'Rate limit: ') + (relay.rate_limit ? String(relay.rate_limit) + '/min' : (lang==='fa'?'سراسری (۶۰ در دقیقه)':'global (60/min)')));
+  limits.push((lang==='fa'?'سقف ترافیک: ':'Traffic cap: ') + (relay.traffic_limit_bytes ? fmtB(relay.traffic_limit_bytes) : (lang==='fa'?'نامحدود':'unlimited')));
+  if(relay.expires_at) limits.push((lang==='fa'?'انقضا: ':'Expires: ') + esc(relay.expires_at));
+  var allowText = (relay.allowlist && relay.allowlist.length) ? esc(relay.allowlist.join(', ')) : (lang==='fa'?'پیش‌فرض (شش دامنه)':'default (six domains)');
+  var html = '<div style="padding:10px 0;border-bottom:1px solid var(--border);">';
+  html += '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">' + pill + '<b>' + esc(relay.label || relay.slug || '') + '</b><code style="direction:ltr;">' + esc(relay.slug || '') + '</code><span style="color:var(--text-3);font-size:0.85rem;">' + esc(relay.fingerprint || '') + '</span></div>';
+  html += '<div style="display:flex;gap:6px;align-items:center;margin-top:6px;"><code style="direction:ltr;unicode-bidi:plaintext;flex:1;overflow-wrap:anywhere;">' + esc(linkText) + '</code><button class="btn btn-outline btn-sm" onclick="foxholeRelayCopyLink(\'' + esc(relay.slug || '') + '\')"' + copyDisabled + '><span>' + (lang==='fa'?'کپی پیوند':'Copy Link') + '</span></button></div>';
+  html += '<div style="color:var(--text-3);font-size:0.85rem;margin-top:6px;">' + (lang==='fa'?'امروز: ':'Today: ') + '↑ ' + fmtB(day.up || 0) + ' ↓ ' + fmtB(day.down || 0) + ' · ' + fmtB(day.total || 0) + ' · ' + String(requests.day || 0) + ' ' + (lang==='fa'?'درخواست':'requests') + ' | ' + (lang==='fa'?'این ماه: ':'This month: ') + '↑ ' + fmtB(month.up || 0) + ' ↓ ' + fmtB(month.down || 0) + ' · ' + fmtB(month.total || 0) + ' | ' + (lang==='fa'?'متصل اکنون: ':'Connected now: ') + String(usage.connected || 0) + ' · ' + (lang==='fa'?'یکتا امروز/ماه: ':'Unique day/month: ') + String(unique.day || 0) + '/' + String(unique.month || 0) + '</div>';
+  html += '<div style="color:var(--text-3);font-size:0.85rem;">' + limits.join(' · ') + ' · ' + (lang==='fa'?'مجاز: ':'Allowlist: ') + allowText + ' · ' + (lang==='fa'?'درخواست‌ها (کل): ':'Requests (all time): ') + String(relay.requests || 0) + '</div>';
+  html += '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;">';
+  html += '<button class="btn btn-outline btn-sm" onclick="foxholeRelayEdit(' + relay.id + ')"><span>' + (lang==='fa'?'ویرایش':'Edit') + '</span></button>';
+  html += '<button class="btn btn-outline btn-sm" onclick="foxholeRelayRotateOne(' + relay.id + ')"><span>' + (lang==='fa'?'چرخش کلید':'Rotate Key') + '</span></button>';
+  html += '<button class="btn btn-outline btn-sm" onclick="foxholeRelayPingOne(' + relay.id + ')"><span>' + (lang==='fa'?'پینگ':'Ping') + '</span></button>';
+  html += delBtn;
+  html += '</div></div>';
+  return html;
+}
+function foxholeRenderRelays(){
+  var box = $m('foxhole-relays-list');
+  if(!box) return;
+  if(!foxholeRelays.length){ box.innerHTML = '<div style="color:var(--text-3);font-size:0.9rem;">' + (lang==='fa'?'هنوز رله‌ای نیست — یکی بسازید.':'No relays yet — create one below.') + '</div>'; return; }
+  var html = '';
+  for(var i = 0; i < foxholeRelays.length; i++){ html += foxholeRelayRowHtml(foxholeRelays[i]); }
+  box.innerHTML = html;
+}
+function foxholeMrReadForm(prefix){
+  var v = function(id){ var el = $m(id); return el ? el.value : ''; };
+  var c = function(id){ var el = $m(id); return el ? !!el.checked : true; };
+  var allowRaw = v(prefix + '-allowlist');
+  var allowlist = null;
+  if(allowRaw.trim()){
+    allowlist = [];
+    var parts = allowRaw.split(',');
+    for(var i = 0; i < parts.length; i++){ var h = parts[i].trim().toLowerCase(); if(h) allowlist.push(h); }
+  }
+  var rate = parseInt(v(prefix + '-rate') || '0', 10); if(isNaN(rate) || rate < 0) rate = 0;
+  var traffic = parseInt(v(prefix + '-traffic') || '0', 10); if(isNaN(traffic) || traffic < 0) traffic = 0;
+  var expiresRaw = v(prefix + '-expires').trim();
+  var expires = '';
+  if(expiresRaw){ var dt = new Date(expiresRaw); if(!isNaN(dt.getTime())) expires = dt.toISOString(); }
+  return {label: v(prefix + '-label').trim(), slug: v(prefix + '-slug').trim().toLowerCase(), allowlist: allowlist, rate_limit: rate, traffic_limit_bytes: traffic, expires_at: expires, enabled: c(prefix + '-enabled')};
+}
+function foxholeRelayShowNewKey(relay, key){
+  var link = foxholeRelayLinkFor(relay, key);
+  foxholeRelayLinks[relay.slug || ''] = link;
+  var box = $m('foxhole-mr-key-box');
+  var linkEl = $m('foxhole-mr-key-link-text');
+  var keyEl = $m('foxhole-mr-key-text');
+  if(linkEl) linkEl.textContent = link;
+  if(keyEl) keyEl.textContent = key;
+  if(box) box.style.display = '';
+}
+function foxholeMrCopyNewLink(){
+  var el = $m('foxhole-mr-key-link-text');
+  if(el && el.textContent) foxholeCopyText(el.textContent);
+}
+function foxholeMrCopyNewKey(){
+  var el = $m('foxhole-mr-key-text');
+  if(el && el.textContent) foxholeCopyText(el.textContent, lang==='fa'?'کلید کپی شد — آن را در جایی امن نگه دارید.':'Key copied — store it somewhere safe.');
+}
+function foxholeRelayCopyLink(slug){
+  var link = foxholeRelayLinks[slug || ''];
+  if(!link){ toast(lang==='fa'?'پیوند کامل فقط بلافاصله پس از ساخت یا چرخش کلید در دسترس است.':'The full link is only available right after generating or rotating the key.', true); return; }
+  foxholeCopyText(link);
+}
+async function foxholeRelayCreate(){
+  var btn = $m('foxhole-mr-create-btn');
+  if(btn) btn.disabled = true;
+  try{
+    var f = foxholeMrReadForm('foxhole-mr');
+    var payload = {label: f.label, rate_limit: f.rate_limit, traffic_limit_bytes: f.traffic_limit_bytes, enabled: f.enabled};
+    if(f.slug) payload.slug = f.slug;
+    if(f.allowlist) payload.allowlist = f.allowlist;
+    if(f.expires_at) payload.expires_at = f.expires_at;
+    var r = await authenticatedFetch('/api/foxhole/relays', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+    var d = await r.json().catch(function(){ return {}; });
+    if(!r.ok) throw new Error((d && d.detail) || ('HTTP ' + r.status));
+    if(!d.key || !d.relay) throw new Error('no key');
+    foxholeRelayShowNewKey(d.relay, d.key);
+    foxholeMrSlugTouched = false;
+    var labelEl = $m('foxhole-mr-label'); if(labelEl) labelEl.value = '';
+    var slugEl = $m('foxhole-mr-slug'); if(slugEl) slugEl.value = '';
+    await foxholeLoadRelays();
+    toast(lang==='fa'?'رله ساخته شد — همین حالا پیوند و کلید را کپی کنید.':'Relay created — copy the link and key now.');
+  }catch(e){ toast((lang==='fa'?'ساخت رله ناموفق بود: ':'Failed to create relay: ') + (e && e.message ? e.message : ''), true); }
+  finally{ var b2 = $m('foxhole-mr-create-btn'); if(b2) b2.disabled = false; }
+}
+function foxholeMrExpiresInput(iso){
+  if(!iso) return '';
+  var dt = new Date(iso);
+  if(isNaN(dt.getTime())) return '';
+  var pad = function(n){ return (n < 10 ? '0' : '') + n; };
+  return dt.getFullYear() + '-' + pad(dt.getMonth() + 1) + '-' + pad(dt.getDate()) + 'T' + pad(dt.getHours()) + ':' + pad(dt.getMinutes());
+}
+function foxholeRelayEdit(id){
+  var relay = foxholeRelayById(id);
+  if(!relay) return;
+  var setV = function(elId, v){ var el = $m(elId); if(el) el.value = v; };
+  var idEl = $m('foxhole-mr-edit-id'); if(idEl) idEl.value = String(relay.id);
+  setV('foxhole-mr-edit-label', relay.label || '');
+  setV('foxhole-mr-edit-slug', relay.slug || '');
+  setV('foxhole-mr-edit-allowlist', (relay.allowlist && relay.allowlist.length) ? relay.allowlist.join(', ') : '');
+  setV('foxhole-mr-edit-rate', String(relay.rate_limit || 0));
+  setV('foxhole-mr-edit-traffic', String(relay.traffic_limit_bytes || 0));
+  setV('foxhole-mr-edit-expires', foxholeMrExpiresInput(relay.expires_at || ''));
+  var enEl = $m('foxhole-mr-edit-enabled'); if(enEl) enEl.checked = !!relay.enabled;
+  var box = $m('foxhole-mr-edit-box');
+  if(box){ box.style.display = ''; box.scrollIntoView(); }
+}
+function foxholeRelayCancelEdit(){
+  var box = $m('foxhole-mr-edit-box');
+  if(box) box.style.display = 'none';
+}
+async function foxholeRelaySaveEdit(){
+  var idEl = $m('foxhole-mr-edit-id');
+  var id = idEl ? parseInt(idEl.value || '0', 10) : 0;
+  if(!id) return;
+  var btn = $m('foxhole-mr-edit-save-btn');
+  if(btn) btn.disabled = true;
+  try{
+    var f = foxholeMrReadForm('foxhole-mr-edit');
+    var payload = {label: f.label, rate_limit: f.rate_limit, traffic_limit_bytes: f.traffic_limit_bytes, enabled: f.enabled, expires_at: f.expires_at, allowlist: f.allowlist || []};
+    if(f.slug) payload.slug = f.slug;
+    var r = await authenticatedFetch('/api/foxhole/relays/' + id, {method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+    var d = await r.json().catch(function(){ return {}; });
+    if(!r.ok) throw new Error((d && d.detail) || ('HTTP ' + r.status));
+    foxholeRelayCancelEdit();
+    await foxholeLoadRelays();
+    toast(lang==='fa'?'رله ویرایش شد.':'Relay updated.');
+  }catch(e){ toast((lang==='fa'?'ویرایش رله ناموفق بود: ':'Failed to update relay: ') + (e && e.message ? e.message : ''), true); }
+  finally{ var b2 = $m('foxhole-mr-edit-save-btn'); if(b2) b2.disabled = false; }
+}
+async function foxholeRelayRotateOne(id){
+  var relay = foxholeRelayById(id);
+  if(!relay) return;
+  try{
+    var r = await authenticatedFetch('/api/foxhole/relays/' + id, {method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify({rotate: true})});
+    var d = await r.json().catch(function(){ return {}; });
+    if(!r.ok) throw new Error((d && d.detail) || ('HTTP ' + r.status));
+    if(!d.key || !d.relay) throw new Error('no key');
+    foxholeRelayShowNewKey(d.relay, d.key);
+    await foxholeLoadRelays();
+    toast(lang==='fa'?'کلید این رله چرخید — کلید قبلی همین رله فوراً باطل شد؛ رله‌های دیگر تغییری نکردند. همین حالا کلید جدید را کپی کنید.':'Key rotated for this relay only — its old key is invalid immediately; other relays are unchanged. Copy the new key now.');
+  }catch(e){ toast((lang==='fa'?'چرخش کلید ناموفق بود: ':'Failed to rotate key: ') + (e && e.message ? e.message : ''), true); }
+}
+function foxholeRelayRotateEdit(){
+  var idEl = $m('foxhole-mr-edit-id');
+  var id = idEl ? parseInt(idEl.value || '0', 10) : 0;
+  if(id) foxholeRelayRotateOne(id);
+}
+async function foxholeRelayDelete(id){
+  var relay = foxholeRelayById(id);
+  if(!relay) return;
+  if(relay.slug === 'default'){ toast(lang==='fa'?'رله پیش‌فرض قابل حذف نیست.':'The default relay cannot be deleted.', true); return; }
+  var ok = await confirmDialog((lang==='fa'?'حذف رله «':'Delete relay "') + (relay.label || relay.slug || '') + '"?', lang==='fa'?'حذف':'Delete');
+  if(!ok) return;
+  try{
+    var r = await authenticatedFetch('/api/foxhole/relays/' + id, {method:'DELETE'});
+    var d = await r.json().catch(function(){ return {}; });
+    if(!r.ok) throw new Error((d && d.detail) || ('HTTP ' + r.status));
+    delete foxholeRelayLinks[relay.slug || ''];
+    await foxholeLoadRelays();
+    toast(lang==='fa'?'رله حذف شد. پیوند آن دیگر کار نمی‌کند؛ رله‌های دیگر تغییری نکردند.':'Relay deleted. Its link no longer works; other relays are unchanged.');
+  }catch(e){ toast((lang==='fa'?'حذف رله ناموفق بود: ':'Failed to delete relay: ') + (e && e.message ? e.message : ''), true); }
+}
+function foxholeRelayPingOne(id){
+  var relay = foxholeRelayById(id);
+  if(!relay) return;
+  var sel = $m('foxhole-ping-relay');
+  if(sel) sel.value = relay.slug || 'default';
+  foxholeRelayPing(null, relay.slug || 'default');
+}
+var SXPAGES=['dashboard','inbounds','active-users','addresses','ipscanner','logs','foxhole-relay','telegram','settings','about'];
 function pageFromLocation(){
   var h='';
   try{ h=(window.location.hash||'').replace(/^#\/?/,''); }catch(e){ h=''; }
@@ -22069,6 +24712,9 @@ function switchPage(id,opts){
   if (id === 'telegram') {
     loadTgProxyCard();
     safeCall(loadTelegramSettings);
+  }
+  if (id === 'foxhole-relay') {
+    loadFoxholeRelay();
   }
   if (id === 'ipscanner') {
     try { buildProviderPills(); } catch (e) { console.error('Provider pills failed', e); }
@@ -22305,7 +24951,8 @@ async function cloneLinkFromEdit(){
 }
 let sortCol='created_at',sortDir='desc';
 function sortLinks(col){if(sortCol===col)sortDir=sortDir==='asc'?'desc':'asc';else{sortCol=col;sortDir='desc';}allLinks.sort((a,b)=>{let va=a[sortCol]??'',vb=b[sortCol]??'';if(sortCol==='used_bytes'){va=Number(va);vb=Number(vb);}else if(sortCol==='expires_at'){va=va||'';vb=vb||'';}if(va<vb)return sortDir==='asc'?-1:1;if(va>vb)return sortDir==='asc'?1:-1;return 0;});filterLinks();}
-async function togLink(el){const uid=el.dataset.uid,l=allLinks.find(x=>x.uuid===uid);if(!l)return;const na=!l.active;try{const r=await authenticatedFetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({active:na})});if(!r.ok){const d=await r.json().catch(()=>null);toast(trDetail(d&&d.detail)||t('failed'),true);return;}l.active=na;filterLinks();loadStats();}catch{toast(t('failed'),true);}}
+const _togLinkBusy = new Set();
+async function togLink(el){const uid=el.dataset.uid,l=allLinks.find(x=>x.uuid===uid);if(!l||_togLinkBusy.has(uid))return;const na=!l.active;_togLinkBusy.add(uid);l.active=na;filterLinks();try{const r=await authenticatedFetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({active:na})});if(!r.ok){const d=await r.json().catch(()=>null);toast(trDetail(d&&d.detail)||t('failed'),true);await loadLinks();return;}loadStats();}catch(e){toast(t('failed'),true);await loadLinks();}finally{_togLinkBusy.delete(uid);}}
 async function showQuickAdd(){
   $m('mo-quick-add').classList.add('show');
   if(!window.QUICK_DEFAULT_PROTO){
@@ -22358,6 +25005,9 @@ async function quickCreate(){
   try{const r=await authenticatedFetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!r.ok)throw new Error(trDetail((await r.json()).detail));const data=await r.json();$m('mo-quick-add').classList.remove('show');const userUrl='https://'+location.host+'/user/'+data.uuid;toast(t('createdPrefix')+userUrl);loadLinks();loadStats();}catch(e){toast(t('errorPrefix')+e.message,true);}}
 async function cloneLink(uid){try{const r=await authenticatedFetch('/api/links/'+uid+'/clone',{method:'POST'});const data=await r.json();if(!r.ok)throw new Error(trDetail(data.detail));toast(t('clonedOk'));if(data.port_warning)toast(trDetail(data.port_warning),true);await loadLinks();loadStats();if(data.new_uuid)showEditMo(data.new_uuid);}catch(e){toast(t('errorPrefix')+e.message,true);}}
 function showAddMo(){
+  const _createDefaults = [['tfo-create', false], ['ech-create', false], ['insecure-create', false], ['random-create', false], ['udp-create', true], ['ipv6-create', true], ['bypass-iran-create', true], ['bypass-china-create', false], ['bypass-russia-create', false]];
+  _createDefaults.forEach(function(pair){ const _el = $m(pair[0]); if (_el) _el.classList.toggle('on', pair[1]); });
+  toggleEchFields('create');
   $m('mo-add').classList.add('show');
   updateExpiryPreview('create');
   fillPortNotes();
@@ -22385,6 +25035,12 @@ function protoShort(p){
 }
 function fmtBps(b){ if(!b) return '0 B/s'; return b >= 1048576 ? (b/1048576).toFixed(2)+' MB/s' : b >= 1024 ? (b/1024).toFixed(1)+' KB/s' : b+' B/s'; }
 let _audOpen = {};
+function fmtStarted(s){
+  if(!s) return '—';
+  const d = new Date(s);
+  if(isNaN(d.getTime())) return s;
+  return d.toLocaleString(lang === 'fa' ? 'fa-IR' : 'en-GB', {year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit'});
+}
 function renderActiveUsers(sessions, sessionStats){
   const box = $m('active-users-cards');
   if(!box) return;
@@ -22396,19 +25052,34 @@ function renderActiveUsers(sessions, sessionStats){
     const dests = s.destinations || [];
     const sessRows = s.sessions || [];
     const ips = s.client_ips || (s.client_ip ? [s.client_ip] : []);
-    const detRows = dests.map(d => '<div style="display:flex;justify-content:space-between;gap:8px;font-size:0.85rem;padding:4px 0;border-top:1px solid var(--border);"><span>' + esc(d.destination || '') + '</span><span style="color:var(--text-2);">' + (d.sessions || 1) + ' · ↑ ' + fmtB(d.bytes_up || 0) + ' ↓ ' + fmtB(d.bytes_down || 0) + '</span></div>').join('');
-    const sesRows = sessRows.map(r => '<div style="display:flex;justify-content:space-between;gap:8px;font-size:0.85rem;padding:4px 0;border-top:1px solid var(--border);"><span>' + esc((r.protocol || r.transport || '') + ' · ' + (r.destination || r.inbound_tag || '')) + '</span><span style="color:var(--text-2);">↑ ' + fmtB(r.bytes_up || 0) + ' ↓ ' + fmtB(r.bytes_down || 0) + ' · ↑ ' + fmtBps(r.up_bps || 0) + ' ↓ ' + fmtBps(r.down_bps || 0) + '</span></div>').join('');
-    const ipDetails = s.ip_details || ips.map(ip => ({ip: ip, sessions: 1, bytes_up: 0, bytes_down: 0}));
-    const ipRows = ipDetails.map(d => '<div style="display:flex;justify-content:space-between;gap:8px;font-size:0.85rem;padding:2px 0;"><span>IP ' + esc(d.ip || '') + '</span><span style="color:var(--text-2);">' + (d.sessions || 1) + ' · ↑ ' + fmtB(d.bytes_up || 0) + ' ↓ ' + fmtB(d.bytes_down || 0) + '</span></div>').join('');
+    const detRows = dests.map(d => '<div style="display:flex;justify-content:space-between;gap:8px;font-size:0.85rem;padding:4px 0;border-top:1px solid var(--border);"><span>' + esc(d.destination || '') + '</span><span style="color:var(--text-2);">' + (d.sessions || 1) + ' · ↑ ' + fmtB(d.bytes_up || 0) + ' ↓ ' + fmtB(d.bytes_down || 0) + ' · ↑ ' + fmtBps(d.up_bps || 0) + ' ↓ ' + fmtBps(d.down_bps || 0) + '</span></div>').join('');
+    const sesRows = sessRows.map(r => {
+      const label = r.aggregate_count_only ? t('aggregateCountNote') : esc((r.protocol || r.transport || '') + ' · ' + (r.dest_label || r.destination || r.inbound_tag || ''));
+      const flushed = (r.bytes_flushed || 0) > 0 ? ' · ' + t('flushedWord') + ' ' + fmtB(r.bytes_flushed || 0) : '';
+      return '<div style="display:flex;justify-content:space-between;gap:8px;font-size:0.85rem;padding:4px 0;border-top:1px solid var(--border);"><span>' + label + '</span><span style="color:var(--text-2);">↑ ' + fmtB(r.bytes_up || 0) + ' ↓ ' + fmtB(r.bytes_down || 0) + ' · ↑ ' + fmtBps(r.up_bps || 0) + ' ↓ ' + fmtBps(r.down_bps || 0) + flushed + '</span></div>';
+    }).join('');
+    const ipDetails = s.ip_details || ips.map(ip => ({ip: ip, sessions: 1, bytes_up: 0, bytes_down: 0, up_bps: 0, down_bps: 0}));
+    const ipRows = ipDetails.map(d => '<div style="display:flex;justify-content:space-between;gap:8px;font-size:0.85rem;padding:2px 0;"><span>IP ' + esc(d.ip || '') + '</span><span style="color:var(--text-2);">' + (d.sessions || 1) + ' · ↑ ' + fmtB(d.bytes_up || 0) + ' ↓ ' + fmtB(d.bytes_down || 0) + ' · ↑ ' + fmtBps(d.up_bps || 0) + ' ↓ ' + fmtBps(d.down_bps || 0) + '</span></div>').join('');
+    const idParts = [s.user, s.inbound_tag, s.outbound_proxy, s.outbound_mode].filter(x => x);
+    const idLine = idParts.length ? '<div style="font-size:0.85rem;color:var(--text-2);margin-top:6px;">' + idParts.map(x => esc(x)).join(' · ') + '</div>' : '';
+    const totalSpeed = (s.total_bps || 0) > 0 ? '<div style="font-size:0.85rem;">' + t('totalSpeedWord') + ' ' + fmtBps(s.total_bps) + '</div>' : '';
+    const inboundTotals = s.web_fallback ? '<div style="font-size:0.85rem;color:var(--text-2);">' + t('webInboundTotals') + ' ↑ ' + fmtB(s.web_inbound_bytes_up || 0) + ' ↓ ' + fmtB(s.web_inbound_bytes_down || 0) + ' · ↑ ' + fmtBps(s.web_inbound_up_bps || 0) + ' ↓ ' + fmtBps(s.web_inbound_down_bps || 0) + '</div>' : '';
     return '<div class="card" style="margin:0;padding:12px;">'
     + '<div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;"><b>' + esc(s.label || s.uid || '') + '</b><span class="tag tag-vless">' + esc(s.protocol || '') + '</span></div>'
-    + '<div style="font-size:0.85rem;color:var(--text-2);margin-top:6px;">' + esc(s.user || '') + ' · ' + esc(s.inbound_tag || '') + (s.outbound_proxy ? ' · ' + esc(s.outbound_proxy) : '') + ' · ' + esc(s.outbound_mode || '') + '</div>'
-    + '<div style="font-size:0.85rem;margin-top:6px;">↑ ' + fmtBps(s.up_bps) + ' &nbsp; ↓ ' + fmtBps(s.down_bps) + '</div>'
-    + '<div style="font-size:0.85rem;">' + t('totalWord') + ' ↑ <span class="num">' + fmtB(s.bytes_up) + '</span> &nbsp; ↓ <span class="num">' + fmtB(s.bytes_down) + '</span></div>'
+    + '<div style="font-size:0.85rem;font-weight:600;margin-top:8px;">' + t('identityGroup') + '</div>'
+    + idLine
+    + '<div style="font-size:0.85rem;font-weight:600;margin-top:8px;">' + t('speedGroup') + '</div>'
+    + '<div style="font-size:0.85rem;margin-top:2px;">↑ ' + fmtBps(s.up_bps) + ' &nbsp; ↓ ' + fmtBps(s.down_bps) + '</div>'
+    + totalSpeed
+    + '<div style="font-size:0.85rem;font-weight:600;margin-top:8px;">' + t('trafficGroup') + '</div>'
+    + '<div style="font-size:0.85rem;margin-top:2px;">' + t('totalWord') + ' ↑ <span class="num">' + fmtB(s.bytes_up) + '</span> &nbsp; ↓ ' + fmtB(s.bytes_down) + '</span></div>'
     + '<div style="font-size:0.85rem;">' + (s.limit_bytes > 0 ? t('consumedLine', {used: fmtB(s.used_bytes || 0), limit: fmtB(s.limit_bytes), pct: Math.min(100, Math.round((s.used_bytes || 0) / s.limit_bytes * 100))}) : t('consumedLineNoLimit', {used: fmtB(s.used_bytes || 0)})) + '</div>'
-    + '<div style="font-size:0.85rem;color:var(--text-2);">' + esc(s.subnet || ips.join(', ') || '') + ' · ' + t('sinceWord') + ' ' + esc(s.started_at || '') + '</div>'
+    + inboundTotals
+    + '<div style="font-size:0.85rem;">' + t('quotaLeft') + ' ' + (s.quota_remaining === null || s.quota_remaining === undefined ? '∞' : '<span class="num">' + fmtB(s.quota_remaining) + '</span>') + '</div>'
+    + '<div style="font-size:0.85rem;font-weight:600;margin-top:8px;">' + t('connectionGroup') + '</div>'
+    + '<div style="font-size:0.85rem;color:var(--text-2);margin-top:2px;">' + esc(s.subnet || ips.join(', ') || '') + ' · ' + t('sinceWord') + ' ' + esc(fmtStarted(s.started_at || '')) + '</div>'
     + (ipRows || '')
-    + '<div style="font-size:0.85rem;">' + t('quotaLeft') + ' ' + (s.quota_remaining === null || s.quota_remaining === undefined ? '∞' : '<span class="num">' + fmtB(s.quota_remaining) + '</span>') + ' · ' + t('sessionsOnLink') + ' ' + (s.session_count || s.link_sessions || 0) + '/' + (s.max_connections || '∞') + '</div>'
+    + '<div style="font-size:0.85rem;">' + t('sessionsOnLink') + ' ' + (s.session_count || s.link_sessions || 0) + '/' + (s.max_connections || '∞') + '</div>'
     + '<div style="display:flex;gap:8px;margin-top:8px;"><button class="btn btn-outline btn-sm" id="aud-btn-' + idx + '" onclick="toggleActiveUserDetails(' + idx + ', \'' + esc(s.conn_id) + '\')">' + t('detailsBtn') + '</button>'
     + '</div>'
     + '<div id="aud-' + idx + '" style="display:none;margin-top:8px;"><div style="font-size:0.85rem;font-weight:600;">' + t('destinationCol') + ' (' + dests.length + ')</div>' + (detRows || '<div style="font-size:0.85rem;color:var(--text-2);">—</div>') + '<div style="font-size:0.85rem;font-weight:600;margin-top:8px;">' + t('sessionsCol') + ' (' + sessRows.length + ')</div>' + (sesRows || '<div style="font-size:0.85rem;color:var(--text-2);">—</div>') + '</div>'
@@ -25740,6 +28411,7 @@ async def dynamic_xhttp_router(full_path: str, request: Request):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", CONFIG.get("port", 8000)))
     logger.info(f"Starting SulgX Panel on port {port}")
+    _foxhole_install_secret_redaction()
     uvicorn.run(
         app,
         host=os.environ.get("PANEL_BIND_HOST", "0.0.0.0"),
