@@ -3,9 +3,7 @@ services:
     build: .
     image: sulgx-panel:1.5.8
     container_name: sulgx-panel
-    env_file:
-      - path: .env
-        required: false
+
     environment:
       - DB_PATH=/data/panel.db
       - PORT=${PORT:-8000}
@@ -13,11 +11,15 @@ services:
       - SOCKS_PORT=0
       - TG_PROXY_PORT=0
       - HTTP_PROXY_PORT=0
+
     ports:
       - "${PORT:-8000}:${PORT:-8000}"
+
     volumes:
       - sulgx-data:/data
+
     restart: unless-stopped
+
     healthcheck:
       test: ["CMD", "python", "-c", "import os,urllib.request; port=os.environ.get('PORT','8000'); urllib.request.urlopen('http://localhost:'+port+'/health')"]
       interval: 30s
